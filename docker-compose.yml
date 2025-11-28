@@ -1,68 +1,39 @@
 services:
   db:
-    image: pgvector/pgvector:pg16
+    build: .  # Points to the Dockerfile above
+    container_name: agi_brain
     environment:
-      POSTGRES_DB: ${POSTGRES_DB}
-      POSTGRES_USER: ${POSTGRES_USER}
-      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
-      LANG: C.UTF-8
-      LC_ALL: C.UTF-8
+      POSTGRES_DB: ${POSTGRES_DB:-agi_memory}
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-password}
+      # Important for AGE extension
+      POSTGRES_HOST_AUTH_METHOD: trust 
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      - .:/docker-entrypoint-initdb.d
+      # Maps your schema.sql to run on init
+      - ./schema.sql:/docker-entrypoint-initdb.d/init.sql 
     healthcheck:
-      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${POSTGRES_DB:-agi_memory}"]
       interval: 10s
       timeout: 5s
       retries: 5
       start_period: 30s
     ports:
       - "5432:5432"
-    command: >
-      bash -c "
-        # Install dependencies
-        apt-get update &&
-        apt-get install -y flex bison git build-essential postgresql-server-dev-16 cmake pkg-config libxml2-dev postgresql-contrib postgresql-16-http &&
-        
-        # Setup bison
-        which bison &&
-        ln -s /usr/bin/bison /usr/local/bin/bison &&
-        
-        # Install AGE
-        cd /tmp &&
-        rm -rf age &&
-        git clone https://github.com/apache/age.git &&
-        cd age &&
-        git checkout PG16 &&
-        USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config make clean &&
-        USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config make &&
-        USE_PGXS=1 PG_CONFIG=/usr/lib/postgresql/16/bin/pg_config make install &&
-        
-        # Copy ALL SQL files
-        cp /tmp/age/sql/*.sql /usr/share/postgresql/16/extension/ &&
-        cp /tmp/age/*.sql /usr/share/postgresql/16/extension/ &&
-        cp /tmp/age/age.control /usr/share/postgresql/16/extension/ &&
-        
-        # Start PostgreSQL
-        docker-entrypoint.sh postgres"
+    # Need to modify search_path for AGE to work seamlessly
+    command: ["postgres", "-c", "search_path=ag_catalog,\"$user\",public"]
 
   embeddings:
-    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8.3
+    image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+    container_name: agi_embeddings
     platform: linux/amd64
     command: 
       - --model-id
       - unsloth/embeddinggemma-300m
       - --dtype
       - float32
-      - --pooling
-      - mean
     ports:
       - "8080:80"
-    environment:
-      - DTYPE=float32
-      - MAX_CONCURRENT_REQUESTS=512
-      - MODEL_ID=unsloth/embeddinggemma-300m
-      - CANDLE_DISABLE_BLAS=1
     volumes:
       - embeddings_cache:/data
     healthcheck:
