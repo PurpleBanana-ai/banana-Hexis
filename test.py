@@ -5386,6 +5386,95 @@ async def test_create_semantic_memory_function(db_pool):
                 raise
 
 
+async def test_semantic_memory_trust_is_capped_by_sources(db_pool):
+    """Untrusted single-source claims should not become "true" without reinforcement."""
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("trust_sources")
+            source_a = {"kind": "twitter", "ref": f"https://twitter.com/example/status/{test_id}", "trust": 0.2}
+            source_b = {"kind": "paper", "ref": f"doi:10.0000/{test_id}", "trust": 0.9}
+
+            mem_id = await conn.fetchval(
+                """
+                SELECT create_semantic_memory(
+                    $1::text,
+                    0.95::float,
+                    NULL,
+                    NULL,
+                    $2::jsonb,
+                    0.6::float
+                )
+                """,
+                f"Claim from twitter {test_id}",
+                source_a,
+            )
+
+            row = await conn.fetchrow(
+                "SELECT trust_level, source_attribution FROM memories WHERE id = $1::uuid",
+                mem_id,
+            )
+            assert row is not None
+            trust_before = float(row["trust_level"])
+            assert trust_before <= 0.30
+            assert isinstance(row["source_attribution"], dict)
+            assert row["source_attribution"].get("kind") in {"twitter", "unattributed", "internal"}
+
+            await conn.execute("SELECT add_semantic_source_reference($1::uuid, $2::jsonb)", mem_id, source_b)
+            row2 = await conn.fetchrow("SELECT trust_level FROM memories WHERE id = $1::uuid", mem_id)
+            assert row2 is not None
+            trust_after = float(row2["trust_level"])
+            assert trust_after > trust_before
+        finally:
+            await tr.rollback()
+
+
+async def test_worldview_misalignment_can_reduce_semantic_trust(db_pool):
+    """Explicit worldview misalignment should down-weight trust in a claim."""
+    async with db_pool.acquire() as conn:
+        tr = conn.transaction()
+        await tr.start()
+        try:
+            test_id = get_test_identifier("trust_worldview")
+            sources = [
+                {"kind": "paper", "ref": f"doi:10.0000/{test_id}-a", "trust": 0.9},
+                {"kind": "paper", "ref": f"doi:10.0000/{test_id}-b", "trust": 0.9},
+            ]
+
+            mem_id = await conn.fetchval(
+                "SELECT create_semantic_memory($1::text, 0.9::float, NULL, NULL, $2::jsonb, 0.6::float)",
+                f"Well-sourced claim {test_id}",
+                sources,
+            )
+            trust_before = float(await conn.fetchval("SELECT trust_level FROM memories WHERE id = $1::uuid", mem_id))
+            assert trust_before > 0.2
+
+            w_id = await conn.fetchval(
+                """
+                INSERT INTO worldview_primitives (category, belief, confidence)
+                VALUES ('religion', $1::text, 1.0::float)
+                RETURNING id
+                """,
+                f"Christian theology baseline {test_id}",
+            )
+
+            # Record a strong negative influence; trigger should resync `memories.trust_level`.
+            await conn.execute(
+                """
+                INSERT INTO worldview_memory_influences (worldview_id, memory_id, influence_type, strength)
+                VALUES ($1::uuid, $2::uuid, 'conflict', -1.0::float)
+                """,
+                w_id,
+                mem_id,
+            )
+
+            trust_after = float(await conn.fetchval("SELECT trust_level FROM memories WHERE id = $1::uuid", mem_id))
+            assert trust_after < trust_before
+        finally:
+            await tr.rollback()
+
+
 async def test_create_procedural_memory_function(db_pool):
     """Test create_procedural_memory() with steps"""
     async with db_pool.acquire() as conn:
@@ -7313,6 +7402,62 @@ async def test_complete_heartbeat_records_emotion(db_pool):
         assert count >= 1
 
 
+async def test_complete_heartbeat_blends_emotional_assessment_into_state(db_pool):
+    async with db_pool.acquire() as conn:
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        assessment = {"valence": -0.9, "arousal": 0.9, "primary_emotion": "frustrated"}
+        _mem = await conn.fetchval(
+            "SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb, $5::jsonb)",
+            hb_id,
+            "reasoning",
+            json.dumps([]),
+            json.dumps([]),
+            json.dumps(assessment),
+        )
+        row = await conn.fetchrow(
+            "SELECT valence, arousal, primary_emotion FROM emotional_states WHERE heartbeat_id = $1 ORDER BY recorded_at DESC LIMIT 1",
+            hb_id,
+        )
+        assert row is not None
+        assert row["primary_emotion"] == "frustrated"
+        state = _coerce_json(await conn.fetchval("SELECT get_current_affective_state()"))
+        assert isinstance(state, dict)
+        assert float(state.get("valence", 0.0)) < -0.15
+
+
+async def test_complete_heartbeat_emotion_accounts_for_goal_changes(db_pool):
+    async with db_pool.acquire() as conn:
+        hb_id = await conn.fetchval("SELECT start_heartbeat()")
+        await conn.execute(
+            """
+            UPDATE heartbeat_state
+            SET affective_state = jsonb_build_object(
+                'valence', 0.0,
+                'arousal', 0.5,
+                'primary_emotion', 'neutral',
+                'intensity', 0.0,
+                'updated_at', CURRENT_TIMESTAMP,
+                'source', 'test'
+            )
+            WHERE id = 1
+            """
+        )
+        goals_modified = [{"goal_id": str(uuid.uuid4()), "change": "completed", "reason": "test"}]
+        _mem = await conn.fetchval(
+            "SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb)",
+            hb_id,
+            "reasoning",
+            json.dumps([]),
+            json.dumps(goals_modified),
+        )
+        row = await conn.fetchrow(
+            "SELECT valence FROM emotional_states WHERE heartbeat_id = $1 ORDER BY recorded_at DESC LIMIT 1",
+            hb_id,
+        )
+        assert row is not None
+        assert float(row["valence"]) > 0.25
+
+
 async def test_current_emotional_state_view_matches_latest_row(db_pool):
     async with db_pool.acquire() as conn:
         await conn.execute(
@@ -7477,6 +7622,69 @@ async def test_record_emotion_function_inserts_row(db_pool):
             assert row["primary_emotion"] == "calm"
         finally:
             await tr.rollback()
+
+
+async def test_fast_recall_is_mood_congruent_with_episodic_valence(db_pool):
+    async with db_pool.acquire() as conn:
+        test_id = get_test_identifier("mood_recall")
+        query_text = f"mood recall {test_id}"
+        content_hash = await conn.fetchval("SELECT encode(sha256($1::text::bytea), 'hex')", query_text)
+        # Use a directionally unique vector under cosine distance (basis vector),
+        # not a constant-fill vector (which would be colinear with many test vectors).
+        first_val = 1.0
+
+        await conn.execute(
+            """
+            INSERT INTO embedding_cache (content_hash, embedding)
+            VALUES ($1, array_cat(ARRAY[$2::float], array_fill(0.0::float, ARRAY[embedding_dimension() - 1]))::vector)
+            ON CONFLICT (content_hash) DO UPDATE SET embedding = EXCLUDED.embedding
+            """,
+            content_hash,
+            float(first_val),
+        )
+
+        await conn.execute(
+            """
+            UPDATE heartbeat_state
+            SET affective_state = jsonb_build_object(
+                'valence', 0.8,
+                'arousal', 0.5,
+                'primary_emotion', 'content',
+                'intensity', 0.6,
+                'updated_at', CURRENT_TIMESTAMP,
+                'source', 'test'
+            )
+            WHERE id = 1
+            """
+        )
+
+        pos_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding, importance)
+            VALUES ('episodic', $1, array_cat(ARRAY[$2::float], array_fill(0.0::float, ARRAY[embedding_dimension() - 1]))::vector, 0.5)
+            RETURNING id
+            """,
+            f"positive {test_id}",
+            float(first_val),
+        )
+        neg_id = await conn.fetchval(
+            """
+            INSERT INTO memories (type, content, embedding, importance)
+            VALUES ('episodic', $1, array_cat(ARRAY[$2::float], array_fill(0.0::float, ARRAY[embedding_dimension() - 1]))::vector, 0.5)
+            RETURNING id
+            """,
+            f"negative {test_id}",
+            float(first_val),
+        )
+
+        await conn.execute("INSERT INTO episodic_memories (memory_id, emotional_valence) VALUES ($1, 0.8)", pos_id)
+        await conn.execute("INSERT INTO episodic_memories (memory_id, emotional_valence) VALUES ($1, -0.8)", neg_id)
+
+        rows = await conn.fetch("SELECT * FROM fast_recall($1, 50)", query_text)
+        ids = [r["memory_id"] for r in rows]
+        assert pos_id in ids
+        assert neg_id in ids
+        assert ids.index(pos_id) < ids.index(neg_id)
 
 
 async def test_safe_get_embedding_returns_null_on_failure(db_pool):
@@ -7795,6 +8003,38 @@ async def test_api_remember_and_recall_by_id(cognitive_memory_client, db_pool):
         assert fetched.type == MemoryType.SEMANTIC
         assert fetched.content == content
         assert fetched.importance >= 0.7
+    finally:
+        async with db_pool.acquire() as conn:
+            await conn.execute("DELETE FROM memories WHERE id = $1", mid)
+
+
+async def test_api_semantic_sources_affect_trust(cognitive_memory_client, db_pool):
+    from cognitive_memory_api import MemoryType
+
+    test_id = get_test_identifier("api_trust")
+    content = f"API claim from twitter {test_id}"
+    source_a = {"kind": "twitter", "ref": f"https://twitter.com/example/status/{test_id}", "trust": 0.2}
+    source_b = {"kind": "paper", "ref": f"doi:10.0000/{test_id}", "trust": 0.9}
+
+    mid = await cognitive_memory_client.remember(
+        content,
+        type=MemoryType.SEMANTIC,
+        importance=0.6,
+        source_references=source_a,
+    )
+
+    try:
+        m = await cognitive_memory_client.recall_by_id(mid)
+        assert m is not None
+        assert m.trust_level is not None
+        assert m.trust_level <= 0.30
+        assert isinstance(m.source_attribution, dict)
+
+        await cognitive_memory_client.add_source(mid, source_b)
+        profile = await cognitive_memory_client.get_truth_profile(mid)
+        assert profile.get("type") == "semantic"
+        assert float(profile.get("trust_level", 0)) > float(m.trust_level)
+        assert int(profile.get("source_count", 0)) >= 2
     finally:
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM memories WHERE id = $1", mid)

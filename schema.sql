@@ -70,6 +70,11 @@ CREATE TABLE memories (
     content TEXT NOT NULL,
     embedding vector(768) NOT NULL,
     importance FLOAT DEFAULT 0.5,
+    -- Provenance + epistemic trust. `source_attribution` is a primary/summary source
+    -- (semantic memories may also carry multiple sources in `semantic_memories.source_references`).
+    source_attribution JSONB NOT NULL DEFAULT '{}'::jsonb,
+    trust_level FLOAT NOT NULL DEFAULT 0.5 CHECK (trust_level >= 0 AND trust_level <= 1),
+    trust_updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
     access_count INTEGER DEFAULT 0,
     last_accessed TIMESTAMPTZ,
     decay_rate FLOAT DEFAULT 0.01
@@ -759,15 +764,23 @@ CREATE OR REPLACE FUNCTION fast_recall(
     score FLOAT,
     source TEXT
 ) AS $$
-DECLARE
-    query_embedding vector;
-    zero_vec vector;
-BEGIN
-    query_embedding := get_embedding(p_query_text);
-    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
-    
-    RETURN QUERY
-    WITH 
+	DECLARE
+	    query_embedding vector;
+	    zero_vec vector;
+	    current_valence FLOAT;
+	BEGIN
+	    query_embedding := get_embedding(p_query_text);
+	    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
+	    BEGIN
+	        current_valence := NULLIF(get_current_affective_state()->>'valence', '')::float;
+	    EXCEPTION
+	        WHEN OTHERS THEN
+	            current_valence := NULL;
+	    END;
+	    current_valence := COALESCE(current_valence, 0.0);
+	    
+	    RETURN QUERY
+	    WITH 
     -- Vector seeds (semantic similarity)
     seeds AS (
         SELECT 
@@ -827,46 +840,409 @@ BEGIN
         FROM candidates c
         GROUP BY c.mem_id
     )
-    SELECT 
-        m.id,
-        m.content,
-        m.type,
-        GREATEST(
-            COALESCE(sc.vector_score, 0) * 0.5 +
-            COALESCE(sc.assoc_score, 0) * 0.3 +
-            COALESCE(sc.temp_score, 0) * 0.15 +
-            calculate_relevance(m.importance, m.decay_rate, m.created_at, m.last_accessed) * 0.05,
-            0.001
-        ) as final_score,
-        CASE 
-            WHEN sc.vector_score IS NOT NULL THEN 'vector'
-            WHEN sc.assoc_score IS NOT NULL THEN 'association'
-            WHEN sc.temp_score IS NOT NULL THEN 'temporal'
-            ELSE 'fallback'
-        END as source
-    FROM scored sc
-    JOIN memories m ON sc.mem_id = m.id
-    WHERE m.status = 'active'
-    ORDER BY final_score DESC
-    LIMIT p_limit;
+	    SELECT 
+	        m.id,
+	        m.content,
+	        m.type,
+	        GREATEST(
+	            COALESCE(sc.vector_score, 0) * 0.5 +
+	            COALESCE(sc.assoc_score, 0) * 0.3 +
+	            COALESCE(sc.temp_score, 0) * 0.15 +
+	            calculate_relevance(m.importance, m.decay_rate, m.created_at, m.last_accessed) * 0.05 +
+	            -- Mood-congruent recall bias (small): prefer episodic memories whose valence matches current affect.
+	            (CASE
+	                WHEN em.emotional_valence IS NULL THEN 0.5
+	                ELSE 1.0 - (ABS(em.emotional_valence - current_valence) / 2.0)
+	            END) * 0.05,
+	            0.001
+	        ) as final_score,
+	        CASE 
+	            WHEN sc.vector_score IS NOT NULL THEN 'vector'
+	            WHEN sc.assoc_score IS NOT NULL THEN 'association'
+	            WHEN sc.temp_score IS NOT NULL THEN 'temporal'
+	            ELSE 'fallback'
+	        END as source
+	    FROM scored sc
+	    JOIN memories m ON sc.mem_id = m.id
+	    LEFT JOIN episodic_memories em ON em.memory_id = m.id
+	    WHERE m.status = 'active'
+	    ORDER BY final_score DESC
+	    LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql;
+
+-- ============================================================================
+-- PROVENANCE & TRUST (Normalization Layer)
+-- ============================================================================
+
+-- Normalize a source reference object into a consistent shape.
+-- Intended fields: kind, ref, label, author, observed_at, trust.
+CREATE OR REPLACE FUNCTION normalize_source_reference(p_source JSONB)
+RETURNS JSONB AS $$
+DECLARE
+    kind TEXT;
+    ref TEXT;
+    label TEXT;
+    author TEXT;
+    observed_at TIMESTAMPTZ;
+    trust FLOAT;
+BEGIN
+    IF p_source IS NULL OR jsonb_typeof(p_source) <> 'object' THEN
+        RETURN '{}'::jsonb;
+    END IF;
+
+    kind := NULLIF(p_source->>'kind', '');
+    ref := COALESCE(NULLIF(p_source->>'ref', ''), NULLIF(p_source->>'uri', ''));
+    label := NULLIF(p_source->>'label', '');
+    author := NULLIF(p_source->>'author', '');
+
+    BEGIN
+        observed_at := (p_source->>'observed_at')::timestamptz;
+    EXCEPTION WHEN OTHERS THEN
+        observed_at := CURRENT_TIMESTAMP;
+    END;
+
+    trust := COALESCE(NULLIF(p_source->>'trust', '')::float, 0.5);
+    trust := LEAST(1.0, GREATEST(0.0, trust));
+
+    RETURN jsonb_strip_nulls(
+        jsonb_build_object(
+            'kind', kind,
+            'ref', ref,
+            'label', label,
+            'author', author,
+            'observed_at', observed_at,
+            'trust', trust
+        )
+    );
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Normalize source references into an array of normalized source objects.
+CREATE OR REPLACE FUNCTION normalize_source_references(p_sources JSONB)
+RETURNS JSONB AS $$
+DECLARE
+    elem JSONB;
+    out_arr JSONB := '[]'::jsonb;
+BEGIN
+    IF p_sources IS NULL THEN
+        RETURN '[]'::jsonb;
+    END IF;
+
+    IF jsonb_typeof(p_sources) = 'array' THEN
+        FOR elem IN SELECT * FROM jsonb_array_elements(p_sources)
+        LOOP
+            out_arr := out_arr || jsonb_build_array(normalize_source_reference(elem));
+        END LOOP;
+    ELSIF jsonb_typeof(p_sources) = 'object' THEN
+        out_arr := jsonb_build_array(normalize_source_reference(p_sources));
+    ELSE
+        RETURN '[]'::jsonb;
+    END IF;
+
+    RETURN COALESCE(
+        (SELECT jsonb_agg(e) FROM jsonb_array_elements(out_arr) e WHERE e <> '{}'::jsonb),
+        '[]'::jsonb
+    );
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Dedupe normalized sources by a canonical key (ref/label fallback), keeping the most recent observed_at.
+CREATE OR REPLACE FUNCTION dedupe_source_references(p_sources JSONB)
+RETURNS JSONB AS $$
+BEGIN
+    RETURN COALESCE((
+        SELECT jsonb_agg(d.elem)
+        FROM (
+            SELECT DISTINCT ON (d.key) d.elem
+            FROM (
+                SELECT
+                    COALESCE(NULLIF(e->>'ref', ''), NULLIF(e->>'label', ''), md5(e::text)) AS key,
+                    e AS elem,
+                    COALESCE(e->>'observed_at', '') AS observed_at
+                FROM jsonb_array_elements(normalize_source_references(p_sources)) e
+            ) d
+            ORDER BY d.key, d.observed_at DESC
+        ) d
+    ), '[]'::jsonb);
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Convert sources into a reinforcement score [0..1] that grows with unique source count and average trust.
+CREATE OR REPLACE FUNCTION source_reinforcement_score(p_source_references JSONB)
+RETURNS FLOAT AS $$
+DECLARE
+    unique_sources INT;
+    avg_trust FLOAT;
+BEGIN
+    WITH elems AS (
+        SELECT
+            COALESCE(NULLIF(e->>'ref', ''), NULLIF(e->>'label', ''), md5(e::text)) AS key,
+            COALESCE((e->>'trust')::float, 0.5) AS trust
+        FROM jsonb_array_elements(dedupe_source_references(p_source_references)) e
+    )
+    SELECT COUNT(DISTINCT key), AVG(trust) INTO unique_sources, avg_trust
+    FROM elems;
+
+    IF unique_sources IS NULL OR unique_sources = 0 THEN
+        RETURN 0.0;
+    END IF;
+
+    avg_trust := COALESCE(avg_trust, 0.5);
+    RETURN 1.0 - exp(-0.8 * unique_sources * avg_trust);
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Worldview alignment score in [-1..1], based on explicit influences recorded for a memory.
+CREATE OR REPLACE FUNCTION compute_worldview_alignment(p_memory_id UUID)
+RETURNS FLOAT AS $$
+DECLARE
+    num FLOAT;
+    denom FLOAT;
+    alignment FLOAT;
+BEGIN
+    SELECT
+        SUM(COALESCE(wmi.strength, 0) * COALESCE(wp.confidence, 0.5)),
+        SUM(ABS(COALESCE(wp.confidence, 0.5)))
+    INTO num, denom
+    FROM worldview_memory_influences wmi
+    JOIN worldview_primitives wp ON wp.id = wmi.worldview_id
+    WHERE wmi.memory_id = p_memory_id;
+
+    IF denom IS NULL OR denom = 0 THEN
+        RETURN 0.0;
+    END IF;
+
+    alignment := num / denom;
+    RETURN LEAST(1.0, GREATEST(-1.0, alignment));
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Compute an effective trust level for semantic memories, capped by multi-source reinforcement and worldview alignment.
+CREATE OR REPLACE FUNCTION compute_semantic_trust(
+    p_confidence FLOAT,
+    p_source_references JSONB,
+    p_worldview_alignment FLOAT DEFAULT 0.0
+)
+RETURNS FLOAT AS $$
+DECLARE
+    base_confidence FLOAT;
+    reinforcement FLOAT;
+    cap FLOAT;
+    effective FLOAT;
+    alignment FLOAT;
+BEGIN
+    base_confidence := LEAST(1.0, GREATEST(0.0, COALESCE(p_confidence, 0.5)));
+    reinforcement := source_reinforcement_score(p_source_references);
+
+    -- With no sources, cap stays low; more independent sources raises the ceiling.
+    cap := 0.15 + 0.85 * reinforcement;
+    effective := LEAST(base_confidence, cap);
+
+    alignment := LEAST(1.0, GREATEST(-1.0, COALESCE(p_worldview_alignment, 0.0)));
+    IF alignment < 0 THEN
+        -- Strong misalignment can drive trust toward 0.
+        effective := effective * (1.0 + alignment);
+    ELSE
+        -- Mild bonus for alignment.
+        effective := LEAST(1.0, effective + 0.10 * alignment);
+    END IF;
+
+    RETURN LEAST(1.0, GREATEST(0.0, effective));
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Sync `memories.trust_level` based on semantic confidence/sources + worldview influences.
+CREATE OR REPLACE FUNCTION sync_memory_trust(p_memory_id UUID)
+RETURNS VOID AS $$
+DECLARE
+    mtype memory_type;
+    conf FLOAT;
+    sources JSONB;
+    alignment FLOAT;
+    computed FLOAT;
+BEGIN
+    SELECT type INTO mtype FROM memories WHERE id = p_memory_id;
+    IF NOT FOUND THEN
+        RETURN;
+    END IF;
+
+    IF mtype <> 'semantic' THEN
+        RETURN;
+    END IF;
+
+    SELECT confidence, source_references INTO conf, sources
+    FROM semantic_memories
+    WHERE memory_id = p_memory_id;
+
+    sources := dedupe_source_references(sources);
+    alignment := compute_worldview_alignment(p_memory_id);
+    computed := compute_semantic_trust(conf, sources, alignment);
+
+    UPDATE memories
+    SET trust_level = computed,
+        trust_updated_at = CURRENT_TIMESTAMP,
+        source_attribution = CASE
+            WHEN (source_attribution = '{}'::jsonb OR source_attribution IS NULL)
+                 AND jsonb_typeof(sources) = 'array'
+                 AND jsonb_array_length(sources) > 0
+            THEN normalize_source_reference(sources->0)
+            ELSE source_attribution
+        END
+    WHERE id = p_memory_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Add a new source reference to a semantic memory and recompute trust.
+CREATE OR REPLACE FUNCTION add_semantic_source_reference(
+    p_memory_id UUID,
+    p_source JSONB
+)
+RETURNS VOID AS $$
+DECLARE
+    normalized JSONB;
+BEGIN
+    normalized := normalize_source_reference(p_source);
+    IF normalized = '{}'::jsonb THEN
+        RETURN;
+    END IF;
+
+    UPDATE semantic_memories
+    SET source_references = dedupe_source_references(
+            COALESCE(source_references, '[]'::jsonb) || jsonb_build_array(normalized)
+        ),
+        last_validated = CURRENT_TIMESTAMP
+    WHERE memory_id = p_memory_id;
+
+    PERFORM sync_memory_trust(p_memory_id);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Provide a compact truth/provenance profile for downstream consumers (prompts, APIs).
+CREATE OR REPLACE FUNCTION get_memory_truth_profile(p_memory_id UUID)
+RETURNS JSONB AS $$
+DECLARE
+    mtype memory_type;
+    base_conf FLOAT;
+    sources JSONB;
+    reinforcement FLOAT;
+    alignment FLOAT;
+    trust FLOAT;
+    source_count INT;
+BEGIN
+    SELECT type, trust_level INTO mtype, trust
+    FROM memories
+    WHERE id = p_memory_id;
+
+    IF NOT FOUND THEN
+        RETURN '{}'::jsonb;
+    END IF;
+
+    IF mtype = 'semantic' THEN
+        SELECT confidence, source_references INTO base_conf, sources
+        FROM semantic_memories
+        WHERE memory_id = p_memory_id;
+
+        sources := dedupe_source_references(sources);
+        reinforcement := source_reinforcement_score(sources);
+        alignment := compute_worldview_alignment(p_memory_id);
+        source_count := COALESCE(jsonb_array_length(sources), 0);
+
+        RETURN jsonb_build_object(
+            'type', 'semantic',
+            'base_confidence', COALESCE(base_conf, 0.5),
+            'trust_level', trust,
+            'source_count', source_count,
+            'source_reinforcement', reinforcement,
+            'worldview_alignment', alignment,
+            'sources', sources
+        );
+    END IF;
+
+    RETURN jsonb_build_object(
+        'type', mtype::text,
+        'trust_level', trust
+    );
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Keep `memories.trust_level` in sync for semantic memories when sources/confidence or worldview influences change.
+CREATE OR REPLACE FUNCTION trg_sync_semantic_trust()
+RETURNS TRIGGER AS $$
+BEGIN
+    PERFORM sync_memory_trust(NEW.memory_id);
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_semantic_trust_sync ON semantic_memories;
+CREATE TRIGGER trg_semantic_trust_sync
+    AFTER INSERT OR UPDATE ON semantic_memories
+    FOR EACH ROW
+    EXECUTE FUNCTION trg_sync_semantic_trust();
+
+CREATE OR REPLACE FUNCTION trg_sync_worldview_influence_trust()
+RETURNS TRIGGER AS $$
+DECLARE
+    mem_id UUID;
+BEGIN
+    mem_id := COALESCE(NEW.memory_id, OLD.memory_id);
+    IF mem_id IS NOT NULL THEN
+        PERFORM sync_memory_trust(mem_id);
+    END IF;
+    RETURN COALESCE(NEW, OLD);
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS trg_worldview_influence_trust_sync ON worldview_memory_influences;
+CREATE TRIGGER trg_worldview_influence_trust_sync
+    AFTER INSERT OR UPDATE OR DELETE ON worldview_memory_influences
+    FOR EACH ROW
+    EXECUTE FUNCTION trg_sync_worldview_influence_trust();
 
 -- Create memory (base function) - generates embedding automatically
 CREATE OR REPLACE FUNCTION create_memory(
     p_type memory_type,
     p_content TEXT,
-    p_importance FLOAT DEFAULT 0.5
+    p_importance FLOAT DEFAULT 0.5,
+    p_source_attribution JSONB DEFAULT NULL,
+    p_trust_level FLOAT DEFAULT NULL
 ) RETURNS UUID AS $$
 DECLARE
     new_memory_id UUID;
     embedding_vec vector;
+    normalized_source JSONB;
+    effective_trust FLOAT;
 BEGIN
+    normalized_source := normalize_source_reference(p_source_attribution);
+    IF normalized_source = '{}'::jsonb THEN
+        normalized_source := jsonb_build_object(
+            'kind',
+            CASE
+                WHEN p_type = 'semantic' THEN 'unattributed'
+                ELSE 'internal'
+            END,
+            'observed_at', CURRENT_TIMESTAMP
+        );
+    END IF;
+
+    effective_trust := p_trust_level;
+    IF effective_trust IS NULL THEN
+        effective_trust := CASE
+            WHEN p_type = 'episodic' THEN 0.95
+            WHEN p_type = 'semantic' THEN 0.20
+            WHEN p_type = 'procedural' THEN 0.70
+            WHEN p_type = 'strategic' THEN 0.70
+            ELSE 0.50
+        END;
+    END IF;
+    effective_trust := LEAST(1.0, GREATEST(0.0, effective_trust));
+
     -- Generate embedding
     embedding_vec := get_embedding(p_content);
     
-    INSERT INTO memories (type, content, embedding, importance)
-    VALUES (p_type, p_content, embedding_vec, p_importance)
+    INSERT INTO memories (type, content, embedding, importance, source_attribution, trust_level, trust_updated_at)
+    VALUES (p_type, p_content, embedding_vec, p_importance, normalized_source, effective_trust, CURRENT_TIMESTAMP)
     RETURNING id INTO new_memory_id;
     
     -- Create graph node
@@ -892,12 +1268,21 @@ CREATE OR REPLACE FUNCTION create_episodic_memory(
     p_result JSONB DEFAULT NULL,
     p_emotional_valence FLOAT DEFAULT 0.0,
     p_event_time TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
-    p_importance FLOAT DEFAULT 0.5
+    p_importance FLOAT DEFAULT 0.5,
+    p_source_attribution JSONB DEFAULT NULL,
+    p_trust_level FLOAT DEFAULT NULL
 ) RETURNS UUID AS $$
 DECLARE
     new_memory_id UUID;
+    normalized_source JSONB;
+    effective_trust FLOAT;
 BEGIN
-    new_memory_id := create_memory('episodic', p_content, p_importance);
+    normalized_source := normalize_source_reference(p_source_attribution);
+    IF normalized_source = '{}'::jsonb THEN
+        normalized_source := jsonb_build_object('kind', 'internal', 'observed_at', CURRENT_TIMESTAMP);
+    END IF;
+    effective_trust := COALESCE(p_trust_level, 0.95);
+    new_memory_id := create_memory('episodic', p_content, p_importance, normalized_source, effective_trust);
     
     INSERT INTO episodic_memories (
         memory_id, action_taken, context, result, 
@@ -918,20 +1303,41 @@ CREATE OR REPLACE FUNCTION create_semantic_memory(
     p_category TEXT[] DEFAULT NULL,
     p_related_concepts TEXT[] DEFAULT NULL,
     p_source_references JSONB DEFAULT NULL,
-    p_importance FLOAT DEFAULT 0.5
+    p_importance FLOAT DEFAULT 0.5,
+    p_source_attribution JSONB DEFAULT NULL,
+    p_trust_level FLOAT DEFAULT NULL
 ) RETURNS UUID AS $$
 DECLARE
     new_memory_id UUID;
+    normalized_sources JSONB;
+    primary_source JSONB;
+    base_confidence FLOAT;
+    effective_trust FLOAT;
 BEGIN
-    new_memory_id := create_memory('semantic', p_content, p_importance);
+    normalized_sources := dedupe_source_references(p_source_references);
+    base_confidence := LEAST(1.0, GREATEST(0.0, COALESCE(p_confidence, 0.5)));
+
+    primary_source := normalize_source_reference(p_source_attribution);
+    IF primary_source = '{}'::jsonb AND jsonb_typeof(normalized_sources) = 'array' AND jsonb_array_length(normalized_sources) > 0 THEN
+        primary_source := normalize_source_reference(normalized_sources->0);
+    END IF;
+    IF primary_source = '{}'::jsonb THEN
+        primary_source := jsonb_build_object('kind', 'unattributed', 'observed_at', CURRENT_TIMESTAMP);
+    END IF;
+
+    effective_trust := COALESCE(p_trust_level, compute_semantic_trust(base_confidence, normalized_sources, 0.0));
+
+    new_memory_id := create_memory('semantic', p_content, p_importance, primary_source, effective_trust);
     
     INSERT INTO semantic_memories (
         memory_id, confidence, category, related_concepts,
         source_references, last_validated
     ) VALUES (
         new_memory_id, p_confidence, p_category, p_related_concepts,
-        p_source_references, CURRENT_TIMESTAMP
+        normalized_sources, CURRENT_TIMESTAMP
     );
+
+    PERFORM sync_memory_trust(new_memory_id);
     
     RETURN new_memory_id;
 END;
@@ -942,12 +1348,21 @@ CREATE OR REPLACE FUNCTION create_procedural_memory(
     p_content TEXT,
     p_steps JSONB,
     p_prerequisites JSONB DEFAULT NULL,
-    p_importance FLOAT DEFAULT 0.5
+    p_importance FLOAT DEFAULT 0.5,
+    p_source_attribution JSONB DEFAULT NULL,
+    p_trust_level FLOAT DEFAULT NULL
 ) RETURNS UUID AS $$
 DECLARE
     new_memory_id UUID;
+    normalized_source JSONB;
+    effective_trust FLOAT;
 BEGIN
-    new_memory_id := create_memory('procedural', p_content, p_importance);
+    normalized_source := normalize_source_reference(p_source_attribution);
+    IF normalized_source = '{}'::jsonb THEN
+        normalized_source := jsonb_build_object('kind', 'internal', 'observed_at', CURRENT_TIMESTAMP);
+    END IF;
+    effective_trust := COALESCE(p_trust_level, 0.70);
+    new_memory_id := create_memory('procedural', p_content, p_importance, normalized_source, effective_trust);
     
     INSERT INTO procedural_memories (
         memory_id, steps, prerequisites
@@ -966,12 +1381,21 @@ CREATE OR REPLACE FUNCTION create_strategic_memory(
     p_confidence_score FLOAT,
     p_supporting_evidence JSONB DEFAULT NULL,
     p_context_applicability JSONB DEFAULT NULL,
-    p_importance FLOAT DEFAULT 0.5
+    p_importance FLOAT DEFAULT 0.5,
+    p_source_attribution JSONB DEFAULT NULL,
+    p_trust_level FLOAT DEFAULT NULL
 ) RETURNS UUID AS $$
 DECLARE
     new_memory_id UUID;
+    normalized_source JSONB;
+    effective_trust FLOAT;
 BEGIN
-    new_memory_id := create_memory('strategic', p_content, p_importance);
+    normalized_source := normalize_source_reference(p_source_attribution);
+    IF normalized_source = '{}'::jsonb THEN
+        normalized_source := jsonb_build_object('kind', 'internal', 'observed_at', CURRENT_TIMESTAMP);
+    END IF;
+    effective_trust := COALESCE(p_trust_level, 0.70);
+    new_memory_id := create_memory('strategic', p_content, p_importance, normalized_source, effective_trust);
     
     INSERT INTO strategic_memories (
         memory_id, pattern_description, confidence_score,
@@ -1752,6 +2176,8 @@ CREATE TABLE heartbeat_state (
     next_heartbeat_at TIMESTAMPTZ,
     heartbeat_count INTEGER DEFAULT 0,
     last_user_contact TIMESTAMPTZ,
+    -- Short-term affective "working memory" (source of truth for current state; emotional_states is history).
+    affective_state JSONB NOT NULL DEFAULT '{}'::jsonb,
     is_paused BOOLEAN DEFAULT FALSE,
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
@@ -2095,7 +2521,9 @@ BEGIN
                 'id', m.id,
                 'content', m.content,
                 'created_at', m.created_at,
-                'emotional_valence', em.emotional_valence
+                'emotional_valence', em.emotional_valence,
+                'trust_level', m.trust_level,
+                'source_attribution', m.source_attribution
             ) as obj
             FROM memories m
             LEFT JOIN episodic_memories em ON m.id = em.memory_id
@@ -2522,7 +2950,8 @@ CREATE OR REPLACE FUNCTION complete_heartbeat(
     p_heartbeat_id UUID,
     p_reasoning TEXT,
     p_actions_taken JSONB,
-    p_goals_modified JSONB DEFAULT '[]'
+    p_goals_modified JSONB DEFAULT '[]',
+    p_emotional_assessment JSONB DEFAULT NULL
 )
 RETURNS UUID AS $$
 DECLARE
@@ -2975,6 +3404,49 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+-- Current affective state is stored in heartbeat_state (short-term "working memory").
+CREATE OR REPLACE FUNCTION get_current_affective_state()
+RETURNS JSONB AS $$
+DECLARE
+    st RECORD;
+    fallback JSONB;
+BEGIN
+    SELECT * INTO st FROM heartbeat_state WHERE id = 1;
+
+    IF st.affective_state IS NOT NULL AND st.affective_state <> '{}'::jsonb THEN
+        RETURN st.affective_state;
+    END IF;
+
+    -- Fallback to last logged emotion if a legacy DB has no state yet.
+    SELECT jsonb_build_object(
+        'valence', valence,
+        'arousal', arousal,
+        'dominance', dominance,
+        'primary_emotion', primary_emotion,
+        'intensity', intensity,
+        'recorded_at', recorded_at,
+        'source', 'history_fallback'
+    )
+    INTO fallback
+    FROM current_emotional_state;
+
+    RETURN COALESCE(fallback, '{}'::jsonb);
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN '{}'::jsonb;
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+CREATE OR REPLACE FUNCTION set_current_affective_state(p_state JSONB)
+RETURNS VOID AS $$
+BEGIN
+    UPDATE heartbeat_state
+    SET affective_state = COALESCE(p_state, '{}'::jsonb),
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = 1;
+END;
+$$ LANGUAGE plpgsql;
+
 -- Extend gather_turn_context with emotional_state
 CREATE OR REPLACE FUNCTION gather_turn_context()
 RETURNS JSONB AS $$
@@ -3021,10 +3493,7 @@ BEGIN
             FROM drives
             WHERE current_level >= urgency_threshold * 0.8
         ),
-        'emotional_state', (
-            SELECT row_to_json(e)
-            FROM current_emotional_state e
-        )
+        'emotional_state', get_current_affective_state()
     );
 END;
 $$ LANGUAGE plpgsql;
@@ -3034,20 +3503,29 @@ CREATE OR REPLACE FUNCTION complete_heartbeat(
     p_heartbeat_id UUID,
     p_reasoning TEXT,
     p_actions_taken JSONB,
-    p_goals_modified JSONB DEFAULT '[]'
+    p_goals_modified JSONB DEFAULT '[]',
+    p_emotional_assessment JSONB DEFAULT NULL
 )
 RETURNS UUID AS $$
 DECLARE
     narrative_text TEXT;
-    valence_avg FLOAT;
     memory_id_created UUID;
     hb_number INT;
-    base_valence FLOAT;
-    base_arousal FLOAT;
+    state_record RECORD;
+    prev_state JSONB;
+    prev_valence FLOAT;
+    prev_arousal FLOAT;
     new_valence FLOAT;
     new_arousal FLOAT;
     primary_emotion TEXT;
+    intensity FLOAT;
     action_elem JSONB;
+    goal_elem JSONB;
+    goal_change TEXT;
+    assess_valence FLOAT;
+    assess_arousal FLOAT;
+    assess_primary TEXT;
+    mem_importance FLOAT;
 BEGIN
     SELECT heartbeat_number INTO hb_number FROM heartbeat_log WHERE id = p_heartbeat_id;
 
@@ -3064,57 +3542,35 @@ BEGIN
 
     narrative_text := format('Heartbeat #%s: %s', hb_number, COALESCE(narrative_text, 'No actions taken'));
 
-    SELECT AVG(CASE
-        WHEN a->'result'->>'success' = 'true' THEN 0.2
-        WHEN a->'result'->>'error' IS NOT NULL THEN -0.2
-        ELSE 0
-    END) INTO valence_avg
-    FROM jsonb_array_elements(p_actions_taken) a;
+    -- ---------------------------------------------------------------------
+    -- Affective state update (momentum + events + optional self-report)
+    -- ---------------------------------------------------------------------
 
-    memory_id_created := create_episodic_memory(
-        p_content := narrative_text,
-        p_context := jsonb_build_object(
-            'heartbeat_id', p_heartbeat_id,
-            'heartbeat_number', hb_number,
-            'reasoning', p_reasoning
-        ),
-        p_emotional_valence := COALESCE(valence_avg, 0),
-        p_importance := 0.5
-    );
+    SELECT * INTO state_record FROM heartbeat_state WHERE id = 1;
+    prev_state := COALESCE(state_record.affective_state, '{}'::jsonb);
 
-    UPDATE heartbeat_log SET
-        ended_at = CURRENT_TIMESTAMP,
-        energy_end = get_current_energy(),
-        decision_reasoning = p_reasoning,
-        actions_taken = p_actions_taken,
-        goals_modified = p_goals_modified,
-        narrative = narrative_text,
-        emotional_valence = valence_avg,
-        memory_id = memory_id_created
-    WHERE id = p_heartbeat_id;
+    BEGIN
+        prev_valence := NULLIF(prev_state->>'valence', '')::float;
+    EXCEPTION
+        WHEN OTHERS THEN
+            prev_valence := NULL;
+    END;
+    BEGIN
+        prev_arousal := NULLIF(prev_state->>'arousal', '')::float;
+    EXCEPTION
+        WHEN OTHERS THEN
+            prev_arousal := NULL;
+    END;
 
-    UPDATE heartbeat_state SET
-        next_heartbeat_at = CURRENT_TIMESTAMP +
-            ((SELECT value FROM heartbeat_config WHERE key = 'heartbeat_interval_minutes') || ' minutes')::INTERVAL,
-        updated_at = CURRENT_TIMESTAMP
-    WHERE id = 1;
+    prev_valence := COALESCE(prev_valence, 0.0);
+    prev_arousal := COALESCE(prev_arousal, 0.5);
 
-    -- Derive and record emotional state from last known state + action events.
-    SELECT COALESCE(valence, 0), COALESCE(arousal, 0.5)
-    INTO base_valence, base_arousal
-    FROM current_emotional_state;
+    -- Decay toward baseline (neutral valence, mid arousal).
+    new_valence := prev_valence * 0.8;
+    new_arousal := 0.5 + (prev_arousal - 0.5) * 0.8;
 
-    IF base_valence IS NULL THEN
-        base_valence := 0;
-    END IF;
-    IF base_arousal IS NULL THEN
-        base_arousal := 0.5;
-    END IF;
-
-    new_valence := base_valence;
-    new_arousal := base_arousal;
-
-    FOR action_elem IN SELECT * FROM jsonb_array_elements(p_actions_taken)
+    -- Action-based deltas.
+    FOR action_elem IN SELECT * FROM jsonb_array_elements(COALESCE(p_actions_taken, '[]'::jsonb))
     LOOP
         IF (action_elem->'result'->>'error') = 'Boundary triggered' THEN
             new_valence := new_valence - 0.4;
@@ -3135,28 +3591,78 @@ BEGIN
             new_valence := new_valence + 0.1;
             new_arousal := new_arousal - 0.2;
         END IF;
+    END LOOP;
 
-        IF (action_elem->>'action') = 'reprioritize' AND (action_elem->'params'->>'new_priority') = 'completed' THEN
+    -- Goal-change deltas (worker applies goal changes outside the action list).
+    FOR goal_elem IN SELECT * FROM jsonb_array_elements(COALESCE(p_goals_modified, '[]'::jsonb))
+    LOOP
+        goal_change := COALESCE(goal_elem->>'new_priority', goal_elem->>'change', goal_elem->>'priority', '');
+
+        IF goal_change = 'completed' THEN
             new_valence := new_valence + 0.3;
             new_arousal := new_arousal + 0.1;
-        END IF;
-        IF (action_elem->>'action') = 'reprioritize' AND (action_elem->'params'->>'new_priority') = 'abandoned' THEN
+        ELSIF goal_change = 'abandoned' THEN
             new_valence := new_valence - 0.2;
             new_arousal := new_arousal - 0.1;
         END IF;
     END LOOP;
 
+    -- Optional LLM self-report: blend into the state (does not get overwritten later).
+    assess_valence := NULL;
+    assess_arousal := NULL;
+    assess_primary := NULL;
+    IF p_emotional_assessment IS NOT NULL AND jsonb_typeof(p_emotional_assessment) = 'object' THEN
+        BEGIN
+            assess_valence := NULLIF(p_emotional_assessment->>'valence', '')::float;
+        EXCEPTION
+            WHEN OTHERS THEN
+                assess_valence := NULL;
+        END;
+        BEGIN
+            assess_arousal := NULLIF(p_emotional_assessment->>'arousal', '')::float;
+        EXCEPTION
+            WHEN OTHERS THEN
+                assess_arousal := NULL;
+        END;
+        assess_primary := NULLIF(p_emotional_assessment->>'primary_emotion', '');
+    END IF;
+
+    IF assess_valence IS NOT NULL THEN
+        new_valence := new_valence * 0.6 + LEAST(1.0, GREATEST(-1.0, assess_valence)) * 0.4;
+    END IF;
+    IF assess_arousal IS NOT NULL THEN
+        new_arousal := new_arousal * 0.6 + LEAST(1.0, GREATEST(0.0, assess_arousal)) * 0.4;
+    END IF;
+
     new_valence := LEAST(1.0, GREATEST(-1.0, new_valence));
     new_arousal := LEAST(1.0, GREATEST(0.0, new_arousal));
 
-    primary_emotion := CASE
-        WHEN new_valence > 0.2 AND new_arousal > 0.6 THEN 'excited'
-        WHEN new_valence > 0.2 THEN 'content'
-        WHEN new_valence < -0.2 AND new_arousal > 0.6 THEN 'anxious'
-        WHEN new_valence < -0.2 THEN 'down'
-        ELSE 'neutral'
-    END;
+    primary_emotion := COALESCE(
+        assess_primary,
+        CASE
+            WHEN new_valence > 0.2 AND new_arousal > 0.6 THEN 'excited'
+            WHEN new_valence > 0.2 THEN 'content'
+            WHEN new_valence < -0.2 AND new_arousal > 0.6 THEN 'anxious'
+            WHEN new_valence < -0.2 THEN 'down'
+            ELSE 'neutral'
+        END
+    );
 
+    intensity := LEAST(1.0, GREATEST(0.0, (ABS(new_valence) * 0.6 + new_arousal * 0.4)));
+
+    -- Persist as short-term state for the next heartbeat.
+    UPDATE heartbeat_state SET
+        affective_state = jsonb_build_object(
+            'valence', new_valence,
+            'arousal', new_arousal,
+            'primary_emotion', primary_emotion,
+            'intensity', intensity,
+            'updated_at', CURRENT_TIMESTAMP,
+            'source', CASE WHEN p_emotional_assessment IS NULL THEN 'derived' ELSE 'blended' END
+        )
+    WHERE id = 1;
+
+    -- Log a time series record.
     PERFORM record_emotion(
         p_valence := new_valence,
         p_arousal := new_arousal,
@@ -3164,8 +3670,45 @@ BEGIN
         p_triggered_by_type := 'heartbeat',
         p_triggered_by_id := p_heartbeat_id,
         p_heartbeat_id := p_heartbeat_id,
-        p_trigger_description := 'Auto-derived from heartbeat actions'
+        p_trigger_description := CASE WHEN p_emotional_assessment IS NULL THEN 'Derived from heartbeat events' ELSE 'Blended from prior state + events + self-report' END,
+        p_dominance := 0.5,
+        p_intensity := intensity
     );
+
+    -- ---------------------------------------------------------------------
+    -- Memory/log record
+    -- ---------------------------------------------------------------------
+
+    mem_importance := LEAST(1.0, GREATEST(0.4, 0.5 + intensity * 0.25));
+
+    memory_id_created := create_episodic_memory(
+        p_content := narrative_text,
+        p_context := jsonb_build_object(
+            'heartbeat_id', p_heartbeat_id,
+            'heartbeat_number', hb_number,
+            'reasoning', p_reasoning,
+            'affective_state', get_current_affective_state()
+        ),
+        p_emotional_valence := new_valence,
+        p_importance := mem_importance
+    );
+
+    UPDATE heartbeat_log SET
+        ended_at = CURRENT_TIMESTAMP,
+        energy_end = get_current_energy(),
+        decision_reasoning = p_reasoning,
+        actions_taken = p_actions_taken,
+        goals_modified = p_goals_modified,
+        narrative = narrative_text,
+        emotional_valence = new_valence,
+        memory_id = memory_id_created
+    WHERE id = p_heartbeat_id;
+
+    UPDATE heartbeat_state SET
+        next_heartbeat_at = CURRENT_TIMESTAMP +
+            ((SELECT value FROM heartbeat_config WHERE key = 'heartbeat_interval_minutes') || ' minutes')::INTERVAL,
+        updated_at = CURRENT_TIMESTAMP
+    WHERE id = 1;
 
     RETURN memory_id_created;
 END;

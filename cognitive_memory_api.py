@@ -56,7 +56,9 @@ class Memory:
     importance: float
     relevance_score: float | None = None
     similarity: float | None = None
-    source: str | None = None  # 'vector', 'association', 'temporal'
+    source: str | None = None  # retrieval source: 'vector', 'association', 'temporal'
+    trust_level: float | None = None  # epistemic trust [0..1] (DB-computed)
+    source_attribution: dict[str, Any] | None = None  # primary provenance (DB-stored JSON)
     created_at: datetime | None = None
     emotional_valence: float | None = None
 
@@ -97,6 +99,9 @@ class MemoryInput:
     emotional_valence: float = 0.0
     context: dict[str, Any] | None = None
     concepts: list[str] | None = None
+    source_attribution: dict[str, Any] | None = None
+    source_references: Any | None = None  # JSONB for semantic memories (dict or list[dict])
+    trust_level: float | None = None
 
 
 @dataclass(frozen=True)
@@ -261,7 +266,15 @@ class CognitiveMemory:
         async with self._pool.acquire() as conn:
             row = await conn.fetchrow(
                 """
-                SELECT m.id, m.type, m.content, m.importance, m.created_at, em.emotional_valence
+                SELECT
+                    m.id,
+                    m.type,
+                    m.content,
+                    m.importance,
+                    m.trust_level,
+                    m.source_attribution,
+                    m.created_at,
+                    em.emotional_valence
                 FROM memories m
                 LEFT JOIN episodic_memories em ON m.id = em.memory_id
                 WHERE m.id = $1
@@ -275,6 +288,8 @@ class CognitiveMemory:
                 type=MemoryType(row["type"]),
                 content=row["content"],
                 importance=float(row["importance"]),
+                trust_level=float(row["trust_level"]) if row["trust_level"] is not None else None,
+                source_attribution=_coerce_json(row["source_attribution"]) if row["source_attribution"] is not None else None,
                 created_at=row["created_at"],
                 emotional_valence=row["emotional_valence"],
             )
@@ -289,7 +304,15 @@ class CognitiveMemory:
             if memory_type is None:
                 rows = await conn.fetch(
                     """
-                    SELECT m.id, m.type, m.content, m.importance, m.created_at, em.emotional_valence
+                    SELECT
+                        m.id,
+                        m.type,
+                        m.content,
+                        m.importance,
+                        m.trust_level,
+                        m.source_attribution,
+                        m.created_at,
+                        em.emotional_valence
                     FROM memories m
                     LEFT JOIN episodic_memories em ON m.id = em.memory_id
                     WHERE m.status = 'active'
@@ -301,7 +324,15 @@ class CognitiveMemory:
             else:
                 rows = await conn.fetch(
                     """
-                    SELECT m.id, m.type, m.content, m.importance, m.created_at, em.emotional_valence
+                    SELECT
+                        m.id,
+                        m.type,
+                        m.content,
+                        m.importance,
+                        m.trust_level,
+                        m.source_attribution,
+                        m.created_at,
+                        em.emotional_valence
                     FROM memories m
                     LEFT JOIN episodic_memories em ON m.id = em.memory_id
                     WHERE m.status = 'active' AND m.type = $2::memory_type
@@ -326,9 +357,22 @@ class CognitiveMemory:
         emotional_valence: float = 0.0,
         context: dict[str, Any] | None = None,
         concepts: list[str] | None = None,
+        source_attribution: dict[str, Any] | None = None,
+        source_references: Any | None = None,
+        trust_level: float | None = None,
     ) -> UUID:
         async with self._pool.acquire() as conn:
-            memory_id = await self._create_memory(conn, content, type, importance, emotional_valence, context)
+            memory_id = await self._create_memory(
+                conn,
+                content,
+                type,
+                importance,
+                emotional_valence,
+                context,
+                source_attribution=source_attribution,
+                source_references=source_references,
+                trust_level=trust_level,
+            )
 
             if concepts:
                 for concept in concepts:
@@ -336,11 +380,38 @@ class CognitiveMemory:
 
             return memory_id
 
+    async def add_source(self, memory_id: UUID, source: dict[str, Any]) -> None:
+        """Attach an additional source reference to a semantic memory and recompute trust."""
+        async with self._pool.acquire() as conn:
+            await conn.execute(
+                "SELECT add_semantic_source_reference($1::uuid, $2::jsonb)",
+                memory_id,
+                source,
+            )
+
+    async def get_truth_profile(self, memory_id: UUID) -> dict[str, Any]:
+        """Return DB-computed provenance/trust details for a memory."""
+        async with self._pool.acquire() as conn:
+            row = await conn.fetchrow("SELECT get_memory_truth_profile($1::uuid) AS profile", memory_id)
+            if not row or row["profile"] is None:
+                return {}
+            return dict(_coerce_json(row["profile"]))
+
     async def remember_batch(self, memories: Iterable[MemoryInput]) -> list[UUID]:
         async with self._pool.acquire() as conn:
             ids: list[UUID] = []
             for m in memories:
-                mid = await self._create_memory(conn, m.content, m.type, m.importance, m.emotional_valence, m.context)
+                mid = await self._create_memory(
+                    conn,
+                    m.content,
+                    m.type,
+                    m.importance,
+                    m.emotional_valence,
+                    m.context,
+                    source_attribution=m.source_attribution,
+                    source_references=m.source_references,
+                    trust_level=m.trust_level,
+                )
                 if m.concepts:
                     for concept in m.concepts:
                         await conn.fetchval("SELECT link_memory_to_concept($1::uuid, $2::text, 1.0)", mid, concept)
@@ -575,37 +646,50 @@ class CognitiveMemory:
         importance: float,
         emotional_valence: float,
         context: dict[str, Any] | None,
+        *,
+        source_attribution: dict[str, Any] | None = None,
+        source_references: Any | None = None,
+        trust_level: float | None = None,
     ) -> UUID:
         if type == MemoryType.EPISODIC:
             return await conn.fetchval(
-                "SELECT create_episodic_memory($1::text, NULL, $2::jsonb, NULL, $3::float, CURRENT_TIMESTAMP, $4::float)",
+                "SELECT create_episodic_memory($1::text, NULL, $2::jsonb, NULL, $3::float, CURRENT_TIMESTAMP, $4::float, $5::jsonb, $6::float)",
                 content,
                 context,
                 emotional_valence,
                 importance,
+                source_attribution,
+                trust_level,
             )
         if type == MemoryType.SEMANTIC:
+            sources = source_references if source_references is not None else context
             return await conn.fetchval(
-                "SELECT create_semantic_memory($1::text, 0.8::float, NULL, NULL, $2::jsonb, $3::float)",
+                "SELECT create_semantic_memory($1::text, 0.8::float, NULL, NULL, $2::jsonb, $3::float, $4::jsonb, $5::float)",
                 content,
-                context,
+                sources,
                 importance,
+                source_attribution,
+                trust_level,
             )
         if type == MemoryType.PROCEDURAL:
             steps = context if context is not None else {}
             return await conn.fetchval(
-                "SELECT create_procedural_memory($1::text, $2::jsonb, NULL, $3::float)",
+                "SELECT create_procedural_memory($1::text, $2::jsonb, NULL, $3::float, $4::jsonb, $5::float)",
                 content,
                 steps,
                 importance,
+                source_attribution,
+                trust_level,
             )
         if type == MemoryType.STRATEGIC:
             return await conn.fetchval(
-                "SELECT create_strategic_memory($1::text, $2::text, 0.8::float, $3::jsonb, NULL, $4::float)",
+                "SELECT create_strategic_memory($1::text, $2::text, 0.8::float, $3::jsonb, NULL, $4::float, $5::jsonb, $6::float)",
                 content,
                 content,
                 context,
                 importance,
+                source_attribution,
+                trust_level,
             )
         raise ValueError(f"Unknown memory type: {type}")
 
@@ -626,6 +710,8 @@ class CognitiveMemory:
                 fr.score,
                 fr.source,
                 m.importance,
+                m.trust_level,
+                m.source_attribution,
                 m.created_at,
                 em.emotional_valence
             FROM fast_recall($1::text, $2::int) fr
@@ -651,6 +737,8 @@ class CognitiveMemory:
                     importance=float(row["importance"]),
                     similarity=float(row["score"]),
                     source=row["source"],
+                    trust_level=float(row["trust_level"]) if row["trust_level"] is not None else None,
+                    source_attribution=_coerce_json(row["source_attribution"]) if row["source_attribution"] is not None else None,
                     created_at=row["created_at"],
                     emotional_valence=row["emotional_valence"],
                 )
@@ -679,6 +767,10 @@ class CognitiveMemory:
             type=MemoryType(row["type"]),
             content=row["content"],
             importance=float(row["importance"]),
+            trust_level=float(row["trust_level"]) if "trust_level" in row and row["trust_level"] is not None else None,
+            source_attribution=_coerce_json(row["source_attribution"])
+            if "source_attribution" in row and row["source_attribution"] is not None
+            else None,
             created_at=row["created_at"] if "created_at" in row else None,
             emotional_valence=row["emotional_valence"] if "emotional_valence" in row else None,
         )
@@ -725,7 +817,16 @@ def format_context_for_prompt(context: HydratedContext, *, max_memories: int = 5
         parts.append("## Relevant Memories")
         for m in context.memories[:max_memories]:
             score = f" (score: {m.similarity:.2f})" if m.similarity is not None else ""
-            parts.append(f"- {m.content}{score}")
+            trust = f", trust: {m.trust_level:.2f}" if m.trust_level is not None else ""
+            src_kind = ""
+            if m.source_attribution and isinstance(m.source_attribution, dict):
+                kind = m.source_attribution.get("kind")
+                ref = m.source_attribution.get("ref")
+                if kind and ref:
+                    src_kind = f", source: {kind} ({ref})"
+                elif kind:
+                    src_kind = f", source: {kind}"
+            parts.append(f"- {m.content}{score}{trust}{src_kind}")
 
     if context.partial_activations:
         parts.append("\n## Vague Recollections (tip-of-tongue)")

@@ -926,40 +926,10 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                         SELECT change_goal_priority($1::uuid, $2::goal_priority, $3)
                     """, goal_id, change_type, reason)
 
-            # Optional: record an affective self-report for this heartbeat.
-            emotional = decision.get("emotional_assessment")
-            if isinstance(emotional, dict):
-                try:
-                    valence = float(emotional.get("valence")) if emotional.get("valence") is not None else None
-                    arousal = float(emotional.get("arousal")) if emotional.get("arousal") is not None else None
-                except Exception:
-                    valence = None
-                    arousal = None
-                primary = emotional.get("primary_emotion")
-                if valence is not None or arousal is not None or primary:
-                    await conn.fetchval(
-                        """
-                        SELECT record_emotion(
-                            $1::float,
-                            $2::float,
-                            $3::text,
-                            'heartbeat',
-                            $4::uuid,
-                            $4::uuid,
-                            $5::text
-                        )
-                        """,
-                        float(valence or 0.0),
-                        float(arousal if arousal is not None else 0.5),
-                        str(primary) if primary else None,
-                        heartbeat_id,
-                        (reasoning or "")[:300],
-                    )
-
             # Complete the heartbeat
             memory_id = await conn.fetchval("""
-                SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb)
-            """, heartbeat_id, reasoning, json.dumps(actions_taken), json.dumps(goal_changes))
+                SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb, $5::jsonb)
+            """, heartbeat_id, reasoning, json.dumps(actions_taken), json.dumps(goal_changes), json.dumps(decision.get("emotional_assessment")) if isinstance(decision.get("emotional_assessment"), dict) else None)
 
             logger.info(f"Heartbeat {heartbeat_id} completed. Memory: {memory_id}")
 
