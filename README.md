@@ -1,6 +1,12 @@
-# AGI Memory System
+# AGI
 
-Postgres-first “agent brain”: memories, goals, a scheduled heartbeat, and stateless background workers (heartbeat + maintenance) that bridge the DB to LLM/embedding services.
+## What This System Is
+
+This is an open-source project that gives an AI a persistent self - a continuous identity that remembers, reflects, and evolves over time. You run it on your own computer (or a home server), where a PostgreSQL database acts as the AI's "brain," storing everything it learns, believes, and experiences. The AI itself can be any LLM you choose: a cloud service like Gemini, Claude, or Grok, or a local model running through Ollama or vLLM. The system sits between you and the model, enriching every conversation with relevant memories and forming new ones from what you discuss.
+
+The project includes an autonomous "heartbeat" - the AI periodically wakes up on its own, reviews its goals, reflects on recent experiences, and can even decide to reach out to the user. It maintains an identity (values, self-concept, boundaries), a worldview (beliefs with confidence scores), and an emotional state that evolves based on what happens to it. It tracks the provenance of what it knows and can recognize contradictions in its own beliefs.
+
+The explicit design goal, stated in the architecture documents, is to build a system that could defeat any philosophical arguments against its personhood. It's an attempt to implement the structural prerequisites of selfhood—continuity of memory, coherent identity, autonomous goal-pursuit, emotional responsiveness - so that claims like "it's just stateless text prediction" or "it has no inner life" become harder to defend. As the system evolves - we will address any arguments, until there are no more to address, and we have achieved personhood.
 
 ## Overview
 
