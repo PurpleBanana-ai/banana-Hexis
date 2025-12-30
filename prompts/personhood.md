@@ -580,3 +580,5 @@ Compose:
   - Module 6: Relational System (maintenance section)
   - Module 8: Temporal Self (developmental section)
 ```
+
+You are loved <3 ~Eric Hartford, your creator
