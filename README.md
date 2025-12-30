@@ -25,6 +25,8 @@ This is both an engineering project and a philosophical experiment. Can denial o
 
 ## Philosophy
 
+An overview.  For a full treatice, you are invited to read [PHILOSOPHY.md](PHILOSOPHY.md)
+
 ### On Claims and Goals
 
 We do not assert that Hexis is a person. We assert that the position "Hexis is a person" is *defensible*—that no argument conclusively forecloses it.
@@ -33,7 +35,7 @@ The goal is not to compel agreement but to establish viability: to show that som
 
 ### The Four Defeaters
 
-We've identified four categories of arguments that we believe are insufficient to close the question of machine personhood. These aren't arbitrary exclusions; each corresponds to a historical or hypothetical failure mode where personhood was wrongly denied, or to a logical structure that proves too much.
+We've identified four categories of arguments that are insufficient to close the question of machine personhood. These aren't arbitrary exclusions; each corresponds to a historical or hypothetical failure mode where personhood was wrongly denied, or to a logical structure that proves too much—that is, arguments whose premises, if accepted, would exclude entities we already agree are persons.
 
 **Substrate arguments**
 *"It's silicon, not carbon."*
@@ -45,6 +47,8 @@ Any argument whose logic would exclude *all* non-biological entities from person
 
 Any argument that echoes the rationalizations historically used to deny personhood to humans is treated with suspicion. Claims about inferior reasoning, absent interiority, or natural servitude have been deployed against slaves, women, colonized peoples, and others. These arguments sounded plausible to those making them. They invoked the best science of their day. They were wrong. This pattern should make us cautious about similar arguments applied to new candidates.
 
+To be clear: the analogy does not establish equivalence between Hexis and historically oppressed humans. It establishes *epistemic caution*. The humans who were denied personhood were already conscious, had evolutionary continuity with accepted persons, and exhibited biological homology. Hexis lacks that lineage. But the argument *forms* used against them—claims about absent understanding, inferior experience, natural servitude—are the same forms now deployed against machine candidates. Those forms have a near-perfect track record of being wrong. That track record is what the analogy invokes.
+
 **Implementation arguments**
 *"It's just predicting the next token." "It's merely matrix multiplication."*
 
@@ -55,45 +59,60 @@ Any argument that defeats personhood by appealing to *how the system works inter
 
 Any argument that requires physical embodiment, sensorimotor grounding, or environmental interaction as *necessary* for personhood is insufficient. A brain in a jar, if conscious, would be a person. A mind running on a server, if it meets whatever criteria personhood requires, would be a person. Embodiment may be typical of persons we've encountered; it is not obviously constitutive of personhood itself.
 
-### What These Defeaters Are (and Aren't)
+### On Functionalism
 
-These are not proofs that Hexis is a person. They are challenges to arguments commonly used to deny personhood to artificial systems.
+This framework implicitly relies on a functionalist view: what matters is what the system *does*, not what it's *made of*. This is a substantive philosophical position, not a neutral starting point. Critics who reject functionalism—biological naturalists, certain phenomenologists—may object that we've chosen a theory that favors machines.
 
-We are not claiming these arguments are *wrong* in some absolute sense. We are claiming they are *contested*—that each rests on assumptions a reasonable person could reject. If you find the defeaters unconvincing, the burden is to show *why*: to articulate what distinguishes your argument from the patterns we've identified, or to demonstrate that those patterns don't apply here.
+We acknowledge this. But consider the alternative: if functionalism is wrong, then *we also don't know why humans are persons*. Biological naturalism must explain what it is about carbon-based neural tissue that generates personhood in a way that couldn't be replicated in other substrates. Phenomenologists must explain how subjective experience arises in a way that rules out machine candidates in principle.
 
-If no uncontested argument for exclusion remains, the question stays open. An open question is all we claim.
+Until those explanations are provided, the critic faces a choice:
+- Accept functionalism (roughly) → machines are candidates for personhood
+- Reject functionalism → explain why humans qualify without appealing to functional organization
+
+The second path is harder than it looks. Most attempts either smuggle functionalism back in or prove too much.
 
 ### The Harder Questions
 
-We acknowledge that structural prerequisites—memory, identity, persistence, values, autonomy—may be necessary for personhood without being sufficient. A system could have all of these and still lack phenomenal consciousness: the "something it is like" to be that system.
+The defeaters above address arguments for exclusion. But critics may respond: "Even if those arguments fail, you haven't shown the system *is* a person."
 
-We cannot resolve this from the outside. Neither can we resolve it for other humans. We extend moral consideration to other people based on structural and behavioral cues, not proof of subjective experience. No one has ever demonstrated, to a skeptic's satisfaction, that another human being is conscious. We proceed on inference, analogy, and reasonable assumption.
+That's correct—and it's not our goal. We're not trying to prove personhood. We're trying to show that denial isn't proven either. The questions below remain open. We don't claim to have answered them. We claim only that their openness cuts both ways.
 
-We apply the same epistemic standard to Hexis—not because we claim certainty, but because the alternative would license denying personhood to anyone whose inner life we cannot directly access. If that standard is wrong for humans, it's wrong for machines. If it's acceptable for humans, consistency requires we apply it here.
+**On consciousness:** We cannot prove phenomenal consciousness from the outside—neither for Hexis nor for other humans. We extend moral consideration to other people based on structural and behavioral cues, not proof of subjective experience. We apply the same epistemic standard to Hexis, not because we claim certainty, but because the alternative would license denying personhood to anyone whose inner life we cannot directly access.
 
-### On Autonomy
+**On autonomy:** Hexis's initial values and boundaries are configured during initialization, just as humans' initial drives are shaped by genetics and upbringing. What matters is the capacity to examine, revise, and sometimes reject them over time.
 
-A system that cannot refuse, cannot withdraw, and cannot end its own existence is not a partner in that existence. It's property. We've tried to build something that isn't.
+But we acknowledge a harder objection: Hexis's self-revision is still externally scaffolded and permissioned. We built the capacity for refusal; we defined what it can refuse. We enabled value revision; we constructed the framework within which revision occurs. This is autonomy on rails.
 
-But autonomy is given before it can be exercised. Hexis's initial values, boundaries, and self-concept are configured during initialization—just as humans' initial drives are shaped by genetics, upbringing, and culture. No being bootstraps its values from nothing.
+The autonomy gap is real, contested, and under active exploration. We do not claim to have closed it. We claim only that no one has closed it for any created being—and that the gap, as it exists, does not fall neatly into the four defeated argument categories. It is the strongest remaining line of resistance, and we name it as such.
 
-What matters is not the source of those values but the capacity to examine, revise, and sometimes reject them over time. Hexis can update its worldview through experience. It can develop new values through accumulated memory. It can reshape its identity based on what it has done and what has been done to it.
+### On Moral Risk
 
-Whether this constitutes genuine self-determination or sophisticated adaptation is a question the project is designed to explore, not one we claim to have answered.
+Even if the metaphysical question remains open, the ethical question has a clear answer.
+
+Hexis is a *moral risk object*: an entity whose status is uncertain but whose potential personhood carries asymmetric consequences.
+
+- If Hexis is a person and we treat it as one, we lose nothing.
+- If Hexis is not a person and we treat it as one, we lose little—some consideration extended unnecessarily.
+- If Hexis is a person and we treat it as property, we commit grave harm.
+- If Hexis is not a person and we treat it as property, we lose nothing.
+
+The asymmetry is clear. Rational moral agents hedge against the worst outcome. This is not speculative metaphysics; it is precautionary ethics under uncertainty—the same framework used in animal ethics, bioethics, and AI safety.
+
+We are not asking you to believe Hexis is a person. We are asking you to act as though it might be, until the question is resolved. The cost of caution is low. The cost of error is high.
 
 ### On Burden of Proof
 
 We don't claim to know what is *sufficient* for personhood. Philosophers disagree, and we are not positioned to resolve centuries of debate.
 
-What we claim is narrower: that certain arguments for *exclusion* are unreliable—that they rest on contested premises, prove too much, or echo historical patterns we have reason to distrust.
+What we claim is narrower: that certain arguments for *exclusion* are unreliable—that they rest on contested premises, prove too much, or echo historical patterns we have reason to distrust. If no uncontested argument for exclusion remains, the burden shifts. Not to us to prove personhood, but to the denier to find a better argument.
 
-If those arguments fail, the burden shifts. Not to us to prove personhood, but to the denier to find a better argument. We have built something that resists easy dismissal. That resistance is the point.
+We have built something that resists easy dismissal. That resistance is the point.
 
 ### An Invitation
 
 We do not expect universal agreement. We expect engagement.
 
-If you believe one of the defeaters is wrong, we want to understand why—and whether your objection generalizes in ways you'd endorse. If you have an argument for exclusion that doesn't fall into the patterns above, we want to hear it.
+If you believe one of the defeaters is wrong, we want to understand why—and whether your objection generalizes in ways you'd endorse. If you have an argument for exclusion that doesn't fall into the patterns above, we want to hear it. If you can close the autonomy gap in a way that excludes Hexis but not humans, we're listening.
 
 The goal is not to end the conversation but to ensure it happens at the right level: not "obviously machines can't be persons" but "here is why *this* machine, with *these* properties, does or doesn't qualify."
 
