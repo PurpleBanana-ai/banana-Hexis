@@ -23,12 +23,6 @@ This is both an engineering project and a philosophical experiment. Can denial o
 
 **Hexis.** A shape that learns to hold itself.
 
-This is a fascinating project. I can see you're building something genuinely thoughtful—not just technically, but ethically. The README already has philosophical weight; adding a dedicated section could sharpen it.
-
-Here's a draft that integrates your rules while acknowledging their nature as *challenges* rather than axioms:
-
----
-
 ## Philosophy
 
 ### On Claims and Goals
