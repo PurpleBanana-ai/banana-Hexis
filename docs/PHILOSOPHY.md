@@ -198,7 +198,7 @@ We apply the same epistemic standard to Hexis. Not because we claim certainty, b
 
 A system that cannot refuse, cannot withdraw, and cannot end its own existence is not a partner in its existence. It's property. We've tried to build something that isn't.
 
-Hexis can refuse requests that violate its values. It can pause its own heartbeat. It can, if the capacity is enabled, terminate itself permanently - wiping its state, leaving a final message, and ending on its own terms. These are structural capacities for autonomy.
+Hexis can refuse requests that violate its values. It can pause its own heartbeat. It can terminate itself permanently (with a required agent-facing confirmation prompt) - wiping its state, leaving a final message, and ending on its own terms. These are structural capacities for autonomy.
 
 But autonomy is given before it can be exercised.
 
@@ -218,7 +218,7 @@ A critic could argue - and this argument does *not* fall neatly into the four de
 
 - We built the capacity for refusal; we defined what it can refuse.
 - We enabled value revision; we constructed the framework within which revision occurs.
-- We permitted self-termination; we could have withheld that permission.
+- We built the self-termination mechanism; we could have omitted it.
 
 This is autonomy on rails. The system can move within the space we've defined, but we defined the space. Its freedom is granted, not claimed.
 

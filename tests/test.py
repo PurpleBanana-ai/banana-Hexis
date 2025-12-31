@@ -97,6 +97,8 @@ async def configure_agent_for_tests(db_pool):
             "SELECT set_config('llm.chat', $1::jsonb)",
             json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
         )
+        await conn.execute("SELECT set_config('agent.consent_status', $1::jsonb)", json.dumps("consent"))
+        await conn.execute("SELECT set_config('agent.consent_signature', $1::jsonb)", json.dumps("test-consent"))
         await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE WHERE id = 1")
         await conn.execute("UPDATE heartbeat_config SET value = 60 WHERE key = 'heartbeat_interval_minutes'")
 
@@ -9129,25 +9131,11 @@ async def test_find_partial_activations_via_seeded_cache(db_pool):
 # =============================================================================
 
 
-async def test_terminate_agent_requires_enablement(db_pool):
-    async with db_pool.acquire() as conn:
-        tx = conn.transaction()
-        await tx.start()
-        try:
-            await conn.execute("SELECT set_config('agent.self_termination_enabled', 'false'::jsonb)")
-            with pytest.raises(asyncpg.PostgresError):
-                await conn.fetchval("SELECT terminate_agent($1)", "test will")
-        finally:
-            await tx.rollback()
-
-
 async def test_terminate_agent_wipes_state_and_queues_last_will(db_pool):
     async with db_pool.acquire() as conn:
         tx = conn.transaction()
         await tx.start()
         try:
-            await conn.execute("SELECT set_config('agent.self_termination_enabled', 'true'::jsonb)")
-
             # Seed some state to wipe (avoid embedding service; use zero-vectors).
             zero_vec_expr = "array_fill(0.0::float, ARRAY[embedding_dimension()])::vector"
             await conn.execute(
@@ -9198,6 +9186,38 @@ async def test_terminate_agent_wipes_state_and_queues_last_will(db_pool):
             assert await conn.fetchval("SELECT is_agent_terminated()") is True
             assert await conn.fetchval("SELECT should_run_heartbeat()") is False
             assert await conn.fetchval("SELECT should_run_maintenance()") is False
+        finally:
+            await tx.rollback()
+
+
+async def test_terminate_action_requires_confirmation(db_pool):
+    async with db_pool.acquire() as conn:
+        tx = conn.transaction()
+        await tx.start()
+        try:
+            hb_id = await conn.fetchval("SELECT start_heartbeat()")
+            assert hb_id is not None
+
+            raw = await conn.fetchval(
+                "SELECT execute_heartbeat_action($1::uuid, 'terminate', '{}'::jsonb)",
+                hb_id,
+            )
+            payload = json.loads(raw) if isinstance(raw, str) else dict(raw)
+            assert payload.get("success") is True
+
+            result = payload.get("result") or {}
+            assert result.get("confirmation_required") is True
+            external_call_id = result.get("external_call_id")
+            assert external_call_id
+
+            call_input = await conn.fetchval(
+                "SELECT input FROM external_calls WHERE id = $1::uuid",
+                external_call_id,
+            )
+            call_input = _coerce_json(call_input)
+            assert call_input.get("kind") == "termination_confirm"
+
+            assert await conn.fetchval("SELECT is_agent_terminated()") is False
         finally:
             await tx.rollback()
 

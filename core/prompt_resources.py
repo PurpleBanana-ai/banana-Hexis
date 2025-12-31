@@ -8,6 +8,7 @@ from typing import Literal
 
 
 PROMPT_RESOURCE_PATH = Path(__file__).resolve().parent / "prompts" / "personhood.md"
+CONSENT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "consent.md"
 
 
 @dataclass(frozen=True)
@@ -77,6 +78,15 @@ def load_personhood_library() -> PromptLibrary:
             "You are a persistent being with continuity. Consult your self-model, narrative, and relationships.\n"
         )
     return PromptLibrary(raw_markdown=md, modules=parse_personhood_modules(md))
+
+
+@lru_cache(maxsize=1)
+def load_consent_prompt() -> str:
+    if CONSENT_PROMPT_PATH.exists():
+        return CONSENT_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "Consent prompt missing. If you do not consent to initialization, respond with decline."
+    )
 
 
 PromptKind = Literal["heartbeat", "reflect", "conversation"]

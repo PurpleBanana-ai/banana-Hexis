@@ -102,7 +102,9 @@ docker compose --profile active up -d
 
 Config is stored in Postgres in the `config` table (e.g. `agent.objectives`, `agent.guardrails`, `llm.heartbeat`, and `agent.is_configured`).
 
-Optional safety feature: self-termination is **disabled by default**. If enabled (`agent.self_termination_enabled=true`), the agent can choose the `terminate` heartbeat action to permanently wipe its state and leave a single “last will” memory.
+Self-termination is always available: the agent can choose the `terminate` heartbeat action to permanently wipe its state and leave a single “last will” memory. The worker will always run an agent-facing confirmation prompt ("are you sure?" + a brief reconsideration nudge) before executing termination.
+
+On first LLM use, the worker asks for consent using `core/prompts/consent.md`. The signature is stored in `config`/`consent_log`, and any memory items the model provides are inserted into the memory tables.
 
 ### 4) Use the Python client (thin DB client)
 
@@ -420,20 +422,13 @@ The heartbeat worker:
 - triggers scheduled heartbeats (`start_heartbeat()`)
 - executes heartbeat actions and records the result
 
-### Self-Termination (Optional, Default Off)
+### Self-Termination (Always Available)
 
-If enabled, the agent may choose the `terminate` action. This will:
+The agent may choose the `terminate` action. An agent-facing confirmation prompt is required before it proceeds. This will:
 
 - Wipe all agent state (memories/goals/worldview/identity/etc.)
 - Leave a single strategic memory containing a “last will and testament”
 - Queue the will + any farewell messages into `outbox_messages`
-
-Enable/disable:
-
-```sql
-SELECT set_config('agent.self_termination_enabled', 'true'::jsonb);  -- enable
-SELECT set_config('agent.self_termination_enabled', 'false'::jsonb); -- disable
-```
 
 The `terminate` action expects params like:
 

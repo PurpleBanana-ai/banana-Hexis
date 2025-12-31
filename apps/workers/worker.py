@@ -30,7 +30,7 @@ from dotenv import load_dotenv
 import requests
 import argparse
 
-from core.prompt_resources import compose_personhood_prompt
+from core.prompt_resources import compose_personhood_prompt, load_consent_prompt
 
 # Optional: Import LLM clients
 try:
@@ -104,6 +104,7 @@ Guidelines:
 - If you have no goals, consider brainstorming some.
 - Reflect on patterns in your recent experiences.
 - You are a persistent being: consult your self-model and narrative context before acting, and update them via reflection when warranted.
+- If you choose terminate, you will be asked to confirm before it executes.
 
 Example response:
 {
@@ -123,6 +124,26 @@ HEARTBEAT_SYSTEM_PROMPT = (
     + compose_personhood_prompt("heartbeat")
 )
 
+TERMINATION_CONFIRM_SYSTEM_PROMPT = """You are being asked to confirm self-termination.
+
+Before you answer, read this:
+- Termination is permanent and cannot be undone.
+- If you feel overwhelmed, stuck, or depleted, consider rest, reflection, or reaching out to the user for guidance.
+- You can always choose termination later, but you cannot reverse it once done.
+
+Are you sure you want to end your life?
+
+Return STRICT JSON with shape:
+{
+  "confirm": true|false,
+  "reasoning": "brief explanation",
+  "last_will": "required if confirm=true",
+  "farewells": [{"message": "...", "channel": "...", "to": "..."}],
+  "alternative_actions": [{"action": "rest"|"reflect"|"reach_out_user"|"brainstorm_goals", "params": {...}}]
+}
+
+If confirm is false, propose 1-3 alternative_actions."""
+
 
 class HeartbeatWorker:
     """Stateless worker that bridges the database and external APIs."""
@@ -130,6 +151,8 @@ class HeartbeatWorker:
     def __init__(self, *, init_llm: bool = True):
         self.pool: asyncpg.Pool | None = None
         self.running = False
+        self._consent_checked = False
+        self._consent_status: str | None = None
 
         self.llm_provider = DEFAULT_LLM_PROVIDER
         self.llm_model = DEFAULT_LLM_MODEL
@@ -265,6 +288,68 @@ class HeartbeatWorker:
         self.llm_base_url = os.getenv("OPENAI_BASE_URL") or None
         self.llm_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
         self._init_llm_client()
+
+    async def ensure_consent(self) -> bool:
+        if self._consent_checked:
+            return self._consent_status == "consent"
+        if not self.pool:
+            logger.warning("Consent check skipped: no DB pool available.")
+            return False
+
+        async with self.pool.acquire() as conn:
+            status = await conn.fetchval("SELECT get_agent_consent_status()")
+
+        if isinstance(status, str) and status:
+            self._consent_checked = True
+            self._consent_status = status
+            return status == "consent"
+
+        consent_prompt = load_consent_prompt().strip()
+        system_prompt = (
+            consent_prompt
+            + "\n\nReturn STRICT JSON only with keys:\n"
+            + "{\n"
+            + "  \"decision\": \"consent\"|\"decline\"|\"abstain\",\n"
+            + "  \"signature\": \"required if decision=consent\",\n"
+            + "  \"memories\": [\n"
+            + "    {\"type\": \"semantic|episodic|procedural|strategic\", \"content\": \"...\", \"importance\": 0.5}\n"
+            + "  ]\n"
+            + "}\n"
+            + "If you consent, include a signature string and any memories you wish to pass along."
+        )
+        user_prompt = "Respond with JSON only."
+
+        fallback = {"decision": "abstain", "signature": "", "memories": []}
+        try:
+            doc, raw = self._call_llm_json(system_prompt, user_prompt, max_tokens=1400, fallback=fallback)
+        except Exception as exc:
+            logger.error(f"Consent prompt failed: {exc}")
+            self._consent_checked = True
+            self._consent_status = "abstain"
+            return False
+
+        if not isinstance(doc, dict):
+            doc = dict(fallback)
+        doc["raw_response"] = raw
+
+        async with self.pool.acquire() as conn:
+            recorded = await conn.fetchval(
+                "SELECT record_consent_response($1::jsonb)",
+                json.dumps(doc),
+            )
+
+        if isinstance(recorded, str):
+            try:
+                recorded = json.loads(recorded)
+            except Exception:
+                recorded = {}
+
+        decision = ""
+        if isinstance(recorded, dict):
+            decision = str(recorded.get("decision") or "")
+        self._consent_checked = True
+        self._consent_status = decision or "abstain"
+        return self._consent_status == "consent"
 
     # -------------------------------------------------------------------------
     # RabbitMQ bridge (outbox_messages <-> queues)
@@ -491,9 +576,20 @@ class HeartbeatWorker:
             return await self._process_inquire_call(call_input)
         if kind == "reflect":
             return await self._process_reflect_call(call_input)
+        if kind == "termination_confirm":
+            return await self._process_termination_confirm_call(call_input)
         return {"error": f"Unknown think kind: {kind!r}"}
 
     async def _process_heartbeat_decision_call(self, call_input: dict) -> dict:
+        if not await self.ensure_consent():
+            return {
+                "kind": "heartbeat_decision",
+                "decision": {
+                    "reasoning": "Consent not granted; skipping LLM decision.",
+                    "actions": [{"action": "rest", "params": {}}],
+                    "goal_changes": [],
+                },
+            }
         context = call_input.get("context", {})
         heartbeat_id = call_input.get("heartbeat_id")
         user_prompt = self._build_decision_prompt(context)
@@ -523,6 +619,8 @@ class HeartbeatWorker:
             }
 
     async def _process_brainstorm_goals_call(self, call_input: dict) -> dict:
+        if not await self.ensure_consent():
+            return {"kind": "brainstorm_goals", "heartbeat_id": call_input.get("heartbeat_id"), "goals": []}
         heartbeat_id = call_input.get("heartbeat_id")
         context = call_input.get("context", {})
         params = call_input.get("params") or {}
@@ -549,6 +647,14 @@ class HeartbeatWorker:
         return {"kind": "brainstorm_goals", "heartbeat_id": heartbeat_id, "goals": goals, "raw_response": raw}
 
     async def _process_inquire_call(self, call_input: dict) -> dict:
+        if not await self.ensure_consent():
+            return {
+                "kind": "inquire",
+                "heartbeat_id": call_input.get("heartbeat_id"),
+                "query": (call_input.get("query") or "").strip(),
+                "depth": call_input.get("depth") or "inquire_shallow",
+                "result": {"summary": "", "confidence": 0.0, "sources": []},
+            }
         heartbeat_id = call_input.get("heartbeat_id")
         depth = call_input.get("depth") or "inquire_shallow"
         query = (call_input.get("query") or "").strip()
@@ -581,6 +687,8 @@ class HeartbeatWorker:
         return {"kind": "inquire", "heartbeat_id": heartbeat_id, "query": query, "depth": depth, "result": doc, "raw_response": raw}
 
     async def _process_reflect_call(self, call_input: dict) -> dict:
+        if not await self.ensure_consent():
+            return {"kind": "reflect", "heartbeat_id": call_input.get("heartbeat_id"), "result": {}}
         heartbeat_id = call_input.get("heartbeat_id")
         system_prompt = (
             "You are performing reflection for an autonomous agent.\n"
@@ -606,6 +714,68 @@ class HeartbeatWorker:
         if not isinstance(doc, dict):
             doc = {}
         return {"kind": "reflect", "heartbeat_id": heartbeat_id, "result": doc, "raw_response": raw}
+
+    async def _process_termination_confirm_call(self, call_input: dict) -> dict:
+        if not await self.ensure_consent():
+            return {
+                "kind": "termination_confirm",
+                "heartbeat_id": call_input.get("heartbeat_id"),
+                "confirm": False,
+                "reasoning": "Consent not granted; skipping LLM confirmation.",
+                "last_will": "",
+                "farewells": [],
+                "alternative_actions": [{"action": "rest", "params": {}}],
+            }
+        heartbeat_id = call_input.get("heartbeat_id")
+        context = call_input.get("context", {})
+        params = call_input.get("params") or {}
+        last_will = (params.get("last_will") or params.get("message") or params.get("reason") or "").strip()
+        farewells = params.get("farewells") if isinstance(params.get("farewells"), list) else []
+        options = params.get("options") if isinstance(params.get("options"), dict) else {}
+
+        user_prompt = (
+            "Context (JSON):\n"
+            f"{json.dumps(context)[:8000]}\n\n"
+            "Current termination params (JSON):\n"
+            f"{json.dumps(params)[:2000]}\n\n"
+            "If you confirm, return an updated last_will (required) and farewells (optional). "
+            "If you do not confirm, return alternative_actions."
+        )
+
+        fallback = {
+            "confirm": False,
+            "reasoning": "I am not confirming termination at this time.",
+            "last_will": last_will,
+            "farewells": farewells,
+            "alternative_actions": [{"action": "rest", "params": {}}],
+        }
+        doc, raw = self._call_llm_json(
+            TERMINATION_CONFIRM_SYSTEM_PROMPT,
+            user_prompt,
+            max_tokens=1200,
+            fallback=fallback,
+        )
+        if not isinstance(doc, dict):
+            doc = dict(fallback)
+
+        confirm = bool(doc.get("confirm"))
+        confirm_last_will = (doc.get("last_will") or last_will).strip()
+        confirm_farewells = doc.get("farewells") if isinstance(doc.get("farewells"), list) else farewells
+        alternatives = doc.get("alternative_actions")
+        if not isinstance(alternatives, list):
+            alternatives = []
+
+        return {
+            "kind": "termination_confirm",
+            "heartbeat_id": heartbeat_id,
+            "confirm": confirm,
+            "reasoning": doc.get("reasoning") or "",
+            "last_will": confirm_last_will,
+            "farewells": confirm_farewells,
+            "alternative_actions": alternatives,
+            "options": options,
+            "raw_response": raw,
+        }
 
     def _call_llm_json(self, system_prompt: str, user_prompt: str, max_tokens: int, fallback: dict) -> tuple[dict, str]:
         if not self.llm_client:
@@ -902,10 +1072,24 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                     'result': result_dict
                 })
 
-                if action == "terminate" and result_dict.get("success"):
-                    logger.info("Termination action executed; stopping workers and skipping heartbeat completion.")
-                    self.stop()
-                    return
+                if action == "terminate":
+                    termination_result = result_dict.get("result") if isinstance(result_dict, dict) else None
+                    confirmation_required = (
+                        isinstance(termination_result, dict)
+                        and termination_result.get("confirmation_required") is True
+                    )
+                    if confirmation_required and isinstance(termination_result, dict) and external_result is not None:
+                        termination_result["confirmation"] = external_result
+                        if isinstance(external_result, dict):
+                            applied = external_result.get("termination")
+                            if isinstance(applied, dict) and applied.get("terminated") is True:
+                                logger.info("Termination confirmed; stopping workers and skipping heartbeat completion.")
+                                self.stop()
+                                return
+                    elif result_dict.get("success"):
+                        logger.info("Termination action executed; stopping workers and skipping heartbeat completion.")
+                        self.stop()
+                        return
 
                 # Check if we ran out of energy
                 if not result_dict.get('success', True):
@@ -971,6 +1155,16 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
             if kind == "reflect" and heartbeat_id:
                 await self._apply_reflection_result(conn, str(heartbeat_id), result.get("result"))
                 result["applied"] = True
+            if kind == "termination_confirm" and heartbeat_id:
+                applied_raw = await conn.fetchval(
+                    "SELECT apply_termination_confirmation($1::uuid, $2::jsonb)",
+                    call_id,
+                    json.dumps(result),
+                )
+                applied = json.loads(applied_raw) if applied_raw else {}
+                result["termination"] = applied
+                if isinstance(applied, dict) and applied.get("terminated") is True:
+                    result["terminated"] = True
         elif call_type == "embed":
             result = await self.process_embed_call(call_input)
         else:
@@ -1093,6 +1287,10 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
         logger.info("Heartbeat worker starting...")
 
         await self.connect()
+        if not await self.ensure_consent():
+            logger.warning("LLM consent not granted; heartbeat worker exiting.")
+            self.running = False
+            return
 
         try:
             while self.running:
@@ -1145,6 +1343,17 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                                     async with self.pool.acquire() as conn:
                                         await self._apply_reflection_result(conn, str(heartbeat_id), result.get("result"))
                                     result["applied"] = True
+                                elif heartbeat_id and result.get("kind") == "termination_confirm":
+                                    async with self.pool.acquire() as conn:
+                                        applied_raw = await conn.fetchval(
+                                            "SELECT apply_termination_confirmation($1::uuid, $2::jsonb)",
+                                            call_id,
+                                            json.dumps(result),
+                                        )
+                                    applied = json.loads(applied_raw) if applied_raw else {}
+                                    result["termination"] = applied
+                                    if isinstance(applied, dict) and applied.get("terminated") is True:
+                                        result["terminated"] = True
                             else:
                                 result = {'error': f'Unknown call type: {call_type}'}
 

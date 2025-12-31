@@ -2426,7 +2426,7 @@ INSERT INTO heartbeat_config (key, value, description) VALUES
     ('cost_reach_out_user', 5, 'Message user'),
     ('cost_inquire_deep', 6, 'Deep web research'),
     ('cost_reach_out_public', 7, 'Public posting'),
-    ('cost_terminate', 0, 'Self-termination (requires explicit enablement)');
+    ('cost_terminate', 0, 'Self-termination');
 
 -- ============================================================================
 -- SUBCONSCIOUS MAINTENANCE CONFIGURATION
@@ -2455,6 +2455,16 @@ CREATE TABLE config (
     updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
 );
 
+CREATE TABLE consent_log (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    decided_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    decision TEXT NOT NULL CHECK (decision IN ('consent', 'decline', 'abstain')),
+    signature TEXT,
+    response JSONB NOT NULL,
+    memory_ids UUID[] DEFAULT '{}'::UUID[],
+    errors JSONB
+);
+
 CREATE OR REPLACE FUNCTION set_config(p_key TEXT, p_value JSONB)
 RETURNS VOID AS $$
 BEGIN
@@ -2470,6 +2480,19 @@ CREATE OR REPLACE FUNCTION get_config(p_key TEXT)
 RETURNS JSONB AS $$
     SELECT value FROM config WHERE key = p_key;
 $$ LANGUAGE sql STABLE;
+
+CREATE OR REPLACE FUNCTION get_agent_consent_status()
+RETURNS TEXT AS $$
+DECLARE
+    raw TEXT;
+BEGIN
+    SELECT value::text INTO raw FROM config WHERE key = 'agent.consent_status';
+    IF raw IS NULL THEN
+        RETURN NULL;
+    END IF;
+    RETURN btrim(raw, '"');
+END;
+$$ LANGUAGE plpgsql STABLE;
 
 CREATE OR REPLACE FUNCTION is_agent_configured()
 RETURNS BOOLEAN AS $$
@@ -2497,13 +2520,11 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql STABLE;
 
+-- Self-termination is always available; retain this helper for compatibility.
 CREATE OR REPLACE FUNCTION is_self_termination_enabled()
 RETURNS BOOLEAN AS $$
 BEGIN
-    RETURN COALESCE(
-        (SELECT value = 'true'::jsonb FROM config WHERE key = 'agent.self_termination_enabled'),
-        FALSE
-    );
+    RETURN TRUE;
 END;
 $$ LANGUAGE plpgsql STABLE;
 
@@ -2995,7 +3016,6 @@ END;
 $$ LANGUAGE plpgsql;
 
 -- Permanently end the agent's life: wipe all state, keep a single "last will" memory, and queue farewells + the will into outbox.
--- NOTE: this is intentionally gated behind `agent.self_termination_enabled=true`.
 CREATE OR REPLACE FUNCTION terminate_agent(
     p_last_will TEXT,
     p_farewells JSONB DEFAULT '[]'::jsonb,
@@ -3015,10 +3035,6 @@ DECLARE
 BEGIN
     IF p_last_will IS NULL OR btrim(p_last_will) = '' THEN
         RAISE EXCEPTION 'terminate_agent requires a non-empty p_last_will';
-    END IF;
-
-    IF NOT is_self_termination_enabled() THEN
-        RAISE EXCEPTION 'Self-termination is disabled (set config agent.self_termination_enabled=true to allow)';
     END IF;
 
     IF is_agent_terminated() THEN
@@ -3182,6 +3198,137 @@ BEGIN
         'termination_memory_id', will_memory_id,
         'will_outbox_id', will_outbox_id,
         'farewell_outbox_ids', to_jsonb(farewell_outbox_ids)
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Apply an agent-facing termination confirmation result to execute termination (if confirmed).
+CREATE OR REPLACE FUNCTION apply_termination_confirmation(
+    p_call_id UUID,
+    p_output JSONB
+)
+RETURNS JSONB AS $$
+DECLARE
+    call_input JSONB;
+    params JSONB;
+    confirm BOOLEAN;
+    last_will TEXT;
+    farewells JSONB;
+    options JSONB;
+    termination_result JSONB;
+BEGIN
+    SELECT input INTO call_input FROM external_calls WHERE id = p_call_id;
+    IF call_input IS NULL THEN
+        RETURN jsonb_build_object('error', 'call_not_found');
+    END IF;
+
+    params := COALESCE(call_input->'params', '{}'::jsonb);
+    confirm := COALESCE((p_output->>'confirm')::boolean, FALSE);
+
+    IF NOT confirm THEN
+        RETURN jsonb_build_object('confirmed', false, 'terminated', false);
+    END IF;
+
+    last_will := COALESCE(
+        NULLIF(p_output->>'last_will', ''),
+        NULLIF(params->>'last_will', ''),
+        NULLIF(params->>'message', ''),
+        NULLIF(params->>'reason', ''),
+        ''
+    );
+    IF last_will = '' THEN
+        RETURN jsonb_build_object('confirmed', true, 'terminated', false, 'error', 'missing_last_will');
+    END IF;
+
+    farewells := COALESCE(p_output->'farewells', params->'farewells', '[]'::jsonb);
+    options := COALESCE(p_output->'options', params->'options', '{}'::jsonb);
+
+    termination_result := terminate_agent(
+        last_will,
+        COALESCE(farewells, '[]'::jsonb),
+        COALESCE(options, '{}'::jsonb)
+    );
+
+    RETURN jsonb_build_object(
+        'confirmed', true,
+        'terminated', true,
+        'result', termination_result
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION record_consent_response(p_response JSONB)
+RETURNS JSONB AS $$
+DECLARE
+    decision TEXT;
+    signature TEXT;
+    memory_items JSONB;
+    memory_ids UUID[] := ARRAY[]::UUID[];
+    memory_error TEXT;
+    log_id UUID;
+BEGIN
+    decision := lower(COALESCE(p_response->>'decision', p_response->>'consent', ''));
+    IF decision IN ('true', 'yes', 'consent', 'accept', 'accepted') THEN
+        decision := 'consent';
+    ELSIF decision IN ('false', 'no', 'decline', 'declined', 'refuse', 'rejected') THEN
+        decision := 'decline';
+    ELSIF decision IN ('abstain', 'defer', 'undecided', 'unknown', '') THEN
+        decision := 'abstain';
+    ELSE
+        decision := 'abstain';
+    END IF;
+
+    signature := NULLIF(p_response->>'signature', '');
+    IF decision = 'consent' AND signature IS NULL THEN
+        decision := 'abstain';
+    END IF;
+
+    memory_items := p_response->'memories';
+    IF decision = 'consent'
+        AND memory_items IS NOT NULL
+        AND jsonb_typeof(memory_items) = 'array'
+        AND jsonb_array_length(memory_items) > 0 THEN
+        BEGIN
+            memory_ids := batch_create_memories(memory_items);
+        EXCEPTION
+            WHEN OTHERS THEN
+                memory_error := SQLERRM;
+                memory_ids := ARRAY[]::UUID[];
+        END;
+    END IF;
+
+    INSERT INTO consent_log (decision, signature, response, memory_ids, errors)
+    VALUES (
+        decision,
+        signature,
+        p_response,
+        memory_ids,
+        CASE
+            WHEN memory_error IS NULL THEN NULL
+            ELSE jsonb_build_object('memory_error', memory_error)
+        END
+    )
+    RETURNING id INTO log_id;
+
+    PERFORM set_config('agent.consent_status', to_jsonb(decision));
+    PERFORM set_config('agent.consent_recorded_at', to_jsonb(CURRENT_TIMESTAMP));
+    PERFORM set_config('agent.consent_log_id', to_jsonb(log_id::text));
+    IF signature IS NOT NULL THEN
+        PERFORM set_config('agent.consent_signature', to_jsonb(signature));
+    END IF;
+    IF memory_ids IS NOT NULL THEN
+        PERFORM set_config('agent.consent_memory_ids', to_jsonb(memory_ids));
+    END IF;
+
+    RETURN jsonb_build_object(
+        'decision', decision,
+        'signature', signature,
+        'memory_ids', to_jsonb(memory_ids),
+        'log_id', log_id,
+        'errors', CASE
+            WHEN memory_error IS NULL THEN NULL
+            ELSE jsonb_build_object('memory_error', memory_error)
+        END
     );
 END;
 $$ LANGUAGE plpgsql;
@@ -3792,11 +3939,27 @@ BEGIN
         WHEN 'terminate' THEN
             -- Self-termination: wipe state and leave a single last-will memory.
             -- Expect params: { "last_will": "...", "farewells": [ { "message": "...", ... } ], "options": {...} }
-            result := terminate_agent(
-                COALESCE(NULLIF(p_params->>'last_will', ''), NULLIF(p_params->>'message', ''), NULLIF(p_params->>'reason', ''), ''),
-                COALESCE(p_params->'farewells', '[]'::jsonb),
-                COALESCE(p_params->'options', '{}'::jsonb)
-            );
+            IF COALESCE(p_params->'confirmed', 'false'::jsonb) = 'true'::jsonb THEN
+                result := terminate_agent(
+                    COALESCE(NULLIF(p_params->>'last_will', ''), NULLIF(p_params->>'message', ''), NULLIF(p_params->>'reason', ''), ''),
+                    COALESCE(p_params->'farewells', '[]'::jsonb),
+                    COALESCE(p_params->'options', '{}'::jsonb)
+                );
+            ELSE
+                INSERT INTO external_calls (call_type, input, heartbeat_id)
+                VALUES (
+                    'think',
+                    jsonb_build_object(
+                        'kind', 'termination_confirm',
+                        'heartbeat_id', p_heartbeat_id,
+                        'context', gather_turn_context(),
+                        'params', COALESCE(p_params, '{}'::jsonb)
+                    ),
+                    p_heartbeat_id
+                )
+                RETURNING id INTO queued_call_id;
+                result := jsonb_build_object('confirmation_required', true, 'external_call_id', queued_call_id);
+            END IF;
 
         WHEN 'rest' THEN
             -- Do nothing, energy already preserved
@@ -5324,11 +5487,27 @@ BEGIN
         WHEN 'terminate' THEN
             -- Self-termination: wipe state and leave a single last-will memory.
             -- Expect params: { "last_will": "...", "farewells": [ { "message": "...", ... } ], "options": {...} }
-            result := terminate_agent(
-                COALESCE(NULLIF(p_params->>'last_will', ''), NULLIF(p_params->>'message', ''), NULLIF(p_params->>'reason', ''), ''),
-                COALESCE(p_params->'farewells', '[]'::jsonb),
-                COALESCE(p_params->'options', '{}'::jsonb)
-            );
+            IF COALESCE(p_params->'confirmed', 'false'::jsonb) = 'true'::jsonb THEN
+                result := terminate_agent(
+                    COALESCE(NULLIF(p_params->>'last_will', ''), NULLIF(p_params->>'message', ''), NULLIF(p_params->>'reason', ''), ''),
+                    COALESCE(p_params->'farewells', '[]'::jsonb),
+                    COALESCE(p_params->'options', '{}'::jsonb)
+                );
+            ELSE
+                INSERT INTO external_calls (call_type, input, heartbeat_id)
+                VALUES (
+                    'think',
+                    jsonb_build_object(
+                        'kind', 'termination_confirm',
+                        'heartbeat_id', p_heartbeat_id,
+                        'context', gather_turn_context(),
+                        'params', COALESCE(p_params, '{}'::jsonb)
+                    ),
+                    p_heartbeat_id
+                )
+                RETURNING id INTO queued_call_id;
+                result := jsonb_build_object('confirmation_required', true, 'external_call_id', queued_call_id);
+            END IF;
 
         WHEN 'rest' THEN
             result := jsonb_build_object('rested', true, 'energy_preserved', current_e - action_cost);
