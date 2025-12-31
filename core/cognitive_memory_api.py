@@ -360,6 +360,50 @@ class CognitiveMemory:
                 )
             return [self._row_to_memory(row) for row in rows]
 
+    async def list_recent_episodes(self, *, limit: int = 5) -> list[dict[str, Any]]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    e.id,
+                    e.started_at,
+                    e.ended_at,
+                    e.episode_type,
+                    e.summary,
+                    COUNT(em.memory_id) AS memory_count
+                FROM episodes e
+                LEFT JOIN episode_memories em ON e.id = em.episode_id
+                GROUP BY e.id
+                ORDER BY e.started_at DESC
+                LIMIT $1
+                """,
+                limit,
+            )
+            return [dict(r) for r in rows]
+
+    async def recall_episode(self, episode_id: UUID) -> list[Memory]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    m.id,
+                    m.type,
+                    m.content,
+                    m.importance,
+                    m.trust_level,
+                    m.source_attribution,
+                    m.created_at,
+                    emd.emotional_valence
+                FROM episode_memories em
+                JOIN memories m ON em.memory_id = m.id
+                LEFT JOIN episodic_memories emd ON m.id = emd.memory_id
+                WHERE em.episode_id = $1
+                ORDER BY em.sequence_order ASC
+                """,
+                episode_id,
+            )
+            return [self._row_to_memory(row) for row in rows]
+
     # =========================================================================
     # REMEMBER
     # =========================================================================
@@ -907,6 +951,15 @@ class CognitiveMemorySync:
 
     def recall(self, query: str, **kwargs: Any) -> RecallResult:
         return self._loop.run_until_complete(self._async.recall(query, **kwargs))
+
+    def recall_recent(self, *, limit: int = 10, memory_type: MemoryType | None = None) -> list[Memory]:
+        return self._loop.run_until_complete(self._async.recall_recent(limit=limit, memory_type=memory_type))
+
+    def list_recent_episodes(self, *, limit: int = 5) -> list[dict[str, Any]]:
+        return self._loop.run_until_complete(self._async.list_recent_episodes(limit=limit))
+
+    def recall_episode(self, episode_id: UUID) -> list[Memory]:
+        return self._loop.run_until_complete(self._async.recall_episode(episode_id))
 
     def remember(self, content: str, **kwargs: Any) -> UUID:
         return self._loop.run_until_complete(self._async.remember(content, **kwargs))

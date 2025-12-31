@@ -1,15 +1,12 @@
-import pytest
 import asyncio
-import asyncpg
 import json
-import numpy as np
+import os
 import time
 import uuid
-import os
-import subprocess
-import sys
-from pathlib import Path
 from datetime import timedelta
+
+import numpy as np
+import pytest
 from tenacity import (
     AsyncRetrying,
     RetryError,
@@ -19,119 +16,16 @@ from tenacity import (
     wait_fixed,
 )
 
-# Update to use loop_scope instead of scope
-pytestmark = pytest.mark.asyncio(loop_scope="session")
+from tests.utils import (
+    _coerce_json,
+    _restore_embedding_retry_config,
+    _set_embedding_retry_config,
+    get_test_identifier,
+)
 
-# Global test session ID to help with cleanup
-TEST_SESSION_ID = str(uuid.uuid4())[:8]
+pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.db]
+
 EMBEDDING_DIMENSION = int(os.getenv("EMBEDDING_DIMENSION", os.getenv("EMBEDDING_DIM", "768")))
-
-def get_test_identifier(test_name: str) -> str:
-    """Generate a unique identifier for test data"""
-    return f"{test_name}_{TEST_SESSION_ID}_{int(time.time() * 1000)}"
-
-def _db_dsn() -> str:
-    db_host = os.getenv("POSTGRES_HOST", "localhost")
-    db_port = os.getenv("POSTGRES_PORT", "43815")
-    db_name = os.getenv("POSTGRES_DB", "hexis_memory")
-    db_user = os.getenv("POSTGRES_USER", "hexis_user")
-    db_password = os.getenv("POSTGRES_PASSWORD", "hexis_password")
-    return f"postgresql://{db_user}:{db_password}@{db_host}:{db_port}/{db_name}"
-
-@pytest.fixture(scope="session", autouse=True)
-async def sync_test_embedding_dimension_from_db(db_pool):
-    """
-    Sync the test process' EMBEDDING_DIMENSION with the database's configured dimension.
-
-    Many tests build vectors client-side (e.g., vector literal strings) and must match
-    the DB's pgvector typmod.
-    """
-    global EMBEDDING_DIMENSION
-    async with db_pool.acquire() as conn:
-        dim = await conn.fetchval("SELECT embedding_dimension()")
-    EMBEDDING_DIMENSION = int(dim)
-
-@pytest.fixture(scope="session")
-async def db_pool():
-    """Create a connection pool for testing"""
-    db_url = _db_dsn()
-    # Postgres restarts once during initdb, and this repo's schema init can take >60s on cold starts.
-    wait_seconds = int(os.getenv("POSTGRES_WAIT_SECONDS", "180"))
-    pool = None
-    retrying = AsyncRetrying(
-        stop=stop_after_delay(wait_seconds),
-        wait=wait_fixed(1),
-        retry=retry_if_exception_type(Exception),
-        reraise=True,
-    )
-    async for attempt in retrying:
-        with attempt:
-            pool = await asyncpg.create_pool(
-                db_url,
-                ssl=False,
-                min_size=2,
-                max_size=20,
-                command_timeout=60.0,
-            )
-    assert pool is not None
-    yield pool
-    await pool.close()
-
-@pytest.fixture(scope="session", autouse=True)
-async def configure_agent_for_tests(db_pool):
-    """
-    Heartbeats are gated behind `agent.is_configured`.
-
-    Most tests exercise heartbeat/worker behavior, so default to configured.
-    Individual tests can override by deleting the config row in a transaction.
-    """
-    async with db_pool.acquire() as conn:
-        # Minimal config so CLI `hexis config validate` passes in subprocess smoke tests.
-        await conn.execute("SELECT set_config('agent.is_configured', 'true'::jsonb)")
-        await conn.execute("SELECT set_config('agent.objectives', $1::jsonb)", json.dumps(["test objective"]))
-        await conn.execute(
-            "SELECT set_config('llm.heartbeat', $1::jsonb)",
-            json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
-        )
-        await conn.execute(
-            "SELECT set_config('llm.chat', $1::jsonb)",
-            json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
-        )
-        await conn.execute("SELECT set_config('agent.consent_status', $1::jsonb)", json.dumps("consent"))
-        await conn.execute("SELECT set_config('agent.consent_signature', $1::jsonb)", json.dumps("test-consent"))
-        await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE WHERE id = 1")
-        await conn.execute("UPDATE heartbeat_config SET value = 60 WHERE key = 'heartbeat_interval_minutes'")
-
-@pytest.fixture(scope="session", autouse=True)
-async def apply_repo_migrations(db_pool):
-    """
-    Apply any optional SQL patches from migrations/ once per test session.
-
-    The DB in Docker may persist across runs; this keeps core functions
-    and tables up to date without requiring a full volume reset.
-    """
-    if os.getenv("APPLY_REPO_MIGRATIONS", "0").lower() not in {"1", "true", "yes", "on"}:
-        return
-    migrations_dir = Path(__file__).resolve().parent / "migrations"
-    if not migrations_dir.exists():
-        return
-
-    migration_paths = sorted(p for p in migrations_dir.glob("*.sql") if p.is_file())
-    if not migration_paths:
-        return
-
-    async with db_pool.acquire() as conn:
-        for path in migration_paths:
-            sql = path.read_text(encoding="utf-8")
-            await conn.execute(sql)
-
-@pytest.fixture(autouse=True)
-async def setup_db(db_pool):
-    """Setup the database before each test"""
-    async with db_pool.acquire() as conn:
-        await conn.execute("LOAD 'age';")
-        await conn.execute("SET search_path = ag_catalog, public;")
-    yield
 
 async def test_extensions(db_pool):
     """Test that required PostgreSQL extensions are installed"""
@@ -1773,7 +1667,7 @@ async def test_cluster_insights_view(db_pool):
     async with db_pool.acquire() as conn:
         # Create cluster with members using unique name
         import time
-        unique_name = f'Insight Test Cluster {int(time.time() * 1000)}'
+        unique_name = f'Insight Test Cluster {get_test_identifier("insight_cluster")}'
         cluster_id = await conn.fetchval("""
             INSERT INTO memory_clusters (
                 cluster_type,
@@ -1827,7 +1721,7 @@ async def test_active_themes_view(db_pool):
     async with db_pool.acquire() as conn:
         # Create active cluster with unique name
         import time
-        unique_name = f'Recent Anxiety {int(time.time() * 1000)}'
+        unique_name = f'Recent Anxiety {get_test_identifier("recent_anxiety")}'
         cluster_id = await conn.fetchval("""
             INSERT INTO memory_clusters (
                 cluster_type,
@@ -1862,7 +1756,7 @@ async def test_update_cluster_activation_trigger(db_pool):
     async with db_pool.acquire() as conn:
         # Create cluster with unique name
         import time
-        unique_name = f'Activation Test {int(time.time() * 1000)}'
+        unique_name = f'Activation Test {get_test_identifier("activation_test")}'
         cluster_id = await conn.fetchval("""
             INSERT INTO memory_clusters (
                 cluster_type,
@@ -2968,7 +2862,7 @@ async def test_view_calculation_accuracy(db_pool):
     async with db_pool.acquire() as conn:
         # Create test data for memory_health view with unique content to avoid interference
         import time
-        unique_suffix = str(int(time.time() * 1000))
+        unique_suffix = uuid.uuid4().hex[:8]
         test_memories = []
         for i in range(10):
             memory_id = await conn.fetchval("""
@@ -4907,7 +4801,7 @@ async def test_concepts_table(db_pool):
     """Test concepts table structure and constraints"""
     async with db_pool.acquire() as conn:
         # Use unique name for this test
-        unique_name = f'TestConcept_{int(time.time() * 1000)}'
+        unique_name = f'TestConcept_{get_test_identifier("concept")}'
 
         # Create concept
         concept_id = await conn.fetchval("""
@@ -4932,7 +4826,7 @@ async def test_concept_hierarchy(db_pool):
     """Test concept hierarchy with ancestors and path_text"""
     async with db_pool.acquire() as conn:
         # Use unique suffix to avoid conflicts
-        suffix = f'_{int(time.time() * 1000)}'
+        suffix = f'_{uuid.uuid4().hex[:8]}'
 
         # Create hierarchy: Entity -> Organism -> Animal -> Dog
         entity_id = await conn.fetchval("""
@@ -5802,7 +5696,7 @@ async def test_cleanup_working_memory_returns_count(db_pool):
     """Test cleanup_working_memory() returns count of deleted items"""
     async with db_pool.acquire() as conn:
         # Use unique content identifier
-        unique_id = f'cleanup_test_{int(time.time() * 1000)}'
+        unique_id = f'cleanup_test_{uuid.uuid4().hex[:8]}'
 
         # Clear existing expired entries first
         await conn.execute("""
@@ -6077,7 +5971,7 @@ async def test_memory_health_view_aggregations(db_pool):
     async with db_pool.acquire() as conn:
         # Create memories of known type with known values
         import time
-        unique_suffix = str(int(time.time() * 1000))
+        unique_suffix = uuid.uuid4().hex[:8]
 
         for i in range(5):
             await conn.execute("""
@@ -6171,48 +6065,6 @@ async def test_gin_index_content_search(db_pool):
 # These tests exercise functions that were previously untested or only
 # partially tested. They require the embedding service to be running.
 # =============================================================================
-
-@pytest.fixture(scope="session")
-async def ensure_embedding_service(db_pool):
-    """
-    Ensure embedding service is available.
-
-    This fixture retries for a short window so tests don't flake while Docker
-    is still initializing. If the service never becomes healthy, fail fast
-    with a clear timeout error (no skipping).
-    """
-    async with db_pool.acquire() as conn:
-        # Ensure correct service URL
-        await conn.execute("""
-            INSERT INTO embedding_config (key, value)
-            VALUES ('service_url', 'http://embeddings:80/embed')
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-        """)
-
-        wait_seconds = int(os.getenv("EMBEDDINGS_WAIT_SECONDS", "30"))
-        retrying = AsyncRetrying(
-            stop=stop_after_delay(wait_seconds),
-            wait=wait_fixed(1),
-            retry=(retry_if_result(lambda ok: not ok) | retry_if_exception_type(Exception)),
-            reraise=False,
-        )
-
-        try:
-            ok = await retrying(conn.fetchval, "SELECT check_embedding_service_health()")
-            assert ok is True
-            return True
-        except RetryError as e:
-            last_exc = e.last_attempt.exception()
-            last_res = None
-            try:
-                last_res = e.last_attempt.result()
-            except Exception:
-                pass
-            pytest.fail(
-                f"Embedding service not available after {wait_seconds}s (service_url=http://embeddings:80/embed). "
-                f"last_exception={last_exc!r} last_result={last_res!r}"
-            )
-
 
 # -----------------------------------------------------------------------------
 # get_embedding() COMPREHENSIVE TESTS
@@ -7048,7 +6900,7 @@ async def test_embedding_cache_lifecycle(db_pool, ensure_embedding_service):
 # HEARTBEAT TESTS (DB + WORKER CONTRACT)
 # -----------------------------------------------------------------------------
 
-@pytest.fixture(scope="session")
+@pytest.fixture(scope="module")
 async def apply_heartbeat_migration(db_pool):
     """
     Legacy fixture retained for older test structure.
@@ -7297,64 +7149,6 @@ async def test_execute_heartbeat_action_insufficient_energy_no_side_effects(db_p
         # Restore for subsequent tests (heartbeat_state is a singleton)
         await conn.execute("UPDATE heartbeat_state SET current_energy = 10 WHERE id = 1")
 
-
-def _coerce_json(val):
-    if isinstance(val, str):
-        return json.loads(val)
-    return val
-
-
-async def _set_embedding_retry_config(
-    conn,
-    retry_seconds: int,
-    retry_interval_seconds: float,
-):
-    original_retry_seconds = await conn.fetchval(
-        "SELECT value FROM embedding_config WHERE key = 'retry_seconds'"
-    )
-    original_retry_interval_seconds = await conn.fetchval(
-        "SELECT value FROM embedding_config WHERE key = 'retry_interval_seconds'"
-    )
-    await conn.execute(
-        """
-        INSERT INTO embedding_config (key, value)
-        VALUES ('retry_seconds', $1)
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-        """,
-        str(retry_seconds),
-    )
-    await conn.execute(
-        """
-        INSERT INTO embedding_config (key, value)
-        VALUES ('retry_interval_seconds', $1)
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-        """,
-        str(retry_interval_seconds),
-    )
-    return original_retry_seconds, original_retry_interval_seconds
-
-
-async def _restore_embedding_retry_config(
-    conn,
-    original_retry_seconds,
-    original_retry_interval_seconds,
-):
-    if original_retry_seconds is None:
-        await conn.execute("DELETE FROM embedding_config WHERE key = 'retry_seconds'")
-    else:
-        await conn.execute(
-            "UPDATE embedding_config SET value = $1 WHERE key = 'retry_seconds'",
-            original_retry_seconds,
-        )
-    if original_retry_interval_seconds is None:
-        await conn.execute(
-            "DELETE FROM embedding_config WHERE key = 'retry_interval_seconds'"
-        )
-    else:
-        await conn.execute(
-            "UPDATE embedding_config SET value = $1 WHERE key = 'retry_interval_seconds'",
-            original_retry_interval_seconds,
-        )
 
 
 async def test_worker_claim_pending_call_is_concurrency_safe(db_pool, apply_heartbeat_migration):
@@ -8229,319 +8023,6 @@ async def test_recompute_neighborhood_writes_neighbors(db_pool):
 
 
 # -----------------------------------------------------------------------------
-# PYTHON API SURFACE (core/cognitive_memory_api.py)
-# -----------------------------------------------------------------------------
-
-@pytest.fixture(scope="session")
-async def cognitive_memory_client(ensure_embedding_service):
-    from core.cognitive_memory_api import CognitiveMemory
-
-    client = await CognitiveMemory.create(_db_dsn(), min_size=1, max_size=5)
-    yield client
-    await client.close()
-
-
-async def test_api_remember_and_recall_by_id(cognitive_memory_client, db_pool):
-    from core.cognitive_memory_api import MemoryType
-
-    test_id = get_test_identifier("api_remember")
-    content = f"API semantic memory {test_id}"
-
-    mid = await cognitive_memory_client.remember(
-        content,
-        type=MemoryType.SEMANTIC,
-        importance=0.7,
-    )
-
-    try:
-        fetched = await cognitive_memory_client.recall_by_id(mid)
-        assert fetched is not None
-        assert fetched.id == mid
-        assert fetched.type == MemoryType.SEMANTIC
-        assert fetched.content == content
-        assert fetched.importance >= 0.7
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM memories WHERE id = $1", mid)
-
-
-async def test_api_semantic_sources_affect_trust(cognitive_memory_client, db_pool):
-    from core.cognitive_memory_api import MemoryType
-
-    test_id = get_test_identifier("api_trust")
-    content = f"API claim from twitter {test_id}"
-    source_a = {"kind": "twitter", "ref": f"https://twitter.com/example/status/{test_id}", "trust": 0.2}
-    source_b = {"kind": "paper", "ref": f"doi:10.0000/{test_id}", "trust": 0.9}
-
-    mid = await cognitive_memory_client.remember(
-        content,
-        type=MemoryType.SEMANTIC,
-        importance=0.6,
-        source_references=source_a,
-    )
-
-    try:
-        m = await cognitive_memory_client.recall_by_id(mid)
-        assert m is not None
-        assert m.trust_level is not None
-        assert m.trust_level <= 0.30
-        assert isinstance(m.source_attribution, dict)
-
-        await cognitive_memory_client.add_source(mid, source_b)
-        profile = await cognitive_memory_client.get_truth_profile(mid)
-        assert profile.get("type") == "semantic"
-        assert float(profile.get("trust_level", 0)) > float(m.trust_level)
-        assert int(profile.get("source_count", 0)) >= 2
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM memories WHERE id = $1", mid)
-
-
-async def test_api_remember_links_concepts_and_find_by_concept(cognitive_memory_client, db_pool):
-    from core.cognitive_memory_api import MemoryType
-
-    test_id = get_test_identifier("api_concepts")
-    content = f"API concept memory {test_id}"
-    concept = f"Concept_{test_id}"
-
-    mid = await cognitive_memory_client.remember(
-        content,
-        type=MemoryType.SEMANTIC,
-        importance=0.6,
-        concepts=[concept],
-    )
-
-    try:
-        hits = await cognitive_memory_client.find_by_concept(concept, limit=25)
-        assert any(m.id == mid for m in hits)
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM memories WHERE id = $1", mid)
-            await conn.execute("DELETE FROM concepts WHERE name = $1", concept)
-
-
-async def test_api_hydrate_returns_context(cognitive_memory_client, db_pool):
-    from core.cognitive_memory_api import MemoryType
-
-    test_id = get_test_identifier("api_hydrate")
-    content = f"Hydrate memory {test_id}"
-
-    mid = await cognitive_memory_client.remember(content, type=MemoryType.SEMANTIC, importance=0.7)
-    try:
-        # Use a larger limit because the embedding model may not strongly encode
-        # random suffixes, making many "Hydrate memory ..." entries near-ties.
-        ctx = await cognitive_memory_client.hydrate(content, include_goals=True, memory_limit=50)
-        assert ctx.memories
-        assert any(test_id in m.content for m in ctx.memories)
-        assert isinstance(ctx.identity, list)
-        assert isinstance(ctx.worldview, list)
-        assert ctx.goals is None or isinstance(ctx.goals, dict)
-        assert isinstance(ctx.urgent_drives, list)
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM memories WHERE id = $1", mid)
-
-
-async def test_api_hold_and_search_working(cognitive_memory_client, db_pool):
-    test_id = get_test_identifier("api_working")
-    content = f"Working memory {test_id}"
-
-    wid = await cognitive_memory_client.hold(content, ttl_seconds=3600)
-    try:
-        # Use the full content as the query to avoid model-dependent synonym distance.
-        rows = await cognitive_memory_client.search_working(content, limit=10)
-        assert any(test_id in (r.get("content") or "") for r in rows)
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM working_memory WHERE id = $1", wid)
-
-
-async def test_api_connect_memories_creates_audit_row(cognitive_memory_client, db_pool):
-    from core.cognitive_memory_api import MemoryType, RelationshipType
-
-    test_id = get_test_identifier("api_connect")
-    a = await cognitive_memory_client.remember(f"Conn A {test_id}", type=MemoryType.SEMANTIC, importance=0.6)
-    b = await cognitive_memory_client.remember(f"Conn B {test_id}", type=MemoryType.SEMANTIC, importance=0.6)
-    ctx = f"context {test_id}"
-
-    try:
-        await cognitive_memory_client.connect_memories(a, b, RelationshipType.ASSOCIATED, confidence=0.9, context=ctx)
-        async with db_pool.acquire() as conn:
-            n = await conn.fetchval(
-                """
-                SELECT COUNT(*) FROM relationship_discoveries
-                WHERE from_id = $1 AND to_id = $2 AND relationship_type = 'ASSOCIATED'
-                  AND discovered_by = 'api' AND discovery_context = $3
-                """,
-                a,
-                b,
-                ctx,
-            )
-            assert int(n) >= 1
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM relationship_discoveries WHERE from_id = $1 AND to_id = $2", a, b)
-            await conn.execute("DELETE FROM memories WHERE id = $1", a)
-            await conn.execute("DELETE FROM memories WHERE id = $1", b)
-
-
-async def test_api_remember_batch_raw_success_creates_graph_nodes(cognitive_memory_client, db_pool):
-    from core.cognitive_memory_api import MemoryType
-
-    test_id = get_test_identifier("api_batch_raw_ok")
-    contents = [f"Batch raw A {test_id}", f"Batch raw B {test_id}"]
-    emb = [[0.01] * EMBEDDING_DIMENSION, [0.02] * EMBEDDING_DIMENSION]
-
-    ids = await cognitive_memory_client.remember_batch_raw(contents, emb, type=MemoryType.SEMANTIC, importance=0.55)
-    assert len(ids) == 2
-
-    try:
-        # Verify rows exist
-        async with db_pool.acquire() as conn:
-            count = await conn.fetchval("SELECT COUNT(*) FROM memories WHERE id = ANY($1::uuid[])", ids)
-            assert int(count) == 2
-
-            # Verify graph nodes exist
-            await conn.execute("LOAD 'age';")
-            await conn.execute("SET search_path = ag_catalog, public;")
-            for mid in ids:
-                node_count = await conn.fetchval(
-                    f"""
-                    SELECT COUNT(*) FROM cypher('memory_graph', $$
-                        MATCH (n:MemoryNode {{memory_id: '{mid}'}})
-                        RETURN n
-                    $$) as (n agtype)
-                    """
-                )
-                assert int(node_count) >= 1
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute("LOAD 'age';")
-            await conn.execute("SET search_path = ag_catalog, public;")
-            for mid in ids:
-                await conn.execute(
-                    f"""
-                    SELECT * FROM cypher('memory_graph', $$
-                        MATCH (n:MemoryNode {{memory_id: '{mid}'}})
-                        DETACH DELETE n
-                    $$) as (v agtype)
-                    """
-                )
-            await conn.execute("DELETE FROM memories WHERE id = ANY($1::uuid[])", ids)
-
-
-async def test_api_remember_batch_raw_dimension_mismatch_raises(cognitive_memory_client):
-    from core.cognitive_memory_api import MemoryType
-
-    with pytest.raises(ValueError):
-        await cognitive_memory_client.remember_batch_raw(["x"], [[0.0]], type=MemoryType.SEMANTIC)
-
-
-async def test_api_hydrate_batch_returns_many(cognitive_memory_client):
-    test_id = get_test_identifier("api_hydrate_batch")
-    res = await cognitive_memory_client.hydrate_batch([f"q1 {test_id}", f"q2 {test_id}", f"q3 {test_id}"], include_goals=False)
-    assert len(res) == 3
-
-
-async def test_api_context_manager_connect_works(ensure_embedding_service):
-    from core.cognitive_memory_api import CognitiveMemory
-
-    async with CognitiveMemory.connect(_db_dsn(), min_size=1, max_size=3) as mem:
-        ctx = await mem.hydrate("test query", include_goals=False)
-        assert isinstance(ctx.memories, list)
-
-
-async def test_api_introspection_methods_return_shapes(cognitive_memory_client):
-    health = await cognitive_memory_client.get_health()
-    assert isinstance(health, dict)
-
-    drives = await cognitive_memory_client.get_drives()
-    assert isinstance(drives, list)
-
-    ident = await cognitive_memory_client.get_identity()
-    worldview = await cognitive_memory_client.get_worldview()
-    assert isinstance(ident, list)
-    assert isinstance(worldview, list)
-
-    goals = await cognitive_memory_client.get_goals()
-    assert isinstance(goals, list)
-
-
-async def test_api_create_goal_sets_due_at(cognitive_memory_client, db_pool):
-    from datetime import datetime, timezone
-    from core.cognitive_memory_api import GoalPriority, GoalSource
-
-    test_id = get_test_identifier("api_goal_due")
-    due_at = datetime.now(timezone.utc)
-    goal_id = await cognitive_memory_client.create_goal(
-        f"Goal {test_id}",
-        description="test due_at",
-        source=GoalSource.USER_REQUEST,
-        priority=GoalPriority.QUEUED,
-        due_at=due_at,
-    )
-    assert goal_id is not None
-
-    async with db_pool.acquire() as conn:
-        stored = await conn.fetchrow("SELECT due_at FROM goals WHERE id = $1::uuid", goal_id)
-        assert stored is not None
-        assert stored["due_at"] is not None
-
-
-async def test_api_queue_user_message_creates_outbox(cognitive_memory_client, db_pool):
-    test_id = get_test_identifier("api_outbox")
-    outbox_id = await cognitive_memory_client.queue_user_message(f"hi {test_id}", intent="status", context={"test_id": test_id})
-    assert outbox_id is not None
-
-    async with db_pool.acquire() as conn:
-        row = await conn.fetchrow("SELECT kind, status, payload FROM outbox_messages WHERE id = $1::uuid", outbox_id)
-        assert row is not None
-        assert row["kind"] == "user"
-        assert row["status"] == "pending"
-
-
-async def test_api_ingestion_receipts_roundtrip(cognitive_memory_client):
-    from core.cognitive_memory_api import MemoryType
-
-    test_id = get_test_identifier("api_ingestion_receipt")
-    mid = await cognitive_memory_client.remember(f"Receipt memory {test_id}", type=MemoryType.EPISODIC, importance=0.4)
-    assert mid is not None
-
-    src = f"/tmp/{test_id}.txt"
-    content_hash = f"hash_{test_id}"
-    inserted = await cognitive_memory_client.record_ingestion_receipts(
-        [{"source_file": src, "chunk_index": 0, "content_hash": content_hash, "memory_id": str(mid)}]
-    )
-    assert inserted == 1
-    inserted2 = await cognitive_memory_client.record_ingestion_receipts(
-        [{"source_file": src, "chunk_index": 1, "content_hash": content_hash, "memory_id": str(mid)}]
-    )
-    assert inserted2 == 0
-
-    receipts = await cognitive_memory_client.get_ingestion_receipts(src, [content_hash])
-    assert content_hash in receipts
-
-
-async def test_api_sync_wrapper_basic(ensure_embedding_service):
-    from core.cognitive_memory_api import CognitiveMemorySync, MemoryType
-
-    dsn = _db_dsn()
-
-    def _run():
-        mem = CognitiveMemorySync.connect(dsn, min_size=1, max_size=2)
-        try:
-            test_id = get_test_identifier("api_sync")
-            mid = mem.remember(f"Sync memory {test_id}", type=MemoryType.SEMANTIC, importance=0.6)
-            assert mid is not None
-            result = mem.recall(f"Sync memory {test_id}", limit=50)
-            assert any(test_id in m.content for m in result.memories)
-        finally:
-            mem.close()
-
-    await asyncio.to_thread(_run)
-
-
-# -----------------------------------------------------------------------------
 # WORKER LOOP COMPONENTS (non-infinite)
 # -----------------------------------------------------------------------------
 
@@ -9220,66 +8701,3 @@ async def test_terminate_action_requires_confirmation(db_pool):
             assert await conn.fetchval("SELECT is_agent_terminated()") is False
         finally:
             await tx.rollback()
-
-
-# =============================================================================
-# CLI UX SMOKE TESTS (No mocks; minimal subprocess checks)
-# =============================================================================
-
-
-async def test_cli_status_json_no_docker(db_pool):
-    env = os.environ.copy()
-    p = subprocess.run(
-        [sys.executable, "-m", "apps.cli.hexis_cli", "status", "--json", "--no-docker", "--wait-seconds", "60"],
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(Path(__file__).resolve().parent),
-    )
-    assert p.returncode == 0, p.stderr
-    data = json.loads(p.stdout)
-    assert "agent_configured" in data
-    assert "pending_external_calls" in data
-
-
-async def test_cli_config_show_and_validate(db_pool):
-    env = os.environ.copy()
-
-    show = subprocess.run(
-        [sys.executable, "-m", "apps.cli.hexis_cli", "config", "show", "--wait-seconds", "60"],
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(Path(__file__).resolve().parent),
-    )
-    assert show.returncode == 0, show.stderr
-    cfg = json.loads(show.stdout)
-    assert "agent.is_configured" in cfg
-
-    validate = subprocess.run(
-        [sys.executable, "-m", "apps.cli.hexis_cli", "config", "validate", "--wait-seconds", "60"],
-        capture_output=True,
-        text=True,
-        env=env,
-        cwd=str(Path(__file__).resolve().parent),
-    )
-    assert validate.returncode == 0, validate.stderr
-
-
-async def test_cli_config_validate_fails_when_unconfigured(db_pool):
-    async with db_pool.acquire() as conn:
-        await conn.execute("SELECT set_config('agent.is_configured', 'false'::jsonb)")
-    try:
-        env = os.environ.copy()
-        validate = subprocess.run(
-            [sys.executable, "-m", "apps.cli.hexis_cli", "config", "validate", "--wait-seconds", "60"],
-            capture_output=True,
-            text=True,
-            env=env,
-            cwd=str(Path(__file__).resolve().parent),
-        )
-        assert validate.returncode != 0
-        assert "agent.is_configured is not true" in (validate.stderr + validate.stdout)
-    finally:
-        async with db_pool.acquire() as conn:
-            await conn.execute("SELECT set_config('agent.is_configured', 'true'::jsonb)")

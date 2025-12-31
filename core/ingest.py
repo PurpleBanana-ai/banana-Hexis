@@ -18,7 +18,7 @@ import sys
 import re
 from pathlib import Path
 from dataclasses import dataclass, field, asdict
-from typing import Optional, Generator
+from typing import Optional, Generator, Callable
 from enum import Enum
 import mimetypes
 
@@ -61,6 +61,8 @@ class Config:
     # Processing Settings
     batch_size: int = 5  # Chunks to process before committing
     verbose: bool = True
+    log: Optional[Callable[[str], None]] = None
+    cancel_check: Optional[Callable[[], bool]] = None
 
 
 # ============================================================================
@@ -115,6 +117,22 @@ class DocumentChunk:
     total_chunks: int
     file_type: str
     metadata: dict = field(default_factory=dict)
+
+
+def _emit(config: Config, message: str) -> None:
+    if config.log:
+        config.log(message)
+    else:
+        print(message)
+
+
+def _should_cancel(config: Config) -> bool:
+    if config.cancel_check:
+        try:
+            return bool(config.cancel_check())
+        except Exception:
+            return False
+    return False
 
 
 # ============================================================================
@@ -513,7 +531,7 @@ class MemoryExtractor:
             return memories
         except Exception as e:
             if self.config.verbose:
-                print(f"  Warning: Failed to extract memories from chunk {chunk.chunk_index}: {e}")
+                _emit(self.config, f"  Warning: Failed to extract memories from chunk {chunk.chunk_index}: {e}")
             return []
     
     def _parse_response(self, response: str, chunk: DocumentChunk) -> list[ExtractedMemory]:
@@ -537,7 +555,7 @@ class MemoryExtractor:
             data = json.loads(json_str)
         except json.JSONDecodeError as e:
             if self.config.verbose:
-                print(f"  Warning: Failed to parse JSON: {e}")
+                _emit(self.config, f"  Warning: Failed to parse JSON: {e}")
             return []
         
         memories = []
@@ -580,7 +598,7 @@ class MemoryExtractor:
                     
             except Exception as e:
                 if self.config.verbose:
-                    print(f"  Warning: Failed to parse memory: {e}")
+                    _emit(self.config, f"  Warning: Failed to parse memory: {e}")
                 continue
         
         return memories
@@ -745,45 +763,49 @@ class IngestionPipeline:
     
     def ingest_file(self, file_path: Path) -> int:
         """Ingest a single file. Returns number of memories created."""
+        if _should_cancel(self.config):
+            raise RuntimeError("Ingestion cancelled")
         if not file_path.exists():
-            print(f"File not found: {file_path}")
+            _emit(self.config, f"File not found: {file_path}")
             return 0
         
         if file_path.suffix.lower() not in self.SUPPORTED_EXTENSIONS:
-            print(f"Unsupported file type: {file_path.suffix}")
+            _emit(self.config, f"Unsupported file type: {file_path.suffix}")
             return 0
         
         if self.config.verbose:
-            print(f"\nProcessing: {file_path}")
+            _emit(self.config, f"\nProcessing: {file_path}")
         
         # Read the document
         reader = get_reader(file_path)
         try:
             content = reader.read(file_path)
         except Exception as e:
-            print(f"  Error reading file: {e}")
+            _emit(self.config, f"  Error reading file: {e}")
             self.stats['errors'] += 1
             return 0
         
         if self.config.verbose:
-            print(f"  Read {len(content)} characters")
+            _emit(self.config, f"  Read {len(content)} characters")
         
         # Chunk the document
         chunks = list(self.chunker.chunk(content, file_path))
         if self.config.verbose:
-            print(f"  Split into {len(chunks)} chunks")
+            _emit(self.config, f"  Split into {len(chunks)} chunks")
         
         # Process each chunk
         memories_created = 0
         for i, chunk in enumerate(chunks):
+            if _should_cancel(self.config):
+                raise RuntimeError("Ingestion cancelled")
             if self.config.verbose:
-                print(f"  Processing chunk {i + 1}/{len(chunks)}...", end=" ")
+                _emit(self.config, f"  Processing chunk {i + 1}/{len(chunks)}...")
             
             # Extract memories
             memories = self.extractor.extract(chunk)
             
             if self.config.verbose:
-                print(f"extracted {len(memories)} memories")
+                _emit(self.config, f"  extracted {len(memories)} memories")
             
             # Store memories (batched for fewer DB round-trips)
             try:
@@ -791,13 +813,16 @@ class IngestionPipeline:
             except Exception as e:
                 self.stats["errors"] += 1
                 if self.config.verbose:
-                    print(f"    Error storing batch: {e}")
+                    _emit(self.config, f"    Error storing batch: {e}")
                 created_ids = []
 
             memories_created += len(created_ids)
             if self.config.verbose:
                 for memory, memory_id in zip(memories, created_ids):
-                    print(f"    + [{memory.memory_type.value}] {memory.content[:60]}... ({memory_id[:8]}...)")
+                    _emit(
+                        self.config,
+                        f"    + [{memory.memory_type.value}] {memory.content[:60]}... ({memory_id[:8]}...)",
+                    )
             
             self.stats['chunks_processed'] += 1
             
@@ -812,14 +837,16 @@ class IngestionPipeline:
         self.stats['memories_created'] += memories_created
         
         if self.config.verbose:
-            print(f"  Created {memories_created} memories from {file_path.name}")
+            _emit(self.config, f"  Created {memories_created} memories from {file_path.name}")
         
         return memories_created
     
     def ingest_directory(self, dir_path: Path, recursive: bool = True) -> int:
         """Ingest all supported files in a directory."""
+        if _should_cancel(self.config):
+            raise RuntimeError("Ingestion cancelled")
         if not dir_path.exists() or not dir_path.is_dir():
-            print(f"Directory not found: {dir_path}")
+            _emit(self.config, f"Directory not found: {dir_path}")
             return 0
         
         pattern = '**/*' if recursive else '*'
@@ -827,24 +854,26 @@ class IngestionPipeline:
                  if f.is_file() and f.suffix.lower() in self.SUPPORTED_EXTENSIONS]
         
         if self.config.verbose:
-            print(f"Found {len(files)} files to process")
+            _emit(self.config, f"Found {len(files)} files to process")
         
         total_memories = 0
         for file_path in files:
+            if _should_cancel(self.config):
+                raise RuntimeError("Ingestion cancelled")
             total_memories += self.ingest_file(file_path)
         
         return total_memories
     
     def print_stats(self):
         """Print ingestion statistics."""
-        print("\n" + "=" * 50)
-        print("INGESTION COMPLETE")
-        print("=" * 50)
-        print(f"Files processed:   {self.stats['files_processed']}")
-        print(f"Chunks processed:  {self.stats['chunks_processed']}")
-        print(f"Memories created:  {self.stats['memories_created']}")
-        print(f"Errors:            {self.stats['errors']}")
-        print("=" * 50)
+        _emit(self.config, "\n" + "=" * 50)
+        _emit(self.config, "INGESTION COMPLETE")
+        _emit(self.config, "=" * 50)
+        _emit(self.config, f"Files processed:   {self.stats['files_processed']}")
+        _emit(self.config, f"Chunks processed:  {self.stats['chunks_processed']}")
+        _emit(self.config, f"Memories created:  {self.stats['memories_created']}")
+        _emit(self.config, f"Errors:            {self.stats['errors']}")
+        _emit(self.config, "=" * 50)
     
     def close(self):
         """Clean up resources."""

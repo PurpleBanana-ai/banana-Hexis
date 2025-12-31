@@ -131,6 +131,14 @@ async def main():
 asyncio.run(main())
 ```
 
+## UI
+
+Launch the UI with:
+
+```bash
+reflex run
+```
+
 ## Usage Scenarios
 
 Below are common ways to use this repo, from “just a schema” to a full autonomous agent loop.
@@ -357,7 +365,7 @@ Run the test suite with:
 docker compose up -d
 
 # Run tests
-pytest tests/test.py -q
+pytest tests -q
 ```
 
 ## Python Dependencies
@@ -586,7 +594,7 @@ If you don’t want to run the maintenance worker, you can schedule `SELECT run_
 - Ensure PostgreSQL is running: `docker compose ps`
 - Check logs: `docker compose logs db`
 - Worker logs (if running): `docker compose logs heartbeat_worker` / `docker compose logs maintenance_worker`
-- Verify extensions: Run test suite with `pytest tests/test.py -v`
+- Verify extensions: Run test suite with `pytest tests -v`
 
 **Memory Search Performance:**
 - Rebuild vector indexes if queries are slow

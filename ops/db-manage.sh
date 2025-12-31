@@ -163,10 +163,10 @@ backup_db() {
 
 run_tests() {
     echo "Running database tests..."
-    if [ -f "${REPO_ROOT}/tests/test.py" ]; then
-        pytest "${REPO_ROOT}/tests/test.py" -q
+    if [ -d "${REPO_ROOT}/tests/db" ]; then
+        pytest "${REPO_ROOT}/tests/db" -q
     else
-        echo "No tests/test.py file found"
+        echo "No tests/db directory found"
         return 1
     fi
 }

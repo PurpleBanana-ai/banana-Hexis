@@ -1,27 +1,271 @@
 import os
+import json
+import uuid
+from pathlib import Path
+from typing import Any
+
+import asyncpg
 import pytest
+from tenacity import (
+    AsyncRetrying,
+    RetryError,
+    retry_if_exception_type,
+    retry_if_result,
+    stop_after_delay,
+    wait_fixed,
+)
 
-SLOW_TEST_WARNING_SECONDS = float(os.getenv("SLOW_TEST_WARNING_SECONDS", "5"))
+from tests.utils import _db_dsn
 
 
-@pytest.hookimpl(hookwrapper=True)
-def pytest_runtest_makereport(item, call):
-    outcome = yield
-    report = outcome.get_result()
-    if report.when != "call":
-        return
-    if SLOW_TEST_WARNING_SECONDS <= 0:
-        return
-    if report.duration < SLOW_TEST_WARNING_SECONDS:
-        return
+@pytest.fixture(scope="module", autouse=True)
+async def temp_test_db():
+    """Create a dedicated test database per module and drop it after tests."""
+    original_db = os.getenv("POSTGRES_DB", "hexis_memory")
+    temp_db = f"tmp_test_{uuid.uuid4().hex}"
+    os.environ["POSTGRES_DB"] = temp_db
 
-    message = (
-        "WARNING: slow test "
-        f"{report.nodeid} took {report.duration:.2f}s "
-        f"(threshold {SLOW_TEST_WARNING_SECONDS:.2f}s)"
-    )
-    reporter = item.config.pluginmanager.get_plugin("terminalreporter")
-    if reporter:
-        reporter.write_line(message)
+    admin_db = os.getenv("POSTGRES_ADMIN_DB", "postgres")
+    admin_dsn = _db_dsn(admin_db)
+
+    admin_conn = await asyncpg.connect(admin_dsn)
+    try:
+        await admin_conn.execute(f'CREATE DATABASE "{temp_db}"')
+    finally:
+        await admin_conn.close()
+
+    schema_path = Path(__file__).resolve().parents[1] / "db" / "schema.sql"
+    schema_sql = schema_path.read_text(encoding="utf-8")
+    test_conn = await asyncpg.connect(_db_dsn(temp_db))
+    try:
+        await test_conn.execute(schema_sql)
+    finally:
+        await test_conn.close()
+
+    yield
+
+    admin_conn = await asyncpg.connect(admin_dsn)
+    try:
+        await admin_conn.execute(
+            "SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = $1 AND pid <> pg_backend_pid()",
+            temp_db,
+        )
+        await admin_conn.execute(f'DROP DATABASE IF EXISTS "{temp_db}"')
+    finally:
+        await admin_conn.close()
+
+    if original_db:
+        os.environ["POSTGRES_DB"] = original_db
     else:
-        print(message)
+        os.environ.pop("POSTGRES_DB", None)
+
+
+@pytest.fixture(scope="module")
+async def db_pool(temp_test_db):
+    """Create a connection pool for testing."""
+    db_url = _db_dsn()
+    # Postgres restarts once during initdb, and this repo's schema init can take >60s on cold starts.
+    wait_seconds = int(os.getenv("POSTGRES_WAIT_SECONDS", "180"))
+    pool = None
+    retrying = AsyncRetrying(
+        stop=stop_after_delay(wait_seconds),
+        wait=wait_fixed(1),
+        retry=retry_if_exception_type(Exception),
+        reraise=True,
+    )
+    async for attempt in retrying:
+        with attempt:
+            pool = await asyncpg.create_pool(
+                db_url,
+                ssl=False,
+                min_size=2,
+                max_size=20,
+                command_timeout=60.0,
+            )
+    assert pool is not None
+    yield pool
+    await pool.close()
+
+
+@pytest.fixture(scope="module", autouse=True)
+async def sync_test_embedding_dimension_from_db(db_pool, request):
+    """
+    Sync module-level EMBEDDING_DIMENSION with the database's configured dimension.
+    """
+    async with db_pool.acquire() as conn:
+        dim = await conn.fetchval("SELECT embedding_dimension()")
+    if hasattr(request.module, "EMBEDDING_DIMENSION"):
+        request.module.EMBEDDING_DIMENSION = int(dim)
+
+
+@pytest.fixture(scope="module", autouse=True)
+async def configure_agent_for_tests(db_pool):
+    """
+    Heartbeats are gated behind `agent.is_configured`.
+
+    Most tests exercise heartbeat/worker behavior, so default to configured.
+    Individual tests can override by deleting the config row in a transaction.
+    """
+    tracked_keys = [
+        "agent.is_configured",
+        "agent.objectives",
+        "llm.heartbeat",
+        "llm.chat",
+        "agent.consent_status",
+        "agent.consent_signature",
+        "agent.consent_log_id",
+        "agent.consent_recorded_at",
+        "agent.consent_memory_ids",
+    ]
+    original_config: dict[str, Any] = {}
+    original_hb_interval: float | None = None
+    original_hb_paused: bool | None = None
+    inserted_consent_log_id: str | None = None
+
+    async with db_pool.acquire() as conn:
+        rows = await conn.fetch(
+            "SELECT key, value FROM config WHERE key = ANY($1::text[])",
+            tracked_keys,
+        )
+        original_config = {row["key"]: row["value"] for row in rows}
+        original_hb_interval = await conn.fetchval(
+            "SELECT value FROM heartbeat_config WHERE key = 'heartbeat_interval_minutes'"
+        )
+        original_hb_paused = await conn.fetchval(
+            "SELECT is_paused FROM heartbeat_state WHERE id = 1"
+        )
+
+        consent_payload = {
+            "decision": "consent",
+            "signature": "test-consent",
+            "memories": [],
+        }
+        recorded = await conn.fetchval(
+            "SELECT record_consent_response($1::jsonb)",
+            json.dumps(consent_payload),
+        )
+        if isinstance(recorded, str):
+            try:
+                recorded = json.loads(recorded)
+            except Exception:
+                recorded = {}
+        if isinstance(recorded, dict):
+            inserted_consent_log_id = str(recorded.get("log_id") or "") or None
+
+        # Minimal config so CLI `hexis config validate` passes in subprocess smoke tests.
+        await conn.execute("SELECT set_config('agent.is_configured', 'true'::jsonb)")
+        await conn.execute("SELECT set_config('agent.objectives', $1::jsonb)", json.dumps(["test objective"]))
+        await conn.execute(
+            "SELECT set_config('llm.heartbeat', $1::jsonb)",
+            json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
+        )
+        await conn.execute(
+            "SELECT set_config('llm.chat', $1::jsonb)",
+            json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
+        )
+        await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE WHERE id = 1")
+        await conn.execute("UPDATE heartbeat_config SET value = 60 WHERE key = 'heartbeat_interval_minutes'")
+
+    yield
+
+    async with db_pool.acquire() as conn:
+        for key in tracked_keys:
+            if key in original_config:
+                await conn.execute(
+                    "SELECT set_config($1, $2::jsonb)",
+                    key,
+                    json.dumps(original_config[key]),
+                )
+            else:
+                await conn.execute("DELETE FROM config WHERE key = $1", key)
+
+        if inserted_consent_log_id:
+            await conn.execute("DELETE FROM consent_log WHERE id = $1::uuid", inserted_consent_log_id)
+
+        if original_hb_interval is not None:
+            await conn.execute(
+                "UPDATE heartbeat_config SET value = $1 WHERE key = 'heartbeat_interval_minutes'",
+                float(original_hb_interval),
+            )
+        if original_hb_paused is not None:
+            await conn.execute(
+                "UPDATE heartbeat_state SET is_paused = $1 WHERE id = 1",
+                bool(original_hb_paused),
+            )
+
+
+@pytest.fixture(scope="module", autouse=True)
+async def apply_repo_migrations(db_pool):
+    """
+    Apply any optional SQL patches from migrations/ once per module.
+
+    The DB in Docker may persist across runs; this keeps core functions
+    and tables up to date without requiring a full volume reset.
+    """
+    if os.getenv("APPLY_REPO_MIGRATIONS", "0").lower() not in {"1", "true", "yes", "on"}:
+        return
+    migrations_dir = Path(__file__).resolve().parent / "migrations"
+    if not migrations_dir.exists():
+        return
+
+    migration_paths = sorted(p for p in migrations_dir.glob("*.sql") if p.is_file())
+    if not migration_paths:
+        return
+
+    async with db_pool.acquire() as conn:
+        for path in migration_paths:
+            sql = path.read_text(encoding="utf-8")
+            await conn.execute(sql)
+
+
+@pytest.fixture(autouse=True)
+async def setup_db(db_pool):
+    """Setup the database before each test."""
+    async with db_pool.acquire() as conn:
+        await conn.execute("LOAD 'age';")
+        await conn.execute("SET search_path = ag_catalog, public;")
+    yield
+
+
+@pytest.fixture(scope="module")
+async def ensure_embedding_service(db_pool):
+    """
+    Ensure embedding service is available.
+
+    This fixture retries for a short window so tests don't flake while Docker
+    is still initializing. If the service never becomes healthy, fail fast
+    with a clear timeout error (no skipping).
+    """
+    async with db_pool.acquire() as conn:
+        # Ensure correct service URL
+        await conn.execute(
+            """
+            INSERT INTO embedding_config (key, value)
+            VALUES ('service_url', 'http://embeddings:80/embed')
+            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+            """
+        )
+
+        wait_seconds = int(os.getenv("EMBEDDINGS_WAIT_SECONDS", "30"))
+        retrying = AsyncRetrying(
+            stop=stop_after_delay(wait_seconds),
+            wait=wait_fixed(1),
+            retry=(retry_if_result(lambda ok: not ok) | retry_if_exception_type(Exception)),
+            reraise=False,
+        )
+
+        try:
+            ok = await retrying(conn.fetchval, "SELECT check_embedding_service_health()")
+            assert ok is True
+            return True
+        except RetryError as exc:
+            last_exc = exc.last_attempt.exception()
+            last_res = None
+            try:
+                last_res = exc.last_attempt.result()
+            except Exception:
+                pass
+            pytest.fail(
+                f"Embedding service not available after {wait_seconds}s (service_url=http://embeddings:80/embed). "
+                f"last_exception={last_exc!r} last_result={last_res!r}"
+            )

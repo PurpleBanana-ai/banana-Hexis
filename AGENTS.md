@@ -7,7 +7,9 @@
 - `apps/workers/worker.py`: stateless workers: heartbeat (conscious) + maintenance (subconscious).
 - `core/cognitive_memory_api.py`: thin Python client for the “DB is the brain” API surface.
 - `apps/cli/hexis_cli.py`: CLI entrypoint (`hexis …`) for local workflows; `apps/cli/hexis_init.py` bootstraps DB config; `apps/mcp/hexis_mcp_server.py` exposes MCP tools.
-- `tests/test.py`: integration test suite (pytest + asyncpg) covering schema + worker + Python API.
+- `tests/db/test_db.py`: DB integration test suite (pytest + asyncpg) covering schema, workers, and database functions.
+- `tests/core/test_core_api.py`: core API integration tests (core/cognitive_memory_api.py).
+- `tests/cli/test_cli.py`: CLI smoke tests.
 - Docs: `README.md` (user-facing), `docs/architecture.md` (design/architecture consolidation).
 
 ## Build, Test, and Development Commands
@@ -16,7 +18,10 @@
 - Start services (active): `docker compose --profile active up -d` (adds `heartbeat_worker` + `maintenance_worker`).
 - Reset DB volume (schema changes): `docker compose down -v && docker compose up -d`.
 - Configure agent (gates heartbeats): `./hexis init` (or `hexis init` if installed).
-- Run tests: `pytest tests/test.py -q` (expects Docker services up).
+- Run tests (all): `pytest tests -q` (expects Docker services up).
+- Run DB tests: `pytest tests/db -q`
+- Run core tests: `pytest tests/core -q`
+- Run CLI tests: `pytest tests/cli -q`
 
 ## Coding Style & Naming Conventions
 
@@ -28,7 +33,7 @@
 
 - Framework: `pytest` + `pytest-asyncio` (session loop scope).
 - Tests are integration-style; use transactions and rollbacks where practical to avoid cross-test coupling.
-- Naming: `test_*` functions; use `get_test_identifier()` patterns in `tests/test.py` for unique data.
+- Naming: `test_*` functions; use `get_test_identifier()` patterns in `tests/utils.py` for unique data.
 
 ## Commit & Pull Request Guidelines
 
@@ -39,3 +44,7 @@
 
 - Secrets: store API keys in environment variables (`.env`), not in Postgres; DB config stores env var *names* only.
 - Heartbeat is gated until `agent.is_configured=true` (set via `hexis init`).
+
+## Skills
+
+- Use the `reflex` skill for any work involving Reflex UI code (`ui/*.py`), rx components, or state/event/rendering issues.

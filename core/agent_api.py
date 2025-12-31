@@ -1,0 +1,257 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import os
+import time
+from typing import Any
+
+import asyncpg
+
+
+def db_dsn_from_env() -> str:
+    host = os.getenv("POSTGRES_HOST", "localhost")
+    port = int(os.getenv("POSTGRES_PORT", "43815"))
+    database = os.getenv("POSTGRES_DB", "hexis_memory")
+    user = os.getenv("POSTGRES_USER", "hexis_user")
+    password = os.getenv("POSTGRES_PASSWORD", "hexis_password")
+    return f"postgresql://{user}:{password}@{host}:{port}/{database}"
+
+
+async def _connect_with_retry(dsn: str, *, wait_seconds: int = 30) -> asyncpg.Connection:
+    deadline = time.monotonic() + wait_seconds
+    last_err: Exception | None = None
+    while time.monotonic() < deadline:
+        try:
+            return await asyncpg.connect(dsn, ssl=False, command_timeout=60.0)
+        except Exception as exc:
+            last_err = exc
+            await asyncio.sleep(1)
+    raise TimeoutError(f"Failed to connect to Postgres after {wait_seconds}s: {last_err!r}")
+
+
+async def get_agent_status(dsn: str | None = None) -> dict[str, Any]:
+    dsn = dsn or db_dsn_from_env()
+    conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    try:
+        configured = await conn.fetchval("SELECT is_agent_configured()")
+        terminated = await conn.fetchval("SELECT is_agent_terminated()")
+        consent = await conn.fetchval("SELECT get_agent_consent_status()")
+        consent_log_id = await conn.fetchval("SELECT get_config('agent.consent_log_id')")
+        has_consent_log = consent_log_id is not None
+        configured = bool(configured) and has_consent_log and consent == "consent"
+        return {
+            "configured": configured,
+            "terminated": bool(terminated),
+            "consent_status": consent,
+            "consent_log_id": consent_log_id,
+        }
+    finally:
+        await conn.close()
+
+
+async def get_init_defaults(dsn: str | None = None) -> dict[str, Any]:
+    dsn = dsn or db_dsn_from_env()
+    conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    try:
+        hb_rows = await conn.fetch("SELECT key, value FROM heartbeat_config")
+        hb = {r["key"]: float(r["value"]) for r in hb_rows}
+
+        maint: dict[str, float] = {}
+        try:
+            maint_rows = await conn.fetch("SELECT key, value FROM maintenance_config")
+            maint = {r["key"]: float(r["value"]) for r in maint_rows}
+        except Exception:
+            maint = {}
+
+        return {
+            "heartbeat_interval_minutes": int(hb.get("heartbeat_interval_minutes", 60)),
+            "max_energy": float(hb.get("max_energy", 20)),
+            "base_regeneration": float(hb.get("base_regeneration", 10)),
+            "max_active_goals": int(hb.get("max_active_goals", 3)),
+            "maintenance_interval_seconds": int(maint.get("maintenance_interval_seconds", 60)) if maint else 60,
+        }
+    finally:
+        await conn.close()
+
+
+async def get_config(dsn: str | None, key: str) -> Any:
+    dsn = dsn or db_dsn_from_env()
+    conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    try:
+        value = await conn.fetchval("SELECT get_config($1)", key)
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                return value
+        return value
+    finally:
+        await conn.close()
+
+
+async def get_llm_config(dsn: str | None, key: str) -> dict[str, Any]:
+    value = await get_config(dsn, key)
+    if isinstance(value, dict):
+        return value
+    return {}
+
+
+async def get_agent_profile_context(dsn: str | None = None) -> dict[str, Any]:
+    dsn = dsn or db_dsn_from_env()
+    conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    try:
+        value = await conn.fetchval("SELECT get_agent_profile_context()")
+        if isinstance(value, str):
+            try:
+                return json.loads(value)
+            except Exception:
+                return {}
+        return value or {}
+    finally:
+        await conn.close()
+
+
+async def apply_agent_config(
+    *,
+    dsn: str | None = None,
+    heartbeat_interval_minutes: int,
+    maintenance_interval_seconds: int,
+    max_energy: float,
+    base_regeneration: float,
+    max_active_goals: int,
+    objectives: list[str],
+    guardrails: list[str],
+    initial_message: str,
+    tools: list[str],
+    llm_heartbeat: dict[str, Any],
+    llm_chat: dict[str, Any],
+    contact_channels: list[str],
+    contact_destinations: dict[str, str],
+    enable_autonomy: bool,
+    enable_maintenance: bool,
+    mark_configured: bool,
+) -> None:
+    dsn = dsn or db_dsn_from_env()
+    conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    try:
+        async with conn.transaction():
+            await conn.execute(
+                "UPDATE heartbeat_config SET value = $1 WHERE key = 'heartbeat_interval_minutes'",
+                float(heartbeat_interval_minutes),
+            )
+            await conn.execute("UPDATE heartbeat_config SET value = $1 WHERE key = 'max_energy'", float(max_energy))
+            await conn.execute(
+                "UPDATE heartbeat_config SET value = $1 WHERE key = 'base_regeneration'",
+                float(base_regeneration),
+            )
+            await conn.execute(
+                "UPDATE heartbeat_config SET value = $1 WHERE key = 'max_active_goals'",
+                float(max_active_goals),
+            )
+
+            try:
+                await conn.execute(
+                    "UPDATE maintenance_config SET value = $1 WHERE key = 'maintenance_interval_seconds'",
+                    float(maintenance_interval_seconds),
+                )
+            except Exception:
+                pass
+
+            await conn.execute("SELECT set_config('agent.objectives', $1::jsonb)", json.dumps(objectives))
+            await conn.execute(
+                "SELECT set_config('agent.budget', $1::jsonb)",
+                json.dumps(
+                    {
+                        "max_energy": max_energy,
+                        "base_regeneration": base_regeneration,
+                        "heartbeat_interval_minutes": heartbeat_interval_minutes,
+                        "max_active_goals": max_active_goals,
+                    }
+                ),
+            )
+            await conn.execute("SELECT set_config('agent.guardrails', $1::jsonb)", json.dumps(guardrails))
+            await conn.execute("SELECT set_config('agent.initial_message', $1::jsonb)", json.dumps(initial_message))
+            await conn.execute(
+                "SELECT set_config('agent.tools', $1::jsonb)",
+                json.dumps([{"name": t, "enabled": True} for t in tools]),
+            )
+
+            await conn.execute("SELECT set_config('llm.heartbeat', $1::jsonb)", json.dumps(llm_heartbeat))
+            await conn.execute("SELECT set_config('llm.chat', $1::jsonb)", json.dumps(llm_chat))
+            await conn.execute(
+                "SELECT set_config('user.contact', $1::jsonb)",
+                json.dumps({"channels": contact_channels, "destinations": contact_destinations}),
+            )
+
+            if mark_configured:
+                await conn.execute("SELECT set_config('agent.is_configured', 'true'::jsonb)")
+
+            if enable_autonomy:
+                await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE WHERE id = 1")
+            else:
+                await conn.execute("UPDATE heartbeat_state SET is_paused = TRUE WHERE id = 1")
+
+            try:
+                if enable_maintenance:
+                    await conn.execute("UPDATE maintenance_state SET is_paused = FALSE WHERE id = 1")
+                else:
+                    await conn.execute("UPDATE maintenance_state SET is_paused = TRUE WHERE id = 1")
+            except Exception:
+                pass
+    finally:
+        await conn.close()
+
+
+async def set_agent_configured(dsn: str | None, *, configured: bool) -> None:
+    dsn = dsn or db_dsn_from_env()
+    conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    try:
+        if configured:
+            await conn.execute("SELECT set_config('agent.is_configured', 'true'::jsonb)")
+        else:
+            await conn.execute("DELETE FROM config WHERE key = 'agent.is_configured'")
+    finally:
+        await conn.close()
+
+
+def get_agent_status_sync(dsn: str | None = None) -> dict[str, Any]:
+    from core.sync_utils import run_sync
+
+    return run_sync(get_agent_status(dsn))
+
+
+def get_init_defaults_sync(dsn: str | None = None) -> dict[str, Any]:
+    from core.sync_utils import run_sync
+
+    return run_sync(get_init_defaults(dsn))
+
+
+def get_config_sync(dsn: str | None, key: str) -> Any:
+    from core.sync_utils import run_sync
+
+    return run_sync(get_config(dsn, key))
+
+
+def get_llm_config_sync(dsn: str | None, key: str) -> dict[str, Any]:
+    from core.sync_utils import run_sync
+
+    return run_sync(get_llm_config(dsn, key))
+
+
+def get_agent_profile_context_sync(dsn: str | None = None) -> dict[str, Any]:
+    from core.sync_utils import run_sync
+
+    return run_sync(get_agent_profile_context(dsn))
+
+
+def apply_agent_config_sync(**kwargs: Any) -> None:
+    from core.sync_utils import run_sync
+
+    return run_sync(apply_agent_config(**kwargs))
+
+
+def set_agent_configured_sync(dsn: str | None, *, configured: bool) -> None:
+    from core.sync_utils import run_sync
+
+    return run_sync(set_agent_configured(dsn, configured=configured))
