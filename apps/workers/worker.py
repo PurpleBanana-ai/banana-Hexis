@@ -1199,15 +1199,11 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                     break
 
             # Apply goal changes
-            for change in goal_changes:
-                goal_id = change.get('goal_id')
-                change_type = change.get('change')
-                reason = change.get('reason', '')
-
-                if goal_id and change_type:
-                    await conn.execute("""
-                        SELECT change_goal_priority($1::uuid, $2::goal_priority, $3)
-                    """, goal_id, change_type, reason)
+            if isinstance(goal_changes, list) and goal_changes:
+                await conn.execute(
+                    "SELECT apply_goal_changes($1::jsonb)",
+                    json.dumps(goal_changes),
+                )
 
             # Complete the heartbeat
             memory_id = await conn.fetchval("""
@@ -1307,51 +1303,24 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
         return []
 
     async def _apply_inquiry_result(self, conn: asyncpg.Connection, heartbeat_id: str, result: dict) -> str | None:
-        payload = result.get("result") if isinstance(result, dict) else None
-        if not isinstance(payload, dict):
-            return None
-
-        summary = (payload.get("summary") or "").strip()
-        if not summary:
-            return None
-
-        confidence = payload.get("confidence")
         try:
-            confidence_f = float(confidence) if confidence is not None else 0.6
-        except Exception:
-            confidence_f = 0.6
-
-        sources = payload.get("sources")
-        sources_jsonb = json.dumps(
-            {
-                "sources": sources or [],
-                "query": result.get("query"),
-                "depth": result.get("depth"),
-                "heartbeat_id": heartbeat_id,
-            }
-        )
-
-        try:
-            mem_id = await conn.fetchval(
-                """
-                SELECT create_semantic_memory(
-                    $1,
-                    $2,
-                    ARRAY['inquiry', $3],
-                    NULL,
-                    $4::jsonb,
-                    0.6
-                )
-                """,
-                summary,
-                confidence_f,
-                str(result.get("depth") or "inquire_shallow"),
-                sources_jsonb,
+            raw = await conn.fetchval(
+                "SELECT apply_inquiry_result($1::uuid, $2::jsonb)",
+                heartbeat_id,
+                json.dumps(result),
             )
-            return str(mem_id) if mem_id else None
         except Exception as e:
             logger.warning(f"Failed to persist inquiry result: {e}")
             return None
+        if isinstance(raw, str):
+            try:
+                raw = json.loads(raw)
+            except Exception:
+                raw = {}
+        if isinstance(raw, dict):
+            mem_id = raw.get("memory_id")
+            return str(mem_id) if mem_id else None
+        return None
 
     async def _apply_reflection_result(self, conn: asyncpg.Connection, heartbeat_id: str, payload: dict | None) -> None:
         if not payload:
@@ -1646,45 +1615,9 @@ class SubconsciousDecider:
                     return val
             return val
 
-        recent = _coerce(await conn.fetchval("SELECT get_recent_context(20)")) or []
-        narrative = _coerce(await conn.fetchval("SELECT get_narrative_context()")) or {}
-        self_model = _coerce(await conn.fetchval("SELECT get_self_model_context(25)")) or []
-        relationships = _coerce(await conn.fetchval("SELECT get_relationships_context(15)")) or []
-        worldview = _coerce(await conn.fetchval("SELECT get_worldview_context()")) or []
-        contradictions = _coerce(await conn.fetchval("SELECT get_contradictions_context(5)")) or []
-        emotional_patterns = _coerce(await conn.fetchval("SELECT get_emotional_patterns_context(5)")) or []
-        emotional_state = _coerce(await conn.fetchval("SELECT get_current_affective_state()")) or {}
-        goals = _coerce(await conn.fetchval("SELECT get_goals_snapshot()")) or {}
-        trigger_seed = " ".join(
-            [
-                str(item.get("content", "")).strip()
-                for item in recent
-                if isinstance(item, dict) and item.get("content")
-            ][:5]
-        ).strip()
-        emotional_triggers = []
-        if trigger_seed:
-            emotional_triggers = _coerce(
-                await conn.fetchval(
-                    "SELECT match_emotional_triggers($1::text, $2::int, $3::float)",
-                    trigger_seed,
-                    5,
-                    0.75,
-                )
-            ) or []
-
-        return {
-            "recent_memories": recent,
-            "narrative": narrative,
-            "self_model": self_model,
-            "relationships": relationships,
-            "worldview": worldview,
-            "contradictions": contradictions,
-            "emotional_patterns": emotional_patterns,
-            "emotional_state": emotional_state,
-            "emotional_triggers": emotional_triggers,
-            "goals": goals,
-        }
+        raw = await conn.fetchval("SELECT get_subconscious_context()")
+        context = _coerce(raw) if raw is not None else {}
+        return context if isinstance(context, dict) else {}
 
     def _normalize_observations(self, doc: dict) -> dict[str, list[dict]]:
         def _as_list(val: Any) -> list[dict]:

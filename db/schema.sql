@@ -4911,6 +4911,60 @@ EXCEPTION
 END;
 $$ LANGUAGE plpgsql STABLE;
 
+-- Subconscious context snapshot for LLM pattern detection.
+CREATE OR REPLACE FUNCTION get_subconscious_context(
+    p_recent_limit INT DEFAULT 20,
+    p_self_limit INT DEFAULT 25,
+    p_relationship_limit INT DEFAULT 15,
+    p_contradiction_limit INT DEFAULT 5,
+    p_emotional_pattern_limit INT DEFAULT 5,
+    p_trigger_limit INT DEFAULT 5,
+    p_trigger_min_similarity FLOAT DEFAULT 0.75
+)
+RETURNS JSONB AS $$
+DECLARE
+    recent JSONB;
+    seed TEXT;
+    emotional_triggers JSONB := '[]'::jsonb;
+BEGIN
+    recent := COALESCE(get_recent_context(p_recent_limit), '[]'::jsonb);
+
+    SELECT string_agg(content, ' ')
+    INTO seed
+    FROM (
+        SELECT NULLIF(value->>'content', '') as content
+        FROM jsonb_array_elements(recent) value
+        WHERE value ? 'content'
+        LIMIT 5
+    ) sub
+    WHERE content IS NOT NULL;
+
+    IF COALESCE(p_trigger_limit, 0) > 0 AND seed IS NOT NULL AND seed <> '' THEN
+        emotional_triggers := match_emotional_triggers(seed, p_trigger_limit, p_trigger_min_similarity);
+    END IF;
+
+    RETURN jsonb_build_object(
+        'recent_memories', recent,
+        'narrative', get_narrative_context(),
+        'self_model', get_self_model_context(p_self_limit),
+        'relationships', get_relationships_context(p_relationship_limit),
+        'worldview', get_worldview_context(),
+        'contradictions', get_contradictions_context(p_contradiction_limit),
+        'emotional_patterns', get_emotional_patterns_context(p_emotional_pattern_limit),
+        'emotional_state', get_current_affective_state(),
+        'emotional_triggers', COALESCE(emotional_triggers, '[]'::jsonb),
+        'goals', get_goals_snapshot()
+    );
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN jsonb_build_object(
+            'recent_memories', recent,
+            'emotional_state', get_current_affective_state(),
+            'emotional_triggers', '[]'::jsonb
+        );
+END;
+$$ LANGUAGE plpgsql STABLE;
+
 -- Contradictions context (limited) for conscious layer attention.
 CREATE OR REPLACE FUNCTION get_contradictions_context(p_limit INT DEFAULT 5)
 RETURNS JSONB AS $$
@@ -7585,6 +7639,122 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION apply_inquiry_result(
+    p_heartbeat_id UUID,
+    p_payload JSONB
+)
+RETURNS JSONB AS $$
+DECLARE
+    result JSONB;
+    summary TEXT;
+    confidence FLOAT;
+    depth TEXT;
+    query TEXT;
+    sources JSONB;
+    metadata JSONB;
+    mem_id UUID;
+BEGIN
+    IF p_payload IS NULL OR jsonb_typeof(p_payload) <> 'object' THEN
+        RETURN jsonb_build_object('memory_id', NULL, 'error', 'invalid_payload');
+    END IF;
+
+    IF p_payload ? 'result' THEN
+        result := p_payload->'result';
+    ELSE
+        result := p_payload;
+    END IF;
+
+    IF result IS NULL OR jsonb_typeof(result) <> 'object' THEN
+        RETURN jsonb_build_object('memory_id', NULL, 'error', 'invalid_result');
+    END IF;
+
+    summary := btrim(COALESCE(result->>'summary', ''));
+    IF summary = '' THEN
+        RETURN jsonb_build_object('memory_id', NULL, 'skipped', 'missing_summary');
+    END IF;
+
+    BEGIN
+        confidence := COALESCE(NULLIF(result->>'confidence', '')::float, 0.6);
+    EXCEPTION
+        WHEN OTHERS THEN
+            confidence := 0.6;
+    END;
+
+    depth := COALESCE(NULLIF(p_payload->>'depth', ''), NULLIF(result->>'depth', ''), 'inquire_shallow');
+    query := COALESCE(NULLIF(p_payload->>'query', ''), NULLIF(result->>'query', ''));
+
+    sources := COALESCE(result->'sources', '[]'::jsonb);
+    IF jsonb_typeof(sources) <> 'array' THEN
+        sources := '[]'::jsonb;
+    END IF;
+
+    metadata := jsonb_build_object(
+        'sources', sources,
+        'query', query,
+        'depth', depth,
+        'heartbeat_id', CASE
+            WHEN p_heartbeat_id IS NULL THEN NULL
+            ELSE p_heartbeat_id::text
+        END
+    );
+
+    mem_id := create_semantic_memory(
+        summary,
+        confidence,
+        ARRAY['inquiry', depth],
+        NULL,
+        metadata,
+        0.6
+    );
+
+    RETURN jsonb_build_object('memory_id', mem_id);
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN jsonb_build_object('memory_id', NULL, 'error', SQLERRM);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION apply_goal_changes(p_changes JSONB)
+RETURNS JSONB AS $$
+DECLARE
+    change JSONB;
+    goal_id UUID;
+    change_kind goal_priority;
+    reason TEXT;
+    applied INT := 0;
+BEGIN
+    IF p_changes IS NULL OR jsonb_typeof(p_changes) <> 'array' THEN
+        RETURN jsonb_build_object('applied', 0);
+    END IF;
+
+    FOR change IN SELECT * FROM jsonb_array_elements(p_changes)
+    LOOP
+        BEGIN
+            goal_id := NULLIF(change->>'goal_id', '')::uuid;
+        EXCEPTION
+            WHEN OTHERS THEN
+                goal_id := NULL;
+        END;
+        IF goal_id IS NULL THEN
+            CONTINUE;
+        END IF;
+
+        BEGIN
+            change_kind := NULLIF(change->>'change', '')::goal_priority;
+        EXCEPTION
+            WHEN OTHERS THEN
+                CONTINUE;
+        END;
+
+        reason := COALESCE(change->>'reason', '');
+        PERFORM change_goal_priority(goal_id, change_kind, reason);
+        applied := applied + 1;
+    END LOOP;
+
+    RETURN jsonb_build_object('applied', applied);
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION execute_heartbeat_action(
     p_heartbeat_id UUID,
     p_action TEXT,
@@ -8039,7 +8209,8 @@ COMMENT ON FUNCTION gather_turn_context IS 'Gather full context for LLM decision
 --   get_environment_snapshot, get_goals_snapshot, get_recent_context, get_identity_context
 --   get_worldview_context, get_self_model_context, get_narrative_context
 --   get_relationships_context, get_contradictions_context, get_emotional_patterns_context
---   apply_subconscious_observations, apply_brainstormed_goals
+--   get_subconscious_context, match_emotional_triggers
+--   apply_subconscious_observations, apply_brainstormed_goals, apply_inquiry_result, apply_goal_changes
 --   calculate_relevance, age_in_days
 
 -- ============================================================================
