@@ -345,46 +345,27 @@ class MemoryToolHandler:
         min_importance = args.get('min_importance', 0.0)
         
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Use the fast_recall function
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT 
                     memory_id,
                     content,
                     memory_type,
                     score,
-                    source
-                FROM fast_recall(%s, %s)
-            """, (query, limit * 2))  # Get more, then filter
-            
+                    source,
+                    importance
+                FROM recall_memories_filtered(%s, %s, %s::memory_type[], %s)
+                """,
+                (query, limit, memory_types, min_importance),
+            )
+
             results = cur.fetchall()
-            
-            # Filter by type and importance if specified
-            if memory_types or min_importance > 0:
-                cur.execute("""
-                    SELECT id, importance FROM memories 
-                    WHERE id = ANY(%s)
-                """, ([r['memory_id'] for r in results],))
-                
-                importance_map = {str(row['id']): row['importance'] for row in cur.fetchall()}
-                
-                filtered = []
-                for r in results:
-                    mid = str(r['memory_id'])
-                    if memory_types and r['memory_type'] not in memory_types:
-                        continue
-                    if importance_map.get(mid, 0) < min_importance:
-                        continue
-                    r['importance'] = importance_map.get(mid, 0)
-                    filtered.append(r)
-                results = filtered[:limit]
-            
-            # Update access counts
+
             if results:
-                cur.execute("""
-                    UPDATE memories 
-                    SET access_count = access_count + 1, last_accessed = CURRENT_TIMESTAMP
-                    WHERE id = ANY(%s)
-                """, ([r['memory_id'] for r in results],))
+                cur.execute(
+                    "SELECT touch_memories(%s::uuid[])",
+                    ([r["memory_id"] for r in results],),
+                )
                 self.conn.commit()
         
         return {
@@ -399,36 +380,27 @@ class MemoryToolHandler:
         memory_types = args.get('memory_types')
         by_access = args.get('by_access', True)
         
-        order_col = 'last_accessed' if by_access else 'created_at'
-        
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            type_filter = ""
-            params = [limit]
-            
-            if memory_types:
-                type_filter = "AND type = ANY(%s)"
-                params.insert(0, memory_types)
-            
-            cur.execute(f"""
+            cur.execute(
+                """
                 SELECT 
-                    id as memory_id,
+                    memory_id,
                     content,
-                    type as memory_type,
+                    memory_type,
                     importance,
                     created_at,
                     last_accessed
-                FROM memories
-                WHERE status = 'active' {type_filter}
-                ORDER BY {order_col} DESC NULLS LAST
-                LIMIT %s
-            """, params)
+                FROM list_recent_memories(%s, %s::memory_type[], %s)
+                """,
+                (limit, memory_types, by_access),
+            )
             
             results = cur.fetchall()
         
         return {
             "memories": [dict(r) for r in results],
             "count": len(results),
-            "sorted_by": order_col
+            "sorted_by": "last_accessed" if by_access else "created_at"
         }
     
     def _handle_recall_episode(self, args: dict) -> dict:
@@ -437,30 +409,13 @@ class MemoryToolHandler:
         
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
             # Get episode info
-            cur.execute("""
-                SELECT id, started_at, ended_at, episode_type, summary
-                FROM episodes
-                WHERE id = %s
-            """, (episode_id,))
+            cur.execute("SELECT * FROM get_episode_details(%s)", (episode_id,))
             
             episode = cur.fetchone()
             if not episode:
                 return {"error": f"Episode not found: {episode_id}"}
             
-            # Get memories in episode
-            cur.execute("""
-                SELECT 
-                    m.id as memory_id,
-                    m.content,
-                    m.type as memory_type,
-                    m.importance,
-                    m.created_at,
-                    em.sequence_order
-                FROM episode_memories em
-                JOIN memories m ON em.memory_id = m.id
-                WHERE em.episode_id = %s
-                ORDER BY em.sequence_order
-            """, (episode_id,))
+            cur.execute("SELECT * FROM get_episode_memories(%s)", (episode_id,))
             
             memories = cur.fetchall()
         
@@ -471,65 +426,46 @@ class MemoryToolHandler:
         }
     
     def _handle_explore_concept(self, args: dict) -> dict:
-        """Handle explore_concept - find memories linked to a concept."""
-        concept = args.get('concept', '').lower().strip()
+        """Handle explore_concept - find memories linked to a concept.
+        Phase 2 (ReduceScopeCreep): Concepts are now graph-only.
+        """
+        concept = args.get('concept', '').strip()
         include_related = args.get('include_related', True)
         limit = min(args.get('limit', 5), 20)
-        
+
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Find the concept
+            # Get memories linked to this concept via graph
             cur.execute("""
-                SELECT id, name, description, path_text
-                FROM concepts
-                WHERE name ILIKE %s
-                LIMIT 1
-            """, (f'%{concept}%',))
-            
-            concept_row = cur.fetchone()
-            
-            if not concept_row:
-                # No exact concept found, fall back to semantic search
-                return self._handle_recall({'query': concept, 'limit': limit})
-            
-            concept_id = concept_row['id']
-            
-            # Get memories linked to this concept
-            cur.execute("""
-                SELECT 
-                    m.id as memory_id,
-                    m.content,
-                    m.type as memory_type,
-                    m.importance,
-                    mc.strength as concept_strength
-                FROM memory_concepts mc
-                JOIN memories m ON mc.memory_id = m.id
-                WHERE mc.concept_id = %s
-                AND m.status = 'active'
-                ORDER BY mc.strength DESC, m.importance DESC
-                LIMIT %s
-            """, (concept_id, limit))
-            
+                SELECT
+                    memory_id,
+                    memory_content as content,
+                    memory_type,
+                    memory_importance as importance,
+                    link_strength as concept_strength
+                FROM find_memories_by_concept(%s, %s)
+            """, (concept, limit))
+
             memories = cur.fetchall()
-            
-            # Get related concepts
+
+            if not memories:
+                # No concept found, fall back to semantic search
+                return self._handle_recall({'query': concept, 'limit': limit})
+
+            # Get related concepts via graph (concepts that share memories)
             related_concepts = []
-            if include_related:
-                cur.execute("""
-                    SELECT DISTINCT c2.name, COUNT(*) as shared_memories
-                    FROM memory_concepts mc1
-                    JOIN memory_concepts mc2 ON mc1.memory_id = mc2.memory_id
-                    JOIN concepts c2 ON mc2.concept_id = c2.id
-                    WHERE mc1.concept_id = %s
-                    AND mc2.concept_id != %s
-                    GROUP BY c2.name
-                    ORDER BY shared_memories DESC
-                    LIMIT 10
-                """, (concept_id, concept_id))
-                
-                related_concepts = [dict(r) for r in cur.fetchall()]
-        
+            if include_related and memories:
+                memory_ids = [m["memory_id"] for m in memories]
+                cur.execute(
+                    """
+                    SELECT name, shared_memories
+                    FROM find_related_concepts_for_memories(%s::uuid[], %s, 10)
+                    """,
+                    (memory_ids, concept),
+                )
+                related_concepts = [dict(row) for row in cur.fetchall()]
+
         return {
-            "concept": dict(concept_row),
+            "concept": {"name": concept},
             "memories": [dict(m) for m in memories],
             "related_concepts": related_concepts,
             "count": len(memories)
@@ -541,43 +477,34 @@ class MemoryToolHandler:
         limit = min(args.get('limit', 3), 10)
         
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Search clusters by embedding similarity
-            cur.execute("""
-                WITH query_embedding AS (
-                    SELECT get_embedding(%s) as emb
-                )
+            cur.execute(
+                """
                 SELECT 
-                    mc.id,
-                    mc.name,
-                    mc.description,
-                    mc.cluster_type,
-                    mc.importance_score,
-                    mc.keywords,
-                    1 - (mc.centroid_embedding <=> (SELECT emb FROM query_embedding)) as similarity
-                FROM memory_clusters mc
-                WHERE mc.centroid_embedding IS NOT NULL
-                ORDER BY mc.centroid_embedding <=> (SELECT emb FROM query_embedding)
-                LIMIT %s
-            """, (query, limit))
+                    id,
+                    name,
+                    cluster_type,
+                    similarity
+                FROM search_clusters_by_query(%s, %s)
+                """,
+                (query, limit),
+            )
             
             clusters = cur.fetchall()
             
             # For each cluster, get sample memories
             result_clusters = []
             for cluster in clusters:
-                cur.execute("""
+                cur.execute(
+                    """
                     SELECT 
-                        m.id as memory_id,
-                        m.content,
-                        m.type as memory_type,
-                        mcm.membership_strength
-                    FROM memory_cluster_members mcm
-                    JOIN memories m ON mcm.memory_id = m.id
-                    WHERE mcm.cluster_id = %s
-                    AND m.status = 'active'
-                    ORDER BY mcm.membership_strength DESC
-                    LIMIT 3
-                """, (cluster['id'],))
+                        memory_id,
+                        content,
+                        memory_type,
+                        membership_strength
+                    FROM get_cluster_sample_memories(%s, 3)
+                    """,
+                    (cluster["id"],),
+                )
                 
                 sample_memories = cur.fetchall()
                 
@@ -598,26 +525,20 @@ class MemoryToolHandler:
         limit = min(args.get('limit', 3), 10)
         
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            # Search procedural memories
-            cur.execute("""
-                WITH query_embedding AS (
-                    SELECT get_embedding(%s) as emb
-                )
+            cur.execute(
+                """
                 SELECT 
-                    m.id as memory_id,
-                    m.content,
-                    pm.steps,
-                    pm.prerequisites,
-                    pm.success_rate,
-                    pm.average_duration,
-                    1 - (m.embedding <=> (SELECT emb FROM query_embedding)) as similarity
-                FROM memories m
-                JOIN procedural_memories pm ON m.id = pm.memory_id
-                WHERE m.status = 'active'
-                AND m.type = 'procedural'
-                ORDER BY m.embedding <=> (SELECT emb FROM query_embedding)
-                LIMIT %s
-            """, (task, limit))
+                    memory_id,
+                    content,
+                    steps,
+                    prerequisites,
+                    success_rate,
+                    average_duration,
+                    similarity
+                FROM search_procedural_memories(%s, %s)
+                """,
+                (task, limit),
+            )
             
             procedures = cur.fetchall()
         
@@ -633,25 +554,20 @@ class MemoryToolHandler:
         limit = min(args.get('limit', 3), 10)
         
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
-                WITH query_embedding AS (
-                    SELECT get_embedding(%s) as emb
-                )
+            cur.execute(
+                """
                 SELECT 
-                    m.id as memory_id,
-                    m.content,
-                    sm.pattern_description,
-                    sm.confidence_score,
-                    sm.context_applicability,
-                    sm.success_metrics,
-                    1 - (m.embedding <=> (SELECT emb FROM query_embedding)) as similarity
-                FROM memories m
-                JOIN strategic_memories sm ON m.id = sm.memory_id
-                WHERE m.status = 'active'
-                AND m.type = 'strategic'
-                ORDER BY m.embedding <=> (SELECT emb FROM query_embedding)
-                LIMIT %s
-            """, (situation, limit))
+                    memory_id,
+                    content,
+                    pattern_description,
+                    confidence_score,
+                    context_applicability,
+                    success_metrics,
+                    similarity
+                FROM search_strategic_memories(%s, %s)
+                """,
+                (situation, limit),
+            )
             
             strategies = cur.fetchall()
         
@@ -666,20 +582,19 @@ class MemoryToolHandler:
         limit = min(args.get('limit', 5), 20)
         
         with self.conn.cursor(cursor_factory=RealDictCursor) as cur:
-            cur.execute("""
+            cur.execute(
+                """
                 SELECT 
-                    e.id,
-                    e.started_at,
-                    e.ended_at,
-                    e.episode_type,
-                    e.summary,
-                    COUNT(em.memory_id) as memory_count
-                FROM episodes e
-                LEFT JOIN episode_memories em ON e.id = em.episode_id
-                GROUP BY e.id
-                ORDER BY e.started_at DESC
-                LIMIT %s
-            """, (limit,))
+                    id,
+                    started_at,
+                    ended_at,
+                    episode_type,
+                    summary,
+                    memory_count
+                FROM list_recent_episodes(%s)
+                """,
+                (limit,),
+            )
             
             episodes = cur.fetchall()
         
@@ -1202,8 +1117,7 @@ def cross_join_query(
                 cur.execute(
                     """
                     SELECT memory_id, neighbors
-                    FROM memory_neighborhoods
-                    WHERE memory_id = ANY(%s::uuid[])
+                    FROM get_memory_neighborhoods(%s::uuid[])
                     """,
                     (hit_ids,),
                 )
@@ -1237,8 +1151,7 @@ def cross_join_query(
                     cur.execute(
                         """
                         SELECT id, type, content, importance
-                        FROM memories
-                        WHERE id = ANY(%s::uuid[])
+                        FROM get_memories_summary(%s::uuid[])
                         """,
                         (list(neighbor_ids),),
                     )

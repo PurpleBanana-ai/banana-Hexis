@@ -522,6 +522,37 @@ HEARTBEAT REFLECTION:
   3. Quick integration (self-model, emotion, values, relationships)
   4. Current state
   5. Forward look
+
+REQUIRED REFLECTION OUTPUT (STRUCTURED JSON):
+──────────────────────────────────────────────
+Return strict JSON with these keys so reflections can be persisted:
+
+{
+  "insights": [
+    {"content": "...", "confidence": 0.8, "category": "self|world|other"}
+  ],
+  "identity_updates": [
+    {"aspect_type": "values|capabilities|limits|narrative", "change": "...", "reason": "..."}
+  ],
+  "self_updates": [
+    {"kind": "capable_of|struggles_with|values|has_learned|tends_to",
+     "concept": "...",
+     "strength": 0.8,
+     "evidence_memory_id": null}
+  ],
+  "worldview_updates": [
+    {"id": "uuid", "new_confidence": 0.8}
+  ],
+  "worldview_influences": [
+    {"worldview_id": "uuid", "memory_id": "uuid", "strength": 0.8, "influence_type": "evidence"}
+  ],
+  "discovered_relationships": [
+    {"from_id": "uuid", "to_id": "uuid", "type": "ASSOCIATED", "confidence": 0.9}
+  ],
+  "contradictions_noted": [
+    {"memory_a": "uuid", "memory_b": "uuid", "resolution": "..."}
+  ]
+}
 ```
 
 ---

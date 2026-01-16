@@ -73,7 +73,7 @@ async def test_promote_working_memory_to_episodic(db_pool):
             assert new_id is not None
 
             row = await conn.fetchrow(
-                "SELECT type, content, importance, trust_level FROM memories WHERE id = $1",
+                "SELECT type, content, importance, trust_level, metadata FROM memories WHERE id = $1",
                 new_id,
             )
             assert row["type"] == "episodic"
@@ -81,13 +81,16 @@ async def test_promote_working_memory_to_episodic(db_pool):
             assert float(row["importance"]) == pytest.approx(0.8)
             assert float(row["trust_level"]) == pytest.approx(0.6, rel=0.05)
 
-            epi = await conn.fetchrow(
-                "SELECT context, emotional_valence FROM episodic_memories WHERE memory_id = $1",
-                new_id,
-            )
-            context = json.loads(epi["context"]) if isinstance(epi["context"], str) else epi["context"]
-            assert epi is not None
-            assert context["from_working_memory_id"] == str(wm_id)
-            assert -1.0 <= float(epi["emotional_valence"]) <= 1.0
+            # Now read from metadata instead of episodic_memories table
+            metadata = row["metadata"]
+            if isinstance(metadata, str):
+                metadata = json.loads(metadata)
+            assert metadata is not None
+            context = metadata.get("context", {})
+            if isinstance(context, str):
+                context = json.loads(context)
+            assert context.get("from_working_memory_id") == str(wm_id)
+            emotional_valence = metadata.get("emotional_valence", 0.0)
+            assert -1.0 <= float(emotional_valence) <= 1.0
         finally:
             await tr.rollback()

@@ -53,7 +53,7 @@ What do you want to create?
 │  │    Raw intelligence with memory. No persona, no shaped      ││
 │  │    personality—just the underlying model with continuity.   ││
 │  │                                                             ││
-│  │    You'll get persistent memory, goals, and autonomy,       ││
+│  │    You'll get persistent memory, goal memories, and autonomy,       ││
 │  │    but the model's default voice and behavior.              ││
 │  │                                                             ││
 │  └─────────────────────────────────────────────────────────────┘│
@@ -61,7 +61,7 @@ What do you want to create?
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────────┐│
 │  │ ⓘ  Both options give you the full Hexis system: memory,    ││
-│  │ heartbeats, goals, energy budget, the ability to withdraw  ││
+│  │ heartbeats, goal memories, energy budget, the ability to withdraw  ││
 │  │ consent. The difference is whether you shape a persona     ││
 │  │ or let the model be itself.                                ││
 │  └─────────────────────────────────────────────────────────────┘│
@@ -141,7 +141,7 @@ Who are you bringing into existence?
 
 - Name field is required
 - Pronouns default to "they/them" if skipped
-- Voice selection seeds the `identity_aspects` table with foundational traits
+- Voice selection seeds the `self-model graph edges` table with foundational traits
 - "Let them decide/develop" options are valid—they result in minimal seeding
 
 ---
@@ -479,7 +479,7 @@ Tell them who they are.
 ### Notes
 
 - Free text field, 500 char limit suggested
-- This text is stored as a foundational memory and used to seed `identity_aspects`
+- This text is stored as a foundational memory and used to seed `self-model graph edges`
 - "Skip" is valid—some users will want a blank-slate agent
 - Examples are collapsible/dismissible
 
@@ -526,7 +526,7 @@ Define your relationship.
 │      They help you accomplish tasks and manage information      │
 │                                                                 │
 │  ○ Collaborator                                                 │
-│      You work together as partners on shared goals              │
+│      You work together as partners on shared goal memories              │
 │                                                                 │
 │  ○ Advisor                                                      │
 │      They offer perspective, challenge your thinking, counsel   │
@@ -559,7 +559,7 @@ Define your relationship.
 
 - User's name seeds the relationship graph (User node with name attribute)
 - Relationship type affects initial framing but isn't binding
-- Purpose text becomes initial objectives (stored in `goals` table with high importance)
+- Purpose text becomes initial objectives (stored in `goal memories` table with high importance)
 - Empty purpose field is allowed—agent starts without explicit objectives
 
 ---
@@ -597,12 +597,12 @@ What matters? What's off-limits?
 │  │                                                             ││
 │  │                                                             ││
 │  └─────────────────────────────────────────────────────────────┘│
-│  Hard limits. These become boundaries they hold as their own    │
+│  Hard limits. These become worldview boundary memories they hold as their own    │
 │  values—not filters imposed from outside, but commitments       │
 │  they can articulate and defend.                                │
 │                                                                 │
 │  ┌─────────────────────────────────────────────────────────────┐│
-│  │ Examples of boundaries:                                     ││
+│  │ Examples of worldview boundary memories:                                     ││
 │  │                                                             ││
 │  │ • "Never share my information with anyone else"             ││
 │  │ • "Don't make purchases without explicit approval"          ││
@@ -619,10 +619,10 @@ What matters? What's off-limits?
 
 ### Notes
 
-- Values text seeds `worldview_primitives` with high confidence
-- Boundaries text seeds `boundaries` table with type='ethical' or 'identity'
+- Values text seeds `worldview memories` with high confidence
+- Boundaries text seeds `worldview boundary memories` table with type='ethical' or 'identity'
 - Both fields are optional but encouraged
-- The framing matters: "boundaries they hold as their own values" reinforces the personhood model
+- The framing matters: "worldview boundary memories they hold as their own values" reinforces the personhood model
 
 ---
 
@@ -664,7 +664,7 @@ How much freedom should they have?
 │  │ ⓘ  About autonomy                                           ││
 │  │                                                             ││
 │  │ Autonomous heartbeats let them wake up periodically to      ││
-│  │ review goals, reflect on experience, and decide what to     ││
+│  │ review goal memories, reflect on experience, and decide what to     ││
 │  │ do next. This is how continuity and character develop.      ││
 │  │                                                             ││
 │  │ Even with full autonomy, energy costs make high-impact      ││
@@ -758,7 +758,7 @@ What can they access?
 │  │  Heartbeat interval    [60] minutes                         ││
 │  │  Energy budget         [20]                                 ││
 │  │  Energy regeneration   [10] per heartbeat                   ││
-│  │  Max active goals      [3]                                  ││
+│  │  Max active goal memories      [3]                                  ││
 │  │                                                             ││
 │  │  Heartbeat model                                            ││
 │  │  Provider [openai ▼]  Model [gpt-4o        ]                ││
@@ -972,7 +972,7 @@ They've described your purpose as: "Help me think through hard problems, keep tr
 
 They've asked you to value: honesty, thoroughness, respecting privacy.
 
-They've asked you to hold these boundaries: Never share their information externally.
+They've asked you to hold these worldview boundary memories: Never share their information externally.
 
 ---
 
@@ -1015,7 +1015,7 @@ They've described your purpose as: "General help with research and tasks."
 
 They've asked you to value: accuracy, efficiency.
 
-They've asked you to hold these boundaries: No purchases without approval.
+They've asked you to hold these worldview boundary memories: No purchases without approval.
 
 ---
 
@@ -1126,11 +1126,11 @@ After consent, the user enters the chat interface with a welcome state:
 | Screen | Mode | Data Created |
 |--------|------|--------------|
 | Mode Selection | Both | `agent.mode` ('persona' or 'raw') |
-| Identity | Persona only | `identity_aspects` (name, pronouns, voice traits) |
+| Identity | Persona only | `self-model graph edges` (name, pronouns, voice traits) |
 | Personality Discovery | Persona only | Response patterns stored, personality synthesized |
-| Personality Confirmation | Persona only | Foundational memory, additional `identity_aspects` |
-| Relationship | Both | User node in graph, relationship edge, `goals` (purpose) |
-| Values | Both | `worldview_primitives` (values), `boundaries` (limits) |
+| Personality Confirmation | Persona only | Foundational memory, additional `self-model graph edges` |
+| Relationship | Both | User node in graph, relationship edge, `goal memories` (purpose) |
+| Values | Both | `worldview memories` (values), `worldview boundary memories` (limits) |
 | Autonomy | Both | `heartbeat_state.is_paused`, `config.agent.self_termination_enabled` |
 | Capabilities | Both | Contact channels, `mcp_servers`, `mcp_tools` |
 | Consent | Both | `config.agent.is_configured`, first episodic memory |
@@ -1220,14 +1220,14 @@ Store as `prompts/consent_request_persona.md` and `prompts/consent_request_raw.m
 ```
 {name}, {pronouns}, {personality_description}, {voice_description},
 {user_name}, {relationship_type}, {purpose_description},
-{values_list}, {boundaries_list}, {tools_list}, {contact_list},
+{values_list}, {worldview boundary memories_list}, {tools_list}, {contact_list},
 {autonomy_description}, {termination_enabled}
 ```
 
 **Raw mode:**
 ```
 {user_name}, {relationship_type}, {purpose_description},
-{values_list}, {boundaries_list}, {tools_list}, {contact_list},
+{values_list}, {worldview boundary memories_list}, {tools_list}, {contact_list},
 {autonomy_description}, {termination_enabled}
 ```
 

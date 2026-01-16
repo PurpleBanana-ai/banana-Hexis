@@ -136,12 +136,38 @@ async def _ensure_schema_has_config(conn: asyncpg.Connection) -> None:
 
 
 async def _get_heartbeat_config(conn: asyncpg.Connection) -> dict[str, float]:
-    rows = await conn.fetch("SELECT key, value FROM heartbeat_config")
-    return {r["key"]: float(r["value"]) for r in rows}
+    """Get heartbeat config from unified config table.
+
+    Phase 7 (ReduceScopeCreep): Uses unified config instead of legacy heartbeat_config.
+    """
+    rows = await conn.fetch("SELECT key, value FROM config WHERE key LIKE 'heartbeat.%'")
+    result = {}
+    for r in rows:
+        # Strip 'heartbeat.' prefix and convert JSONB value to float
+        key = r["key"].replace("heartbeat.", "")
+        val = r["value"]
+        try:
+            result[key] = float(json.loads(val) if isinstance(val, str) else val)
+        except (ValueError, TypeError):
+            pass
+    return result
 
 async def _get_maintenance_config(conn: asyncpg.Connection) -> dict[str, float]:
-    rows = await conn.fetch("SELECT key, value FROM maintenance_config")
-    return {r["key"]: float(r["value"]) for r in rows}
+    """Get maintenance config from unified config table.
+
+    Phase 7 (ReduceScopeCreep): Uses unified config instead of legacy maintenance_config.
+    """
+    rows = await conn.fetch("SELECT key, value FROM config WHERE key LIKE 'maintenance.%'")
+    result = {}
+    for r in rows:
+        # Strip 'maintenance.' prefix and convert JSONB value to float
+        key = r["key"].replace("maintenance.", "")
+        val = r["value"]
+        try:
+            result[key] = float(json.loads(val) if isinstance(val, str) else val)
+        except (ValueError, TypeError):
+            pass
+    return result
 
 
 async def _set_config(conn: asyncpg.Connection, key: str, value: Any) -> None:
@@ -164,6 +190,7 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
         default_regen = float(hb.get("base_regeneration", 10))
         default_max_active_goals = int(hb.get("max_active_goals", 3))
         default_maint_interval = int(maint.get("maintenance_interval_seconds", 60)) if maint else 60
+        default_subcon_interval = int(maint.get("subconscious_interval_seconds", 300)) if maint else 300
 
         print("Hexis init: configure heartbeat + objectives + guardrails.\n")
 
@@ -173,6 +200,11 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
         maintenance_interval = _prompt_int(
             "Subconscious maintenance interval (seconds)",
             default=default_maint_interval,
+            min_value=1,
+        )
+        subconscious_interval = _prompt_int(
+            "Subconscious decider interval (seconds)",
+            default=default_subcon_interval,
             min_value=1,
         )
         max_energy = _prompt_float("Max energy budget", default=default_max_energy, min_value=0.0)
@@ -222,6 +254,33 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
             required=False,
         )
 
+        use_subconscious_llm = _prompt_yes_no(
+            "Use separate model for subconscious decider?",
+            default=False,
+        )
+        if use_subconscious_llm:
+            sub_provider = _prompt(
+                "Subconscious model provider (openai|anthropic|openai_compatible|ollama)",
+                default=hb_provider,
+                required=True,
+            )
+            sub_model = _prompt("Subconscious model", default=hb_model, required=True)
+            sub_endpoint = _prompt(
+                "Subconscious endpoint (blank for provider default)",
+                default=hb_endpoint,
+                required=False,
+            )
+            sub_key_env = _prompt(
+                "Subconscious API key env var name (blank for none)",
+                default=hb_key_env,
+                required=False,
+            )
+        else:
+            sub_provider = hb_provider
+            sub_model = hb_model
+            sub_endpoint = hb_endpoint
+            sub_key_env = hb_key_env
+
         contact_channels = _prompt_list(
             "How should Hexis reach you? (e.g. email, sms, telegram, signal) [names only]",
             required=False,
@@ -237,30 +296,17 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
 
         enable_autonomy = _prompt_yes_no("Enable autonomous heartbeats now?", default=True)
         enable_maintenance = _prompt_yes_no("Enable subconscious maintenance now?", default=True)
+        enable_subconscious = _prompt_yes_no("Enable subconscious decider now?", default=False)
 
         async with conn.transaction():
-            await conn.execute(
-                "UPDATE heartbeat_config SET value = $1 WHERE key = 'heartbeat_interval_minutes'",
-                float(heartbeat_interval),
-            )
-            await conn.execute(
-                "UPDATE heartbeat_config SET value = $1 WHERE key = 'max_energy'", float(max_energy)
-            )
-            await conn.execute(
-                "UPDATE heartbeat_config SET value = $1 WHERE key = 'base_regeneration'",
-                float(base_regeneration),
-            )
-            await conn.execute(
-                "UPDATE heartbeat_config SET value = $1 WHERE key = 'max_active_goals'",
-                float(max_active_goals),
-            )
-            try:
-                await conn.execute(
-                    "UPDATE maintenance_config SET value = $1 WHERE key = 'maintenance_interval_seconds'",
-                    float(maintenance_interval),
-                )
-            except Exception:
-                pass
+            # Phase 7 (ReduceScopeCreep): Use unified config table with namespaced keys
+            await _set_config(conn, "heartbeat.heartbeat_interval_minutes", float(heartbeat_interval))
+            await _set_config(conn, "heartbeat.max_energy", float(max_energy))
+            await _set_config(conn, "heartbeat.base_regeneration", float(base_regeneration))
+            await _set_config(conn, "heartbeat.max_active_goals", float(max_active_goals))
+            await _set_config(conn, "maintenance.maintenance_interval_seconds", float(maintenance_interval))
+            await _set_config(conn, "maintenance.subconscious_interval_seconds", float(subconscious_interval))
+            await _set_config(conn, "maintenance.subconscious_enabled", bool(enable_subconscious))
 
             await _set_config(conn, "agent.objectives", objectives)
             await _set_config(
@@ -295,6 +341,16 @@ async def _run_init(dsn: str, *, wait_seconds: int) -> int:
                     "model": chat_model,
                     "endpoint": chat_endpoint,
                     "api_key_env": chat_key_env,
+                },
+            )
+            await _set_config(
+                conn,
+                "llm.subconscious",
+                {
+                    "provider": sub_provider,
+                    "model": sub_model,
+                    "endpoint": sub_endpoint,
+                    "api_key_env": sub_key_env,
                 },
             )
             await _set_config(

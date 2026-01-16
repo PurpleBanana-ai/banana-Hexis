@@ -51,25 +51,42 @@ async def get_agent_status(dsn: str | None = None) -> dict[str, Any]:
 
 
 async def get_init_defaults(dsn: str | None = None) -> dict[str, Any]:
+    """Get default configuration values from unified config table.
+
+    Phase 7 (ReduceScopeCreep): Uses unified config table instead of legacy heartbeat_config/maintenance_config.
+    """
     dsn = dsn or db_dsn_from_env()
     conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
     try:
-        hb_rows = await conn.fetch("SELECT key, value FROM heartbeat_config")
-        hb = {r["key"]: float(r["value"]) for r in hb_rows}
+        # Phase 7: Use unified config table with namespaced keys
+        rows = await conn.fetch(
+            """
+            SELECT key, value
+            FROM get_config_by_prefixes($1::text[])
+            """,
+            ["heartbeat.", "maintenance."],
+        )
+        cfg = {r["key"]: r["value"] for r in rows}
 
-        maint: dict[str, float] = {}
-        try:
-            maint_rows = await conn.fetch("SELECT key, value FROM maintenance_config")
-            maint = {r["key"]: float(r["value"]) for r in maint_rows}
-        except Exception:
-            maint = {}
+        def get_float(key: str, default: float) -> float:
+            val = cfg.get(key)
+            if val is None:
+                return default
+            # JSONB values may be strings or numbers
+            if isinstance(val, (int, float)):
+                return float(val)
+            try:
+                import json
+                return float(json.loads(val) if isinstance(val, str) else val)
+            except Exception:
+                return default
 
         return {
-            "heartbeat_interval_minutes": int(hb.get("heartbeat_interval_minutes", 60)),
-            "max_energy": float(hb.get("max_energy", 20)),
-            "base_regeneration": float(hb.get("base_regeneration", 10)),
-            "max_active_goals": int(hb.get("max_active_goals", 3)),
-            "maintenance_interval_seconds": int(maint.get("maintenance_interval_seconds", 60)) if maint else 60,
+            "heartbeat_interval_minutes": int(get_float("heartbeat.heartbeat_interval_minutes", 60)),
+            "max_energy": get_float("heartbeat.max_energy", 20),
+            "base_regeneration": get_float("heartbeat.base_regeneration", 10),
+            "max_active_goals": int(get_float("heartbeat.max_active_goals", 3)),
+            "maintenance_interval_seconds": int(get_float("maintenance.maintenance_interval_seconds", 60)),
         }
     finally:
         await conn.close()
@@ -117,6 +134,7 @@ async def apply_agent_config(
     dsn: str | None = None,
     heartbeat_interval_minutes: int,
     maintenance_interval_seconds: int,
+    subconscious_interval_seconds: int | None = None,
     max_energy: float,
     base_regeneration: float,
     max_active_goals: int,
@@ -126,37 +144,49 @@ async def apply_agent_config(
     tools: list[str],
     llm_heartbeat: dict[str, Any],
     llm_chat: dict[str, Any],
+    llm_subconscious: dict[str, Any] | None = None,
     contact_channels: list[str],
     contact_destinations: dict[str, str],
     enable_autonomy: bool,
     enable_maintenance: bool,
+    enable_subconscious: bool | None = None,
     mark_configured: bool,
 ) -> None:
     dsn = dsn or db_dsn_from_env()
     conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
     try:
         async with conn.transaction():
+            # Phase 7 (ReduceScopeCreep): Use unified config table with namespaced keys
             await conn.execute(
-                "UPDATE heartbeat_config SET value = $1 WHERE key = 'heartbeat_interval_minutes'",
-                float(heartbeat_interval_minutes),
-            )
-            await conn.execute("UPDATE heartbeat_config SET value = $1 WHERE key = 'max_energy'", float(max_energy))
-            await conn.execute(
-                "UPDATE heartbeat_config SET value = $1 WHERE key = 'base_regeneration'",
-                float(base_regeneration),
+                "SELECT set_config('heartbeat.heartbeat_interval_minutes', $1::jsonb)",
+                str(float(heartbeat_interval_minutes)),
             )
             await conn.execute(
-                "UPDATE heartbeat_config SET value = $1 WHERE key = 'max_active_goals'",
-                float(max_active_goals),
+                "SELECT set_config('heartbeat.max_energy', $1::jsonb)",
+                str(float(max_energy)),
             )
-
-            try:
+            await conn.execute(
+                "SELECT set_config('heartbeat.base_regeneration', $1::jsonb)",
+                str(float(base_regeneration)),
+            )
+            await conn.execute(
+                "SELECT set_config('heartbeat.max_active_goals', $1::jsonb)",
+                str(float(max_active_goals)),
+            )
+            await conn.execute(
+                "SELECT set_config('maintenance.maintenance_interval_seconds', $1::jsonb)",
+                str(float(maintenance_interval_seconds)),
+            )
+            if subconscious_interval_seconds is not None:
                 await conn.execute(
-                    "UPDATE maintenance_config SET value = $1 WHERE key = 'maintenance_interval_seconds'",
-                    float(maintenance_interval_seconds),
+                    "SELECT set_config('maintenance.subconscious_interval_seconds', $1::jsonb)",
+                    str(float(subconscious_interval_seconds)),
                 )
-            except Exception:
-                pass
+            if enable_subconscious is not None:
+                await conn.execute(
+                    "SELECT set_config('maintenance.subconscious_enabled', $1::jsonb)",
+                    json.dumps(bool(enable_subconscious)),
+                )
 
             await conn.execute("SELECT set_config('agent.objectives', $1::jsonb)", json.dumps(objectives))
             await conn.execute(
@@ -179,6 +209,10 @@ async def apply_agent_config(
 
             await conn.execute("SELECT set_config('llm.heartbeat', $1::jsonb)", json.dumps(llm_heartbeat))
             await conn.execute("SELECT set_config('llm.chat', $1::jsonb)", json.dumps(llm_chat))
+            await conn.execute(
+                "SELECT set_config('llm.subconscious', $1::jsonb)",
+                json.dumps(llm_subconscious or llm_heartbeat),
+            )
             await conn.execute(
                 "SELECT set_config('user.contact', $1::jsonb)",
                 json.dumps({"channels": contact_channels, "destinations": contact_destinations}),
@@ -251,7 +285,7 @@ async def set_agent_configured(dsn: str | None, *, configured: bool) -> None:
         if configured:
             await conn.execute("SELECT set_config('agent.is_configured', 'true'::jsonb)")
         else:
-            await conn.execute("DELETE FROM config WHERE key = 'agent.is_configured'")
+            await conn.execute("SELECT delete_config_key('agent.is_configured')")
     finally:
         await conn.close()
 

@@ -74,7 +74,7 @@ def ui_test_db() -> Generator[str, None, None]:
     try:
         asyncio.run(_setup())
     except Exception as exc:
-        pytest.skip(f"Postgres unavailable for UI e2e tests: {exc}")
+        pytest.fail(f"Postgres unavailable for UI e2e tests: {exc}")
     yield temp_db
     try:
         asyncio.run(_teardown())
@@ -157,7 +157,7 @@ def reflex_server(ui_test_db: str) -> Generator[str, None, None]:
         _wait_for_port(backend_port, timeout=120)
         yield f"http://127.0.0.1:{port}"
     except Exception as exc:
-        pytest.skip(f"Reflex server did not start: {exc}")
+        pytest.fail(f"Reflex server did not start: {exc}")
     finally:
         process.terminate()
         try:
@@ -176,7 +176,7 @@ def driver() -> Generator[webdriver.Chrome, None, None]:
     try:
         browser = webdriver.Chrome(options=options)
     except WebDriverException as exc:
-        pytest.skip(f"Chrome driver not available: {exc}")
+        pytest.fail(f"Chrome driver not available: {exc}")
     yield browser
     browser.quit()
 
@@ -266,15 +266,17 @@ def test_persona_flow_with_questions(reflex_server: str, driver: webdriver.Chrom
             deadline = time.monotonic() + 20
             mode = None
             profile = None
+            is_configured = None
+            consent_status = None
             while time.monotonic() < deadline:
                 mode = await _fetch_config(conn, "agent.mode")
                 profile = await _fetch_config(conn, "agent.init_profile")
-                if mode and profile:
+                is_configured = await _fetch_config(conn, "agent.is_configured")
+                consent_status = await _fetch_config(conn, "agent.consent_status")
+                if mode and profile and is_configured is True and consent_status == "consent":
                     break
                 await asyncio.sleep(0.5)
 
-            is_configured = await _fetch_config(conn, "agent.is_configured")
-            consent_status = await _fetch_config(conn, "agent.consent_status")
             consent_log_id = await _fetch_config(conn, "agent.consent_log_id")
             heartbeat_paused = await conn.fetchval("SELECT is_paused FROM heartbeat_state WHERE id = 1")
             tools = await _fetch_config(conn, "agent.tools")

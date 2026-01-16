@@ -64,8 +64,9 @@ async def test_apply_agent_config_and_readback(db_pool):
     assert llm_chat.get("model") == "gpt-4o-mini"
 
     async with db_pool.acquire() as conn:
+        # Phase 7 (ReduceScopeCreep): use unified config
         interval = await conn.fetchval(
-            "SELECT value FROM heartbeat_config WHERE key = 'heartbeat_interval_minutes'"
+            "SELECT get_config_float('heartbeat.heartbeat_interval_minutes')"
         )
         assert float(interval) == 12.0
 

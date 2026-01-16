@@ -172,21 +172,12 @@ async def _handle_explore_cluster(args: dict[str, Any], mem_client: CognitiveMem
     async with mem_client._pool.acquire() as conn:  # noqa: SLF001
         clusters = await conn.fetch(
             """
-            WITH query_embedding AS (
-                SELECT get_embedding($1) as emb
-            )
             SELECT
-                mc.id,
-                mc.name,
-                mc.description,
-                mc.cluster_type,
-                mc.importance_score,
-                mc.keywords,
-                1 - (mc.centroid_embedding <=> (SELECT emb FROM query_embedding)) as similarity
-            FROM memory_clusters mc
-            WHERE mc.centroid_embedding IS NOT NULL
-            ORDER BY mc.centroid_embedding <=> (SELECT emb FROM query_embedding)
-            LIMIT $2
+                id,
+                name,
+                cluster_type,
+                similarity
+            FROM search_clusters_by_query($1::text, $2::int)
             """,
             query,
             limit,
@@ -196,16 +187,11 @@ async def _handle_explore_cluster(args: dict[str, Any], mem_client: CognitiveMem
             sample_memories = await conn.fetch(
                 """
                 SELECT
-                    m.id as memory_id,
-                    m.content,
-                    m.type as memory_type,
-                    mcm.membership_strength
-                FROM memory_cluster_members mcm
-                JOIN memories m ON mcm.memory_id = m.id
-                WHERE mcm.cluster_id = $1
-                AND m.status = 'active'
-                ORDER BY mcm.membership_strength DESC
-                LIMIT 3
+                    memory_id,
+                    content,
+                    memory_type,
+                    membership_strength
+                FROM get_cluster_sample_memories($1::uuid, 3)
                 """,
                 cluster["id"],
             )

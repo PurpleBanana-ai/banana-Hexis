@@ -30,28 +30,31 @@ async def _set_embedding_retry_config(
     retry_seconds: int,
     retry_interval_seconds: float,
 ):
+    # Save original values from unified config table
     original_retry_seconds = await conn.fetchval(
-        "SELECT value FROM embedding_config WHERE key = 'retry_seconds'"
+        "SELECT value #>> '{}' FROM config WHERE key = 'embedding.retry_seconds'"
     )
     original_retry_interval_seconds = await conn.fetchval(
-        "SELECT value FROM embedding_config WHERE key = 'retry_interval_seconds'"
+        "SELECT value #>> '{}' FROM config WHERE key = 'embedding.retry_interval_seconds'"
     )
+    # Update unified config table
     await conn.execute(
         """
-        INSERT INTO embedding_config (key, value)
-        VALUES ('retry_seconds', $1)
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        INSERT INTO config (key, value, description, updated_at)
+        VALUES ('embedding.retry_seconds', $1::jsonb, 'Total seconds to retry embedding requests', CURRENT_TIMESTAMP)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
         """,
         str(retry_seconds),
     )
     await conn.execute(
         """
-        INSERT INTO embedding_config (key, value)
-        VALUES ('retry_interval_seconds', $1)
-        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
+        INSERT INTO config (key, value, description, updated_at)
+        VALUES ('embedding.retry_interval_seconds', $1::jsonb, 'Seconds between retry attempts', CURRENT_TIMESTAMP)
+        ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value, updated_at = CURRENT_TIMESTAMP
         """,
         str(retry_interval_seconds),
     )
+    # Phase 7 (ReduceScopeCreep): embedding_config removed - using unified config only
     return original_retry_seconds, original_retry_interval_seconds
 
 
@@ -60,19 +63,19 @@ async def _restore_embedding_retry_config(
     original_retry_seconds,
     original_retry_interval_seconds,
 ):
+    # Restore unified config table
     if original_retry_seconds is None:
-        await conn.execute("DELETE FROM embedding_config WHERE key = 'retry_seconds'")
+        await conn.execute("DELETE FROM config WHERE key = 'embedding.retry_seconds'")
     else:
         await conn.execute(
-            "UPDATE embedding_config SET value = $1 WHERE key = 'retry_seconds'",
+            "UPDATE config SET value = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE key = 'embedding.retry_seconds'",
             original_retry_seconds,
         )
     if original_retry_interval_seconds is None:
-        await conn.execute(
-            "DELETE FROM embedding_config WHERE key = 'retry_interval_seconds'"
-        )
+        await conn.execute("DELETE FROM config WHERE key = 'embedding.retry_interval_seconds'")
     else:
         await conn.execute(
-            "UPDATE embedding_config SET value = $1 WHERE key = 'retry_interval_seconds'",
+            "UPDATE config SET value = $1::jsonb, updated_at = CURRENT_TIMESTAMP WHERE key = 'embedding.retry_interval_seconds'",
             original_retry_interval_seconds,
         )
+    # Phase 7 (ReduceScopeCreep): embedding_config removed - using unified config only

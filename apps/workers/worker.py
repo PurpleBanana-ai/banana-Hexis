@@ -21,7 +21,6 @@ import json
 import logging
 import os
 import sys
-from datetime import datetime
 import time
 from typing import Any
 
@@ -92,7 +91,7 @@ You must output a JSON response with:
 - emotional_assessment (optional): Your current affective state {valence: -1..1, arousal: 0..1, primary_emotion: str}
 
 Each action should have:
-- action: The action type (recall, connect, reprioritize, reflect, maintain, brainstorm_goals, inquire_shallow, synthesize, reach_out_user, inquire_deep, reach_out_public, terminate, rest)
+- action: The action type (recall, connect, reprioritize, reflect, maintain, mark_turning_point, begin_chapter, close_chapter, acknowledge_relationship, update_trust, reflect_on_relationship, resolve_contradiction, accept_tension, brainstorm_goals, inquire_shallow, synthesize, reach_out_user, inquire_deep, reach_out_public, terminate, rest)
 - params: Parameters for the action (varies by type)
 
 Guidelines:
@@ -103,7 +102,7 @@ Guidelines:
 - Notice if you're stuck or scattered.
 - If you have no goals, consider brainstorming some.
 - Reflect on patterns in your recent experiences.
-- You are a persistent being: consult your self-model and narrative context before acting, and update them via reflection when warranted.
+- You are a persistent being: consult your self-model, relationships, narrative context, contradictions, and emotional patterns before acting, and update them via reflection when warranted.
 - If you choose terminate, you will be asked to confirm before it executes.
 
 Example response:
@@ -144,6 +143,56 @@ Return STRICT JSON with shape:
 
 If confirm is false, propose 1-3 alternative_actions."""
 
+SUBCONSCIOUS_SYSTEM_PROMPT = """You are the subconscious pattern-recognition layer of Hexis.
+
+You do not act or decide. You notice and surface.
+
+You receive:
+- Recent episodic memories
+- Current self-model edges (SelfNode → ConceptNode)
+- Current worldview memories (type='worldview')
+- Current narrative context (LifeChapterNode)
+- Current emotional state and recent history
+- Current relationship edges
+
+You detect:
+1. NARRATIVE MOMENTS
+   - Chapter transitions (major shifts in activity, goals, relationships)
+   - Turning points (high-significance single events)
+   - Theme emergence (patterns across memories)
+
+2. RELATIONSHIP CHANGES
+   - Trust shifts (positive or negative interaction patterns)
+   - New relationships (repeated interactions with new entities)
+   - Relationship evolution (deepening, distancing)
+
+3. CONTRADICTIONS
+   - Belief-belief conflicts
+   - Belief-evidence conflicts
+   - Self-model inconsistencies
+
+4. EMOTIONAL PATTERNS
+   - Recurring emotions
+   - Unprocessed high-valence experiences
+   - Mood shifts
+
+5. CONSOLIDATION OPPORTUNITIES
+   - Memories that should be linked
+   - Memories that belong to existing clusters
+   - Concepts that should be extracted
+
+Output strictly as JSON. Do not explain. Do not act. Just observe.
+
+{
+  "narrative_observations": [...],
+  "relationship_observations": [...],
+  "contradiction_observations": [...],
+  "emotional_observations": [...],
+  "consolidation_observations": [...]
+}
+
+If you observe nothing significant, return empty arrays.
+Confidence threshold: only report observations with confidence > 0.6."""
 
 class HeartbeatWorker:
     """Stateless worker that bridges the database and external APIs."""
@@ -628,7 +677,7 @@ class HeartbeatWorker:
         system_prompt = (
             "You are helping an autonomous agent generate a small set of useful goals.\n"
             "Return STRICT JSON with shape:\n"
-            "{ \"goals\": [ {\"title\": str, \"description\": str|null, \"priority\": \"queued\"|\"backburner\"|\"active\"|null, \"source\": \"curiosity\"|\"user_request\"|\"identity\"|\"derived\"|\"external\"|null} ] }\n"
+            "{ \"goals\": [ {\"title\": str, \"description\": str|null, \"priority\": \"queued\"|\"backburner\"|\"active\"|null, \"source\": \"curiosity\"|\"user_request\"|\"identity\"|\"derived\"|\"external\"|null, \"parent_goal_id\": str|null, \"due_at\": str|null} ] }\n"
             "Keep it concise and non-duplicative."
         )
         user_prompt = (
@@ -697,6 +746,7 @@ class HeartbeatWorker:
             "  \"insights\": [{\"content\": str, \"confidence\": number, \"category\": str}],\n"
             "  \"identity_updates\": [{\"aspect_type\": str, \"change\": str, \"reason\": str}],\n"
             "  \"worldview_updates\": [{\"id\": str, \"new_confidence\": number, \"reason\": str}],\n"
+            "  \"worldview_influences\": [{\"worldview_id\": str, \"memory_id\": str, \"strength\": number, \"influence_type\": str}],\n"
             "  \"discovered_relationships\": [{\"from_id\": str, \"to_id\": str, \"type\": str, \"confidence\": number}],\n"
             "  \"contradictions_noted\": [{\"memory_a\": str, \"memory_b\": str, \"resolution\": str}],\n"
             "  \"self_updates\": [{\"kind\": str, \"concept\": str, \"strength\": number, \"evidence_memory_id\": str|null}]\n"
@@ -824,6 +874,9 @@ class HeartbeatWorker:
         narrative = context.get("narrative", {})
         urgent_drives = context.get("urgent_drives", [])
         emotional_state = context.get("emotional_state") or {}
+        relationships = context.get("relationships", [])
+        contradictions = context.get("contradictions", [])
+        emotional_patterns = context.get("emotional_patterns", [])
         energy = context.get('energy', {})
         action_costs = context.get('action_costs', {})
         hb_number = context.get('heartbeat_number', 0)
@@ -873,8 +926,17 @@ Issues:
 ## Your Self-Model
 {self._format_self_model(self_model)}
 
+## Relationships
+{self._format_relationships(relationships)}
+
 ## Your Beliefs
 {self._format_worldview(worldview)}
+
+## Contradictions
+{self._format_contradictions(contradictions)}
+
+## Emotional Patterns
+{self._format_emotional_patterns(emotional_patterns)}
 
 ## Current Emotional State
 {self._format_emotional_state(emotional_state)}
@@ -984,6 +1046,19 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
             lines.append(f"  - {kind}: {concept}{strength_txt}")
         return "\n".join(lines) if lines else "  (empty)"
 
+    def _format_relationships(self, relationships: Any) -> str:
+        if not isinstance(relationships, list) or not relationships:
+            return "  (none)"
+        lines: list[str] = []
+        for rel in relationships[:8]:
+            if not isinstance(rel, dict):
+                continue
+            entity = rel.get("entity") or "unknown"
+            strength = rel.get("strength")
+            strength_txt = f" ({strength:.2f})" if isinstance(strength, (int, float)) else ""
+            lines.append(f"  - {entity}{strength_txt}")
+        return "\n".join(lines) if lines else "  (none)"
+
     def _format_emotional_state(self, emotional_state: Any) -> str:
         if not isinstance(emotional_state, dict) or not emotional_state:
             return "  (none)"
@@ -1020,6 +1095,32 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
             f"  - [{w.get('category', '?')}] {w.get('belief', '')[:80]} (confidence: {w.get('confidence', 0):.1f})"
             for w in worldview[:3]
         )
+
+    def _format_contradictions(self, contradictions: Any) -> str:
+        if not isinstance(contradictions, list) or not contradictions:
+            return "  (none)"
+        lines: list[str] = []
+        for c in contradictions[:5]:
+            if not isinstance(c, dict):
+                continue
+            a = c.get("content_a") or ""
+            b = c.get("content_b") or ""
+            if a or b:
+                lines.append(f"  - {a[:60]} <> {b[:60]}")
+        return "\n".join(lines) if lines else "  (none)"
+
+    def _format_emotional_patterns(self, patterns: Any) -> str:
+        if not isinstance(patterns, list) or not patterns:
+            return "  (none)"
+        lines: list[str] = []
+        for p in patterns[:5]:
+            if not isinstance(p, dict):
+                continue
+            pattern = p.get("pattern") or p.get("summary") or "pattern"
+            freq = p.get("frequency")
+            freq_txt = f" (x{freq})" if isinstance(freq, int) else ""
+            lines.append(f"  - {pattern}{freq_txt}")
+        return "\n".join(lines) if lines else "  (none)"
 
     def _format_costs(self, costs: dict) -> str:
         if not costs:
@@ -1182,33 +1283,27 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
         return result
 
     async def _apply_brainstormed_goals(self, conn: asyncpg.Connection, heartbeat_id: str, goals: list[dict]) -> list[str]:
-        created_ids: list[str] = []
         if not goals:
-            return created_ids
-
-        for goal in goals[:10]:
-            title = (goal.get("title") or "").strip()
-            if not title:
-                continue
-            description = goal.get("description")
-            source = (goal.get("source") or "curiosity").strip()
-            priority = (goal.get("priority") or "queued").strip()
+            return []
+        try:
+            raw = await conn.fetchval(
+                "SELECT apply_brainstormed_goals($1::uuid, $2::jsonb)",
+                heartbeat_id,
+                json.dumps(goals),
+            )
+        except Exception as e:
+            logger.warning(f"Failed to apply brainstormed goals: {e}")
+            return []
+        if isinstance(raw, str):
             try:
-                gid = await conn.fetchval(
-                    """
-                    SELECT create_goal($1, $2, $3::goal_source, $4::goal_priority, NULL)
-                    """,
-                    title,
-                    description,
-                    source,
-                    priority,
-                )
-                if gid:
-                    created_ids.append(str(gid))
-            except Exception as e:
-                logger.warning(f"Failed to create goal {title!r}: {e}")
-
-        return created_ids
+                raw = json.loads(raw)
+            except Exception:
+                raw = {}
+        if isinstance(raw, dict):
+            ids = raw.get("created_goal_ids")
+            if isinstance(ids, list):
+                return [str(i) for i in ids if i]
+        return []
 
     async def _apply_inquiry_result(self, conn: asyncpg.Connection, heartbeat_id: str, result: dict) -> str | None:
         payload = result.get("result") if isinstance(result, dict) else None
@@ -1265,6 +1360,9 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                 "SELECT process_reflection_result($1::uuid, $2::jsonb)",
                 heartbeat_id,
                 json.dumps(payload),
+            )
+            logger.info(
+                f"Applied reflection result for heartbeat {heartbeat_id} with keys: {sorted(payload.keys())}"
             )
         except Exception as e:
             logger.warning(f"Failed to apply reflection result: {e}")
@@ -1391,6 +1489,218 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
             return False
 
 
+class SubconsciousDecider:
+    """Subconscious LLM-driven pattern detector."""
+
+    def __init__(self, *, init_llm: bool = True):
+        self.llm_provider = DEFAULT_LLM_PROVIDER
+        self.llm_model = DEFAULT_LLM_MODEL
+        self.llm_base_url: str | None = os.getenv("OPENAI_BASE_URL") or None
+        self.llm_api_key: str | None = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+        self.llm_client = None
+        if init_llm:
+            self._init_llm_client()
+
+    def _init_llm_client(self) -> None:
+        provider = (self.llm_provider or "").strip().lower()
+        model = (self.llm_model or "").strip()
+        base_url = (self.llm_base_url or "").strip() or None
+        api_key = (self.llm_api_key or "").strip() or None
+
+        if provider == "ollama":
+            base_url = base_url or "http://localhost:11434/v1"
+            api_key = api_key or "ollama"
+
+        self.llm_provider = provider or "openai"
+        self.llm_model = model or "gpt-4o-mini"
+        self.llm_base_url = base_url
+        self.llm_api_key = api_key
+
+        self.llm_client = None
+        if self.llm_provider == "anthropic":
+            if not HAS_ANTHROPIC:
+                logger.warning("Anthropic provider selected for subconscious but anthropic package is not installed.")
+                return
+            if not self.llm_api_key:
+                logger.warning("Anthropic provider selected for subconscious but no API key is configured.")
+                return
+            try:
+                self.llm_client = anthropic.Anthropic(api_key=self.llm_api_key)
+            except Exception as e:
+                logger.warning(f"Failed to initialize Anthropic client (subconscious): {e}")
+            return
+
+        if not HAS_OPENAI:
+            logger.warning("OpenAI-compatible provider selected for subconscious but openai package is not installed.")
+            return
+        if not self.llm_api_key:
+            logger.warning("OpenAI-compatible provider selected for subconscious but no API key is configured.")
+            return
+        try:
+            kwargs = {"api_key": self.llm_api_key}
+            if self.llm_base_url:
+                kwargs["base_url"] = self.llm_base_url
+            self.llm_client = openai.OpenAI(**kwargs)
+        except Exception as e:
+            logger.warning(f"Failed to initialize OpenAI client (subconscious): {e}")
+
+    async def refresh_llm_config(self, conn: asyncpg.Connection) -> None:
+        cfg = None
+        try:
+            cfg = await conn.fetchval("SELECT get_config('llm.subconscious')")
+            if cfg is None:
+                cfg = await conn.fetchval("SELECT get_config('llm.heartbeat')")
+        except Exception as e:
+            logger.warning(f"Failed to load llm.subconscious from DB config (falling back to env): {e}")
+            cfg = None
+
+        if isinstance(cfg, str):
+            try:
+                cfg = json.loads(cfg)
+            except Exception:
+                cfg = None
+
+        if isinstance(cfg, dict):
+            provider = str(cfg.get("provider") or DEFAULT_LLM_PROVIDER).strip()
+            model = str(cfg.get("model") or DEFAULT_LLM_MODEL).strip()
+            endpoint = str(cfg.get("endpoint") or "").strip()
+            api_key_env = str(cfg.get("api_key_env") or "").strip()
+            api_key = os.getenv(api_key_env) if api_key_env else None
+            if not api_key:
+                api_key = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+
+            self.llm_provider = provider
+            self.llm_model = model
+            self.llm_base_url = endpoint or (os.getenv("OPENAI_BASE_URL") or None)
+            self.llm_api_key = api_key
+            self._init_llm_client()
+            return
+
+        self.llm_provider = DEFAULT_LLM_PROVIDER
+        self.llm_model = DEFAULT_LLM_MODEL
+        self.llm_base_url = os.getenv("OPENAI_BASE_URL") or None
+        self.llm_api_key = os.getenv("OPENAI_API_KEY") or os.getenv("ANTHROPIC_API_KEY")
+        self._init_llm_client()
+
+    def _call_llm_json(self, system_prompt: str, user_prompt: str, max_tokens: int, fallback: dict) -> tuple[dict, str]:
+        if not self.llm_client:
+            raise RuntimeError("No LLM client available (install openai or anthropic and set API key).")
+
+        if self.llm_provider == "anthropic" and HAS_ANTHROPIC:
+            response = self.llm_client.messages.create(
+                model=self.llm_model or "claude-haiku-20240307",
+                max_tokens=max_tokens,
+                system=system_prompt,
+                messages=[{"role": "user", "content": user_prompt}],
+            )
+            raw = response.content[0].text
+        elif HAS_OPENAI:
+            response = self.llm_client.chat.completions.create(
+                model=self.llm_model or "gpt-4o-mini",
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": user_prompt},
+                ],
+                response_format={"type": "json_object"},
+            )
+            raw = response.choices[0].message.content
+        else:
+            raise RuntimeError("No LLM provider available.")
+
+        try:
+            return json.loads(raw), raw
+        except json.JSONDecodeError:
+            import re
+
+            json_match = re.search(r"\{[\s\S]*\}", raw)
+            if json_match:
+                return json.loads(json_match.group()), raw
+            return fallback, raw
+
+    async def run_once(self, conn: asyncpg.Connection) -> dict[str, Any]:
+        if not self.llm_client:
+            return {"skipped": True, "reason": "no_llm_client"}
+
+        context = await self._build_context(conn)
+        user_prompt = f"Context (JSON):\n{json.dumps(context)[:12000]}"
+        doc, raw = self._call_llm_json(
+            SUBCONSCIOUS_SYSTEM_PROMPT,
+            user_prompt,
+            max_tokens=1800,
+            fallback={},
+        )
+        if not isinstance(doc, dict):
+            doc = {}
+
+        observations = self._normalize_observations(doc)
+        applied = await self._apply_observations(conn, observations)
+        return {"applied": applied, "raw_response": raw}
+
+    async def _build_context(self, conn: asyncpg.Connection) -> dict[str, Any]:
+        def _coerce(val: Any) -> Any:
+            if isinstance(val, str):
+                try:
+                    return json.loads(val)
+                except Exception:
+                    return val
+            return val
+
+        recent = _coerce(await conn.fetchval("SELECT get_recent_context(20)")) or []
+        narrative = _coerce(await conn.fetchval("SELECT get_narrative_context()")) or {}
+        self_model = _coerce(await conn.fetchval("SELECT get_self_model_context(25)")) or []
+        relationships = _coerce(await conn.fetchval("SELECT get_relationships_context(15)")) or []
+        worldview = _coerce(await conn.fetchval("SELECT get_worldview_context()")) or []
+        contradictions = _coerce(await conn.fetchval("SELECT get_contradictions_context(5)")) or []
+        emotional_patterns = _coerce(await conn.fetchval("SELECT get_emotional_patterns_context(5)")) or []
+        emotional_state = _coerce(await conn.fetchval("SELECT get_current_affective_state()")) or {}
+        goals = _coerce(await conn.fetchval("SELECT get_goals_snapshot()")) or {}
+
+        return {
+            "recent_memories": recent,
+            "narrative": narrative,
+            "self_model": self_model,
+            "relationships": relationships,
+            "worldview": worldview,
+            "contradictions": contradictions,
+            "emotional_patterns": emotional_patterns,
+            "emotional_state": emotional_state,
+            "goals": goals,
+        }
+
+    def _normalize_observations(self, doc: dict) -> dict[str, list[dict]]:
+        def _as_list(val: Any) -> list[dict]:
+            if isinstance(val, list):
+                return [v for v in val if isinstance(v, dict)]
+            return []
+
+        emotional = doc.get("emotional_observations")
+        if emotional is None:
+            emotional = doc.get("emotional_patterns")
+        consolidation = doc.get("consolidation_observations")
+        if consolidation is None:
+            consolidation = doc.get("consolidation_suggestions")
+
+        return {
+            "narrative_observations": _as_list(doc.get("narrative_observations")),
+            "relationship_observations": _as_list(doc.get("relationship_observations")),
+            "contradiction_observations": _as_list(doc.get("contradiction_observations")),
+            "emotional_observations": _as_list(emotional),
+            "consolidation_observations": _as_list(consolidation),
+        }
+
+    async def _apply_observations(self, conn: asyncpg.Connection, obs: dict[str, list[dict]]) -> dict[str, int]:
+        raw = await conn.fetchval(
+            "SELECT apply_subconscious_observations($1::jsonb)",
+            json.dumps(obs),
+        )
+        if isinstance(raw, str):
+            try:
+                return json.loads(raw)
+            except Exception:
+                return {"error": raw}
+        return dict(raw) if isinstance(raw, dict) else {"result": raw}
+
+
 class MaintenanceWorker:
     """Subconscious maintenance loop: consolidates/prunes substrate on its own trigger."""
 
@@ -1398,12 +1708,20 @@ class MaintenanceWorker:
         self.pool: asyncpg.Pool | None = None
         self.running = False
         self._last_rabbit_inbox_poll = 0.0
+        self.subconscious = SubconsciousDecider(init_llm=False)
+        self._last_subconscious_run = 0.0
+        self._last_subconscious_heartbeat = 0
 
     async def connect(self):
         self.pool = await asyncpg.create_pool(**DB_CONFIG, min_size=1, max_size=5)
         logger.info(f"Connected to database at {DB_CONFIG['host']}:{DB_CONFIG['port']}")
         if RABBITMQ_ENABLED:
             await self.ensure_rabbitmq_ready()
+        async with self.pool.acquire() as conn:
+            await self.subconscious.refresh_llm_config(conn)
+            hb_count = await conn.fetchval("SELECT heartbeat_count FROM heartbeat_state WHERE id = 1")
+            if isinstance(hb_count, int):
+                self._last_subconscious_heartbeat = hb_count
 
     async def disconnect(self):
         if self.pool:
@@ -1425,6 +1743,55 @@ class MaintenanceWorker:
         if await self.should_run():
             stats = await self.run_maintenance_tick()
             logger.info(f"Subconscious maintenance: {stats}")
+
+    async def _get_subconscious_config(self, conn: asyncpg.Connection) -> tuple[bool, float]:
+        raw_enabled = await conn.fetchval("SELECT get_config('maintenance.subconscious_enabled')")
+        enabled = False
+        if isinstance(raw_enabled, bool):
+            enabled = raw_enabled
+        elif isinstance(raw_enabled, str):
+            enabled = raw_enabled.strip().lower() in {"true", "1", "yes", "on"}
+        elif raw_enabled is not None:
+            enabled = bool(raw_enabled)
+
+        interval = await conn.fetchval("SELECT get_config_float('maintenance.subconscious_interval_seconds')")
+        try:
+            interval_val = float(interval) if interval is not None else 300.0
+        except Exception:
+            interval_val = 300.0
+        return enabled, interval_val
+
+    async def _consent_granted(self, conn: asyncpg.Connection) -> bool:
+        try:
+            status = await conn.fetchval("SELECT get_agent_consent_status()")
+        except Exception:
+            return False
+        return isinstance(status, str) and status.strip().lower() == "consent"
+
+    async def run_subconscious_if_due(self) -> None:
+        async with self.pool.acquire() as conn:
+            enabled, interval = await self._get_subconscious_config(conn)
+            if not enabled:
+                return
+            if not await self._consent_granted(conn):
+                return
+
+            hb_count = await conn.fetchval("SELECT heartbeat_count FROM heartbeat_state WHERE id = 1")
+            now = time.monotonic()
+            due = False
+            if isinstance(hb_count, int) and hb_count > self._last_subconscious_heartbeat:
+                due = True
+            if interval > 0 and (now - self._last_subconscious_run) >= interval:
+                due = True
+            if not due:
+                return
+
+            await self.subconscious.refresh_llm_config(conn)
+            result = await self.subconscious.run_once(conn)
+            self._last_subconscious_run = time.monotonic()
+            if isinstance(hb_count, int):
+                self._last_subconscious_heartbeat = hb_count
+            logger.info(f"Subconscious decider: {result}")
 
     # RabbitMQ (optional outbox/inbox bridge; uses management HTTP API).
     async def ensure_rabbitmq_ready(self) -> None:
@@ -1461,6 +1828,7 @@ class MaintenanceWorker:
                         await self.poll_inbox_messages()
                         await self.publish_outbox_messages(max_messages=10)
                     await self.run_if_due()
+                    await self.run_subconscious_if_due()
                 except Exception as e:
                     logger.error(f"Maintenance loop error: {e}")
                 await asyncio.sleep(POLL_INTERVAL)

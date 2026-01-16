@@ -87,11 +87,12 @@ async def test_batch_create_memories_with_embeddings(db_pool):
             assert isinstance(ids, list)
             assert len(ids) == 2
 
-            sem_count = await conn.fetchval(
-                "SELECT COUNT(*) FROM semantic_memories WHERE memory_id = ANY($1::uuid[])",
+            # Verify memories exist with type 'semantic'
+            mem_count = await conn.fetchval(
+                "SELECT COUNT(*) FROM memories WHERE id = ANY($1::uuid[]) AND type = 'semantic'",
                 ids,
             )
-            assert int(sem_count) == 2
+            assert int(mem_count) == 2
         finally:
             await tr.rollback()
 

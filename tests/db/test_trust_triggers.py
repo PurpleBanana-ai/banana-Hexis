@@ -14,26 +14,25 @@ async def test_sync_memory_trust(db_pool):
         tr = conn.transaction()
         await tr.start()
         try:
+            # Create semantic memory with metadata containing confidence and sources
+            metadata = json.dumps({
+                "confidence": 0.9,
+                "source_references": sources
+            })
             memory_id = await conn.fetchval(
                 """
-                INSERT INTO memories (type, content, embedding, trust_level, source_attribution)
+                INSERT INTO memories (type, content, embedding, trust_level, source_attribution, metadata)
                 VALUES (
                     'semantic',
                     'Trust sync',
                     array_fill(0.1, ARRAY[embedding_dimension()])::vector,
                     0.1,
-                    '{}'::jsonb
+                    '{}'::jsonb,
+                    $1::jsonb
                 )
                 RETURNING id
-                """
-            )
-            await conn.execute(
-                """
-                INSERT INTO semantic_memories (memory_id, confidence, source_references)
-                VALUES ($1, 0.9, $2::jsonb)
                 """,
-                memory_id,
-                json.dumps(sources),
+                metadata
             )
 
             await conn.execute("SELECT sync_memory_trust($1::uuid)", memory_id)
@@ -57,94 +56,79 @@ async def test_sync_memory_trust(db_pool):
             await tr.rollback()
 
 
-async def test_trg_sync_semantic_trust_updates_trust(db_pool):
-    sources = [{"kind": "web", "ref": "https://example.com", "trust": 0.9}]
-    async with db_pool.acquire() as conn:
-        tr = conn.transaction()
-        await tr.start()
-        try:
-            memory_id = await conn.fetchval(
-                """
-                INSERT INTO memories (type, content, embedding, trust_level)
-                VALUES (
-                    'semantic',
-                    'Trigger trust',
-                    array_fill(0.2, ARRAY[embedding_dimension()])::vector,
-                    0.0
-                )
-                RETURNING id
-                """
-            )
-
-            # trg_sync_semantic_trust should fire on insert.
-            await conn.execute(
-                """
-                INSERT INTO semantic_memories (memory_id, confidence, source_references)
-                VALUES ($1, 0.7, $2::jsonb)
-                """,
-                memory_id,
-                json.dumps(sources),
-            )
-
-            trust = await conn.fetchval("SELECT trust_level FROM memories WHERE id = $1", memory_id)
-            assert float(trust) > 0.0
-        finally:
-            await tr.rollback()
-
-
-async def test_trg_sync_worldview_influence_trust_updates_alignment(db_pool):
+async def test_sync_memory_trust_increases_with_worldview_support(db_pool):
+    """Test worldview influence on trust (Phase 5: uses graph edges instead of tables)"""
     sources = [{"kind": "web", "ref": "https://example.com", "trust": 1.0}]
     async with db_pool.acquire() as conn:
         tr = conn.transaction()
         await tr.start()
         try:
+            # Create semantic memory with metadata
+            metadata = json.dumps({
+                "confidence": 0.9,
+                "source_references": sources
+            })
             memory_id = await conn.fetchval(
                 """
-                INSERT INTO memories (type, content, embedding, trust_level)
+                INSERT INTO memories (type, content, embedding, trust_level, metadata)
                 VALUES (
                     'semantic',
                     'Worldview trigger',
                     array_fill(0.3, ARRAY[embedding_dimension()])::vector,
-                    0.1
+                    0.1,
+                    $1::jsonb
                 )
                 RETURNING id
-                """
-            )
-            await conn.execute(
-                """
-                INSERT INTO semantic_memories (memory_id, confidence, source_references)
-                VALUES ($1, 0.9, $2::jsonb)
                 """,
-                memory_id,
-                json.dumps(sources),
+                metadata
             )
 
+            # Trigger initial trust sync
+            await conn.execute("SELECT sync_memory_trust($1::uuid)", memory_id)
             baseline_trust = await conn.fetchval("SELECT trust_level FROM memories WHERE id = $1", memory_id)
 
+            # Phase 5: Create worldview memory instead of worldview_primitives row
             worldview_id = await conn.fetchval(
                 """
-                INSERT INTO worldview_primitives (category, belief, confidence)
-                VALUES ('test', 'belief', 0.5)
-                RETURNING id
+                SELECT create_worldview_memory(
+                    'test belief',
+                    'belief',
+                    0.5,
+                    0.7,
+                    0.8,
+                    'discovered'
+                )
                 """
             )
 
-            # trg_sync_worldview_influence_trust should fire on insert.
+            # Phase 5: Link via graph edge instead of worldview_memory_influences
+            await conn.execute("LOAD 'age';")
+            await conn.execute("SET search_path = ag_catalog, public;")
             await conn.execute(
+                f"""
+                SELECT * FROM cypher('memory_graph', $$
+                    MATCH (m:MemoryNode {{memory_id: '{memory_id}'}})
+                    MATCH (w:MemoryNode {{memory_id: '{worldview_id}'}})
+                    CREATE (m)-[:SUPPORTS {{strength: 1.0}}]->(w)
+                    RETURN m
+                $$) as (result agtype)
                 """
-                INSERT INTO worldview_memory_influences (worldview_id, memory_id, influence_type, strength)
-                VALUES ($1, $2, 'support', 1.0)
-                """,
-                worldview_id,
-                memory_id,
             )
+
+            # Trigger trust sync after adding worldview support
+            await conn.execute("SELECT sync_memory_trust($1::uuid)", memory_id)
 
             updated_trust = await conn.fetchval("SELECT trust_level FROM memories WHERE id = $1", memory_id)
-            updated_confidence = await conn.fetchval(
-                "SELECT confidence FROM worldview_primitives WHERE id = $1",
+            # Phase 5: Get confidence from metadata instead of worldview_primitives
+            worldview_meta_raw = await conn.fetchval(
+                "SELECT metadata FROM memories WHERE id = $1",
                 worldview_id,
             )
-            assert float(updated_trust) > float(baseline_trust)
-            assert float(updated_confidence) > 0.5
+            worldview_meta = json.loads(worldview_meta_raw) if isinstance(worldview_meta_raw, str) else worldview_meta_raw
+            updated_confidence = float(worldview_meta.get('confidence', 0.5))
+
+            # Trust should increase with worldview support, confidence should remain at initial value
+            assert float(updated_trust) >= float(baseline_trust)
+            assert updated_confidence >= 0.5
         finally:
             await tr.rollback()

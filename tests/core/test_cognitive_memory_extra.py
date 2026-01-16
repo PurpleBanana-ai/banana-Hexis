@@ -41,7 +41,14 @@ async def test_list_recent_episodes_and_recall_episode(mem_client, db_pool):
         assert episodes
         async with db_pool.acquire() as conn:
             episode_id = await conn.fetchval(
-                "SELECT episode_id FROM episode_memories WHERE memory_id = $1",
+                """
+                SELECT e.id
+                FROM episodes e
+                CROSS JOIN LATERAL find_episode_memories_graph(e.id) fem
+                WHERE fem.memory_id = $1
+                ORDER BY e.started_at DESC
+                LIMIT 1
+                """,
                 mid,
             )
         memories = await mem_client.recall_episode(episode_id)
@@ -52,6 +59,9 @@ async def test_list_recent_episodes_and_recall_episode(mem_client, db_pool):
 
 
 async def test_remember_batch_and_link_concepts(mem_client, db_pool):
+    """Test remember_batch creates memories and links concepts in graph.
+    Phase 2 (ReduceScopeCreep): Concepts are now graph-only.
+    """
     test_id = get_test_identifier("batch")
     items = [
         MemoryInput(content=f"Batch A {test_id}", type=MemoryType.SEMANTIC, importance=0.6, concepts=[f"C_{test_id}"]),
@@ -60,13 +70,21 @@ async def test_remember_batch_and_link_concepts(mem_client, db_pool):
     ids = await mem_client.remember_batch(items)
     assert len(ids) == 2
     try:
+        # Verify concept was linked in graph
         async with db_pool.acquire() as conn:
-            concept_id = await conn.fetchval("SELECT id FROM concepts WHERE name = $1", f"C_{test_id}")
-        assert concept_id is not None
+            await conn.execute("LOAD 'age';")
+            await conn.execute("SET search_path = ag_catalog, public;")
+            edge_count = await conn.fetchval(f"""
+                SELECT COUNT(*) FROM cypher('memory_graph', $$
+                    MATCH (m:MemoryNode {{memory_id: '{ids[0]}'}})-[:INSTANCE_OF]->(c:ConceptNode {{name: 'C_{test_id}'}})
+                    RETURN c
+                $$) as (c agtype)
+            """)
+            assert int(edge_count) >= 1, "Concept should be linked in graph"
     finally:
+        # Note: concepts table removed in Phase 2 - concepts are now graph-only
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM memories WHERE id = ANY($1::uuid[])", ids)
-            await conn.execute("DELETE FROM concepts WHERE name = $1", f"C_{test_id}")
 
 
 async def test_connect_batch_and_find_causes(mem_client, db_pool):
@@ -84,10 +102,8 @@ async def test_connect_batch_and_find_causes(mem_client, db_pool):
         rows = await mem_client.find_causes(c, depth=3)
         assert any(str(r.get("cause_id")) == str(a) for r in rows)
     finally:
+        # Note: relationship_discoveries table removed in Phase 8 - only graph edges now
         async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM relationship_discoveries WHERE from_id = $1 OR to_id = $1", a)
-            await conn.execute("DELETE FROM relationship_discoveries WHERE from_id = $1 OR to_id = $1", b)
-            await conn.execute("DELETE FROM relationship_discoveries WHERE from_id = $1 OR to_id = $1", c)
             await conn.execute("DELETE FROM memories WHERE id = ANY($1::uuid[])", [a, b, c])
 
 
@@ -100,33 +116,29 @@ async def test_find_contradictions(mem_client, db_pool):
         rows = await mem_client.find_contradictions(a)
         assert rows
     finally:
+        # Note: relationship_discoveries table removed in Phase 8 - only graph edges now
         async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM relationship_discoveries WHERE from_id = $1 OR to_id = $1", a)
-            await conn.execute("DELETE FROM relationship_discoveries WHERE from_id = $1 OR to_id = $1", b)
             await conn.execute("DELETE FROM memories WHERE id = ANY($1::uuid[])", [a, b])
 
 
 async def test_find_supporting_evidence(mem_client, db_pool):
-    test_id = get_test_identifier("support")
+    """Test find_supporting_evidence with worldview memories."""
+    test_id = get_test_identifier("supporting")
     async with db_pool.acquire() as conn:
         worldview_id = await conn.fetchval(
-            """
-            INSERT INTO worldview_primitives (category, belief, confidence)
-            VALUES ('test', $1, 0.9)
-            RETURNING id
-            """,
-            f"belief {test_id}",
+            "SELECT create_worldview_memory($1, 'belief', 0.9, 0.8, 0.8, 'test')",
+            f"Belief {test_id}",
         )
+
     mem_id = await mem_client.remember(f"Evidence {test_id}", type=MemoryType.SEMANTIC, importance=0.6)
     try:
+        await mem_client.connect_memories(mem_id, worldview_id, RelationshipType.SUPPORTS, confidence=0.9)
         async with db_pool.acquire() as conn:
-            await conn.execute("SELECT link_memory_supports_worldview($1, $2, 0.9)", mem_id, worldview_id)
-        rows = await mem_client.find_supporting_evidence(worldview_id)
-        assert any(str(r.get("memory_id")) == str(mem_id) for r in rows)
+            rows = await conn.fetch("SELECT * FROM find_supporting_evidence($1)", worldview_id)
+        assert any(r["memory_id"] == mem_id for r in rows)
     finally:
         async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM worldview_primitives WHERE id = $1", worldview_id)
-            await conn.execute("DELETE FROM memories WHERE id = $1", mem_id)
+            await conn.execute("DELETE FROM memories WHERE id = ANY($1::uuid[])", [mem_id, worldview_id])
 
 
 async def test_touch_memories_updates_access_count(mem_client, db_pool):

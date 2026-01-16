@@ -57,6 +57,7 @@ async def test_compute_semantic_trust(db_pool):
 
 
 async def test_worldview_alignment_and_trust_sync(db_pool):
+    """Test worldview alignment and trust sync (Phase 5: uses graph instead of worldview_primitives)"""
     async with db_pool.acquire() as conn:
         mem_id = await conn.fetchval(
             """
@@ -75,21 +76,32 @@ async def test_worldview_alignment_and_trust_sync(db_pool):
             json.dumps([{"kind": "web", "ref": "a", "trust": 0.5}]),
         )
 
+        # Phase 5: Create worldview memory instead of worldview_primitives row
         worldview_id = await conn.fetchval(
             """
-            INSERT INTO worldview_primitives (category, belief, confidence)
-            VALUES ('test', 'belief', 0.6)
-            RETURNING id
+            SELECT create_worldview_memory(
+                'test belief',
+                'belief',
+                0.6,
+                0.7,
+                0.8,
+                'discovered'
+            )
             """
         )
 
+        # Phase 5: Link via graph edge instead of worldview_memory_influences
+        await conn.execute("LOAD 'age';")
+        await conn.execute("SET search_path = ag_catalog, public;")
         await conn.execute(
+            f"""
+            SELECT * FROM cypher('memory_graph', $$
+                MATCH (m:MemoryNode {{memory_id: '{mem_id}'}})
+                MATCH (w:MemoryNode {{memory_id: '{worldview_id}'}})
+                CREATE (m)-[:SUPPORTS {{strength: 1.0}}]->(w)
+                RETURN m
+            $$) as (result agtype)
             """
-            INSERT INTO worldview_memory_influences (worldview_id, memory_id, influence_type, strength)
-            VALUES ($1, $2, 'support', 1.0)
-            """,
-            worldview_id,
-            mem_id,
         )
 
         alignment = await conn.fetchval("SELECT compute_worldview_alignment($1::uuid)", mem_id)
@@ -100,46 +112,67 @@ async def test_worldview_alignment_and_trust_sync(db_pool):
         assert profile["type"] == "semantic"
         assert profile["source_count"] >= 1
 
-        # Trigger trust sync via update to semantic sources.
+        # Trigger trust sync via update to metadata source_references.
         await conn.execute(
-            "UPDATE semantic_memories SET source_references = $1::jsonb WHERE memory_id = $2",
+            "UPDATE memories SET metadata = metadata || jsonb_build_object('source_references', $1::jsonb) WHERE id = $2",
             json.dumps([{"kind": "paper", "ref": "b", "trust": 0.9}]),
             mem_id,
         )
+        await conn.execute("SELECT sync_memory_trust($1::uuid)", mem_id)
         trust = await conn.fetchval("SELECT trust_level FROM memories WHERE id = $1", mem_id)
         assert trust is not None
 
-        await conn.execute("DELETE FROM worldview_memory_influences WHERE worldview_id = $1", worldview_id)
-        await conn.execute("DELETE FROM worldview_primitives WHERE id = $1", worldview_id)
+        # Cleanup
+        await conn.execute("DELETE FROM memories WHERE id = $1", worldview_id)
         await conn.execute("DELETE FROM memories WHERE id = $1", mem_id)
 
 
 async def test_update_worldview_confidence_from_influences(db_pool):
+    """Test worldview confidence updates from supporting evidence (Phase 5: uses graph)"""
     async with db_pool.acquire() as conn:
+        # Phase 5: Create worldview memory instead of worldview_primitives row
         worldview_id = await conn.fetchval(
             """
-            INSERT INTO worldview_primitives (category, belief, confidence)
-            VALUES ('test', 'belief', 0.4)
-            RETURNING id
+            SELECT create_worldview_memory(
+                'test belief',
+                'belief',
+                0.4,
+                0.7,
+                0.8,
+                'discovered'
+            )
             """
         )
         mem_id = await conn.fetchval(
             "INSERT INTO memories (type, content, embedding, trust_level) VALUES ('semantic', 'evidence', array_fill(0.1, ARRAY[embedding_dimension()])::vector, 1.0) RETURNING id"
         )
+
+        # Phase 5: Link via graph edge instead of worldview_memory_influences
+        await conn.execute("LOAD 'age';")
+        await conn.execute("SET search_path = ag_catalog, public;")
         await conn.execute(
+            f"""
+            SELECT * FROM cypher('memory_graph', $$
+                MATCH (m:MemoryNode {{memory_id: '{mem_id}'}})
+                MATCH (w:MemoryNode {{memory_id: '{worldview_id}'}})
+                CREATE (m)-[:SUPPORTS {{strength: 1.0}}]->(w)
+                RETURN m
+            $$) as (result agtype)
             """
-            INSERT INTO worldview_memory_influences (worldview_id, memory_id, influence_type, strength)
-            VALUES ($1, $2, 'support', 1.0)
-            """,
-            worldview_id,
-            mem_id,
         )
 
-        before = await conn.fetchval("SELECT confidence FROM worldview_primitives WHERE id = $1", worldview_id)
+        # Get confidence from metadata before update
+        before_raw = await conn.fetchval("SELECT metadata FROM memories WHERE id = $1", worldview_id)
+        before_meta = json.loads(before_raw) if isinstance(before_raw, str) else before_raw
+        before = float(before_meta.get('confidence', 0.4))
+
         await conn.execute("SELECT update_worldview_confidence_from_influences($1::uuid)", worldview_id)
-        after = await conn.fetchval("SELECT confidence FROM worldview_primitives WHERE id = $1", worldview_id)
+
+        # Get confidence from metadata after update
+        after_raw = await conn.fetchval("SELECT metadata FROM memories WHERE id = $1", worldview_id)
+        after_meta = json.loads(after_raw) if isinstance(after_raw, str) else after_raw
+        after = float(after_meta.get('confidence', 0.4))
         assert after >= before
 
-        await conn.execute("DELETE FROM worldview_memory_influences WHERE worldview_id = $1", worldview_id)
-        await conn.execute("DELETE FROM worldview_primitives WHERE id = $1", worldview_id)
+        await conn.execute("DELETE FROM memories WHERE id = $1", worldview_id)
         await conn.execute("DELETE FROM memories WHERE id = $1", mem_id)

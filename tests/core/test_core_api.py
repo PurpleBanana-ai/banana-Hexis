@@ -76,6 +76,9 @@ async def test_api_semantic_sources_affect_trust(cognitive_memory_client, db_poo
 
 
 async def test_api_remember_links_concepts_and_find_by_concept(cognitive_memory_client, db_pool):
+    """Test that remember() links concepts and find_by_concept() retrieves them.
+    Phase 2 (ReduceScopeCreep): Concepts are now graph-only.
+    """
     from core.cognitive_memory_api import MemoryType
 
     test_id = get_test_identifier("api_concepts")
@@ -93,9 +96,10 @@ async def test_api_remember_links_concepts_and_find_by_concept(cognitive_memory_
         hits = await cognitive_memory_client.find_by_concept(concept, limit=25)
         assert any(m.id == mid for m in hits)
     finally:
+        # Note: concepts table removed in Phase 2 - concepts are now graph-only
+        # ConceptNodes are not deleted here; they persist in graph
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM memories WHERE id = $1", mid)
-            await conn.execute("DELETE FROM concepts WHERE name = $1", concept)
 
 
 async def test_api_hydrate_returns_context(cognitive_memory_client, db_pool):
@@ -134,7 +138,10 @@ async def test_api_hold_and_search_working(cognitive_memory_client, db_pool):
             await conn.execute("DELETE FROM working_memory WHERE id = $1", wid)
 
 
-async def test_api_connect_memories_creates_audit_row(cognitive_memory_client, db_pool):
+async def test_api_connect_memories_creates_graph_edge(cognitive_memory_client, db_pool):
+    """Test that connect_memories creates a graph edge.
+    Note: relationship_discoveries table removed in Phase 8 - verify graph edge instead.
+    """
     from core.cognitive_memory_api import MemoryType, RelationshipType
 
     test_id = get_test_identifier("api_connect")
@@ -145,20 +152,18 @@ async def test_api_connect_memories_creates_audit_row(cognitive_memory_client, d
     try:
         await cognitive_memory_client.connect_memories(a, b, RelationshipType.ASSOCIATED, confidence=0.9, context=ctx)
         async with db_pool.acquire() as conn:
+            await conn.execute("SET LOCAL search_path = ag_catalog, public;")
             n = await conn.fetchval(
+                f"""
+                SELECT COUNT(*) FROM cypher('memory_graph', $$
+                    MATCH (x:MemoryNode {{memory_id: '{a}'}})-[r:ASSOCIATED]->(y:MemoryNode {{memory_id: '{b}'}})
+                    RETURN r
+                $$) as (r agtype)
                 """
-                SELECT COUNT(*) FROM relationship_discoveries
-                WHERE from_id = $1 AND to_id = $2 AND relationship_type = 'ASSOCIATED'
-                  AND discovered_by = 'api' AND discovery_context = $3
-                """,
-                a,
-                b,
-                ctx,
             )
-            assert int(n) >= 1
+            assert int(n) >= 1, "Graph edge should be created by connect_memories"
     finally:
         async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM relationship_discoveries WHERE from_id = $1 AND to_id = $2", a, b)
             await conn.execute("DELETE FROM memories WHERE id = $1", a)
             await conn.execute("DELETE FROM memories WHERE id = $1", b)
 
@@ -246,6 +251,7 @@ async def test_api_introspection_methods_return_shapes(cognitive_memory_client):
 
 
 async def test_api_create_goal_sets_due_at(cognitive_memory_client, db_pool):
+    """Phase 6 (ReduceScopeCreep): Goals are now memories with type='goal'."""
     from datetime import datetime, timezone
     from core.cognitive_memory_api import GoalPriority, GoalSource
 
@@ -261,7 +267,11 @@ async def test_api_create_goal_sets_due_at(cognitive_memory_client, db_pool):
     assert goal_id is not None
 
     async with db_pool.acquire() as conn:
-        stored = await conn.fetchrow("SELECT due_at FROM goals WHERE id = $1::uuid", goal_id)
+        # Phase 6: Goals are now in memories table with type='goal'
+        stored = await conn.fetchrow(
+            "SELECT (metadata->>'due_at')::timestamptz as due_at FROM memories WHERE id = $1::uuid AND type = 'goal'",
+            goal_id,
+        )
         assert stored is not None
         assert stored["due_at"] is not None
 
@@ -279,25 +289,44 @@ async def test_api_queue_user_message_creates_outbox(cognitive_memory_client, db
 
 
 async def test_api_ingestion_receipts_roundtrip(cognitive_memory_client):
+    """Test ingestion receipts via source_attribution.
+
+    Phase 10 (ReduceScopeCreep): ingestion_receipts table removed.
+    Receipts are now implicit in memories.source_attribution.
+    - record_ingestion_receipts is a no-op that returns the count
+    - get_ingestion_receipts queries memories by source_attribution
+    """
     from core.cognitive_memory_api import MemoryType
 
     test_id = get_test_identifier("api_ingestion_receipt")
-    mid = await cognitive_memory_client.remember(f"Receipt memory {test_id}", type=MemoryType.EPISODIC, importance=0.4)
-    assert mid is not None
-
     src = f"/tmp/{test_id}.txt"
     content_hash = f"hash_{test_id}"
+
+    # Create a memory with source_attribution containing the content_hash
+    source_attr = {
+        "kind": "document",
+        "ref": src,
+        "content_hash": content_hash,
+        "label": f"{test_id}#chunk0",
+    }
+    mid = await cognitive_memory_client.remember(
+        f"Receipt memory {test_id}",
+        type=MemoryType.SEMANTIC,
+        importance=0.4,
+        source_attribution=source_attr,
+    )
+    assert mid is not None
+
+    # record_ingestion_receipts is now a no-op that returns the count
     inserted = await cognitive_memory_client.record_ingestion_receipts(
         [{"source_file": src, "chunk_index": 0, "content_hash": content_hash, "memory_id": str(mid)}]
     )
-    assert inserted == 1
-    inserted2 = await cognitive_memory_client.record_ingestion_receipts(
-        [{"source_file": src, "chunk_index": 1, "content_hash": content_hash, "memory_id": str(mid)}]
-    )
-    assert inserted2 == 0
+    assert inserted == 1  # Returns count, not actual inserts
 
+    # get_ingestion_receipts should find the memory via source_attribution
     receipts = await cognitive_memory_client.get_ingestion_receipts(src, [content_hash])
     assert content_hash in receipts
+    assert receipts[content_hash] == mid
 
 
 async def test_api_sync_wrapper_basic(ensure_embedding_service):

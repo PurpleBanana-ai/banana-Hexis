@@ -27,6 +27,8 @@ class MemoryType(str, Enum):
     SEMANTIC = "semantic"
     PROCEDURAL = "procedural"
     STRATEGIC = "strategic"
+    WORLDVIEW = "worldview"  # Phase 5 (ReduceScopeCreep): beliefs/values/boundaries
+    GOAL = "goal"  # Phase 6 (ReduceScopeCreep): goals/intentions as memories
 
 
 class GoalPriority(str, Enum):
@@ -283,17 +285,15 @@ class CognitiveMemory:
             row = await conn.fetchrow(
                 """
                 SELECT
-                    m.id,
-                    m.type,
-                    m.content,
-                    m.importance,
-                    m.trust_level,
-                    m.source_attribution,
-                    m.created_at,
-                    em.emotional_valence
-                FROM memories m
-                LEFT JOIN episodic_memories em ON m.id = em.memory_id
-                WHERE m.id = $1
+                    id,
+                    type,
+                    content,
+                    importance,
+                    trust_level,
+                    source_attribution,
+                    created_at,
+                    emotional_valence
+                FROM get_memory_by_id($1::uuid)
                 """,
                 memory_id,
             )
@@ -317,47 +317,23 @@ class CognitiveMemory:
         memory_type: MemoryType | None = None,
     ) -> list[Memory]:
         async with self._pool.acquire() as conn:
-            if memory_type is None:
-                rows = await conn.fetch(
-                    """
-                    SELECT
-                        m.id,
-                        m.type,
-                        m.content,
-                        m.importance,
-                        m.trust_level,
-                        m.source_attribution,
-                        m.created_at,
-                        em.emotional_valence
-                    FROM memories m
-                    LEFT JOIN episodic_memories em ON m.id = em.memory_id
-                    WHERE m.status = 'active'
-                    ORDER BY m.created_at DESC
-                    LIMIT $1
-                    """,
-                    limit,
-                )
-            else:
-                rows = await conn.fetch(
-                    """
-                    SELECT
-                        m.id,
-                        m.type,
-                        m.content,
-                        m.importance,
-                        m.trust_level,
-                        m.source_attribution,
-                        m.created_at,
-                        em.emotional_valence
-                    FROM memories m
-                    LEFT JOIN episodic_memories em ON m.id = em.memory_id
-                    WHERE m.status = 'active' AND m.type = $2::memory_type
-                    ORDER BY m.created_at DESC
-                    LIMIT $1
-                    """,
-                    limit,
-                    memory_type.value,
-                )
+            rows = await conn.fetch(
+                """
+                SELECT
+                    memory_id as id,
+                    memory_type as type,
+                    content,
+                    importance,
+                    trust_level,
+                    source_attribution,
+                    created_at,
+                    emotional_valence
+                FROM list_recent_memories($1::int, $2::memory_type[], $3::bool)
+                """,
+                limit,
+                [memory_type.value] if memory_type is not None else None,
+                False,
+            )
             return [self._row_to_memory(row) for row in rows]
 
     async def list_recent_episodes(self, *, limit: int = 5) -> list[dict[str, Any]]:
@@ -365,17 +341,13 @@ class CognitiveMemory:
             rows = await conn.fetch(
                 """
                 SELECT
-                    e.id,
-                    e.started_at,
-                    e.ended_at,
-                    e.episode_type,
-                    e.summary,
-                    COUNT(em.memory_id) AS memory_count
-                FROM episodes e
-                LEFT JOIN episode_memories em ON e.id = em.episode_id
-                GROUP BY e.id
-                ORDER BY e.started_at DESC
-                LIMIT $1
+                    id,
+                    started_at,
+                    ended_at,
+                    episode_type,
+                    summary,
+                    memory_count
+                FROM list_recent_episodes($1::int)
                 """,
                 limit,
             )
@@ -386,19 +358,15 @@ class CognitiveMemory:
             rows = await conn.fetch(
                 """
                 SELECT
-                    m.id,
-                    m.type,
-                    m.content,
-                    m.importance,
-                    m.trust_level,
-                    m.source_attribution,
-                    m.created_at,
-                    emd.emotional_valence
-                FROM episode_memories em
-                JOIN memories m ON em.memory_id = m.id
-                LEFT JOIN episodic_memories emd ON m.id = emd.memory_id
-                WHERE em.episode_id = $1
-                ORDER BY em.sequence_order ASC
+                    memory_id as id,
+                    memory_type as type,
+                    content,
+                    importance,
+                    trust_level,
+                    source_attribution,
+                    created_at,
+                    emotional_valence
+                FROM get_episode_memories($1::uuid)
                 """,
                 episode_id,
             )
@@ -537,20 +505,8 @@ class CognitiveMemory:
         if not ids:
             return 0
         async with self._pool.acquire() as conn:
-            n = await conn.execute(
-                """
-                UPDATE memories
-                SET access_count = access_count + 1,
-                    last_accessed = CURRENT_TIMESTAMP
-                WHERE id = ANY($1::uuid[])
-                """,
-                ids,
-            )
-            # asyncpg returns "UPDATE <count>"
-            try:
-                return int(str(n).split()[-1])
-            except Exception:
-                return 0
+            updated = await conn.fetchval("SELECT touch_memories($1::uuid[])", ids)
+            return int(updated or 0)
 
     # =========================================================================
     # GRAPH / RELATIONSHIPS
@@ -615,17 +571,16 @@ class CognitiveMemory:
             return await conn.fetchval("SELECT link_memory_to_concept($1::uuid, $2::text, $3::float)", memory_id, concept, strength)
 
     async def find_by_concept(self, concept: str, *, limit: int = 10) -> list[Memory]:
+        """Find memories linked to a concept via graph traversal.
+        Phase 2 (ReduceScopeCreep): Now uses graph instead of relational tables.
+        """
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
                 """
-                SELECT m.id, m.type, m.content, m.importance, m.created_at, em.emotional_valence
-                FROM memories m
-                JOIN memory_concepts mc ON m.id = mc.memory_id
-                JOIN concepts c ON mc.concept_id = c.id
-                LEFT JOIN episodic_memories em ON m.id = em.memory_id
-                WHERE c.name = $1 AND m.status = 'active'
-                ORDER BY mc.strength DESC, m.importance DESC
-                LIMIT $2
+                SELECT memory_id as id, memory_type as type, memory_content as content,
+                       memory_importance as importance, memory_created_at as created_at,
+                       emotional_valence
+                FROM find_memories_by_concept($1::text, $2::int)
                 """,
                 concept,
                 limit,
@@ -669,46 +624,33 @@ class CognitiveMemory:
             return dict(row) if row else {}
 
     async def get_identity(self) -> list[dict[str, Any]]:
+        """Get identity aspects from graph (Phase 5: uses graph instead of identity_aspects table)."""
         async with self._pool.acquire() as conn:
+            # Phase 5: Identity aspects are now graph edges from SelfNode
             rows = await conn.fetch(
                 """
-                SELECT aspect_type, content, stability
-                FROM identity_aspects
-                WHERE stability > 0.3
-                ORDER BY stability DESC
-                LIMIT 5
+                SELECT * FROM get_identity_context()
                 """
             )
-            return [dict(row) for row in rows]
+            result = rows[0][0] if rows and rows[0] else []
+            return result if isinstance(result, list) else []
 
     async def get_worldview(self) -> list[dict[str, Any]]:
+        """Get worldview beliefs from memories (Phase 5: uses worldview memories instead of worldview_primitives table)."""
         async with self._pool.acquire() as conn:
-            rows = await conn.fetch(
-                """
-                SELECT category, belief, confidence
-                FROM worldview_primitives
-                WHERE confidence > 0.5
-                ORDER BY confidence DESC
-                LIMIT 5
-                """
-            )
+            rows = await conn.fetch("SELECT * FROM get_worldview_snapshot($1::int, $2::float)", 5, 0.5)
             return [dict(row) for row in rows]
 
     async def get_goals(self, *, priority: GoalPriority | None = None) -> list[dict[str, Any]]:
+        """Get goals by priority.
+
+        Phase 6 (ReduceScopeCreep): Goals are now memories with type='goal'.
+        """
         async with self._pool.acquire() as conn:
-            if priority is None:
-                rows = await conn.fetch(
-                    """
-                    SELECT * FROM goals
-                    WHERE priority IN ('active', 'queued')
-                    ORDER BY priority, last_touched DESC
-                    """
-                )
-            else:
-                rows = await conn.fetch(
-                    "SELECT * FROM goals WHERE priority = $1::goal_priority ORDER BY last_touched DESC",
-                    priority.value,
-                )
+            rows = await conn.fetch(
+                "SELECT * FROM get_goals_by_priority($1::goal_priority)",
+                priority.value if priority is not None else None,
+            )
             return [dict(row) for row in rows]
 
     async def create_goal(
@@ -759,7 +701,14 @@ class CognitiveMemory:
     async def get_ingestion_receipts(self, source_file: str, content_hashes: list[str]) -> dict[str, UUID]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch(
-                "SELECT * FROM get_ingestion_receipts($1::text, $2::text[])",
+                """
+                SELECT
+                    (m.source_attribution->>'content_hash')::text AS content_hash,
+                    m.id AS memory_id
+                FROM memories m
+                WHERE m.source_attribution->>'ref' = $1
+                  AND m.source_attribution->>'content_hash' = ANY($2::text[])
+                """,
                 source_file,
                 content_hashes,
             )
@@ -772,16 +721,8 @@ class CognitiveMemory:
             return out
 
     async def record_ingestion_receipts(self, items: list[dict[str, Any]]) -> int:
-        async with self._pool.acquire() as conn:
-            import json
-
-            return int(
-                await conn.fetchval(
-                    "SELECT record_ingestion_receipts($1::jsonb)",
-                    json.dumps(items),
-                )
-                or 0
-            )
+        # No-op: ingestion receipts are implicit in memories.source_attribution.
+        return int(len(items or []))
 
     # =========================================================================
     # INTERNALS
@@ -853,23 +794,21 @@ class CognitiveMemory:
         rows = await conn.fetch(
             """
             SELECT
-                fr.memory_id,
-                fr.content,
-                fr.memory_type,
-                fr.score,
-                fr.source,
-                m.importance,
-                m.trust_level,
-                m.source_attribution,
-                m.created_at,
-                em.emotional_valence
-            FROM fast_recall($1::text, $2::int) fr
-            JOIN memories m ON m.id = fr.memory_id
-            LEFT JOIN episodic_memories em ON em.memory_id = fr.memory_id
-            WHERE m.importance >= $3::float
+                memory_id,
+                content,
+                memory_type,
+                score,
+                source,
+                importance,
+                trust_level,
+                source_attribution,
+                created_at,
+                emotional_valence
+            FROM recall_memories_filtered($1::text, $2::int, $3::memory_type[], $4::float)
             """,
             query,
             limit,
+            [mt.value for mt in memory_types] if memory_types else None,
             min_importance,
         )
 

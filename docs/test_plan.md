@@ -16,7 +16,7 @@ async def test_auto_episode_assignment_trigger(db_pool):
     - Creates new episode when first memory inserted
     - Continues episode within 30-minute gap
     - Closes old episode and creates new one after 30-minute gap
-    - Correctly sets sequence_order in episode_memories
+    - Correctly sets sequence_order on IN_EPISODE graph edges
     - Initializes memory_neighborhoods record
     """
 
@@ -235,32 +235,26 @@ async def test_supports_edge(db_pool):
 
 ## 7. Identity & Worldview Tests (Medium Priority)
 
-### Identity Aspects
-Need more complete testing:
+### Identity (Graph)
+Need more complete testing for graph-based identity edges:
 
 ```python
-async def test_identity_aspects_types(db_pool):
-    """Test all aspect_type values:
-    - self_concept
-    - purpose
-    - boundary
-    - agency
-    - values
-    """
+async def test_identity_context_edges(db_pool):
+    """Test SelfNode edges by kind (values, capabilities, limitations)."""
 
-async def test_identity_memory_resonance_integration_status(db_pool):
-    """Test integration_status field values and transitions"""
+async def test_identity_edge_strength_updates(db_pool):
+    """Test updating SelfNode edge strength and evidence."""
 ```
 
-### Worldview Memory Influences
-Need influence_type coverage:
+### Worldview Memories
+Worldview beliefs are stored in `memories` with type='worldview':
 
 ```python
-async def test_worldview_influence_types(db_pool):
-    """Test different influence_type values on worldview_memory_influences"""
+async def test_worldview_confidence_updates(db_pool):
+    """Test metadata.confidence updates on worldview memories."""
 
-async def test_connected_beliefs_relationships(db_pool):
-    """Test connected_beliefs UUID array in worldview_primitives"""
+async def test_worldview_relationship_edges(db_pool):
+    """Test SUPPORTS/CONTRADICTS edges between worldview memories."""
 ```
 
 ## 8. Index Performance Tests (Low Priority)
@@ -270,7 +264,7 @@ async def test_hnsw_index_memories_embedding(db_pool):
     """Test HNSW index on memories.embedding for vector search"""
 
 async def test_hnsw_index_clusters_centroid(db_pool):
-    """Test HNSW index on memory_clusters.centroid_embedding"""
+    """Test HNSW index on clusters.centroid_embedding"""
 
 async def test_hnsw_index_episodes_summary(db_pool):
     """Test HNSW index on episodes.summary_embedding"""
@@ -289,7 +283,7 @@ async def test_memory_health_view_aggregations(db_pool):
     """Test memory_health view calculates correct aggregations"""
 
 async def test_cluster_insights_view_ordering(db_pool):
-    """Test cluster_insights view ordered by importance_score DESC"""
+    """Test cluster_insights view ordered by memory_count DESC"""
 
 async def test_episode_summary_view_completeness(db_pool):
     """Test episode_summary includes all required fields"""

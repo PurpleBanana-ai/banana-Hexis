@@ -52,7 +52,14 @@ async def test_tool_recall_episode(mem_client, db_pool):
     try:
         async with db_pool.acquire() as conn:
             episode_id = await conn.fetchval(
-                "SELECT episode_id FROM episode_memories WHERE memory_id = $1",
+                """
+                SELECT e.id
+                FROM episodes e
+                CROSS JOIN LATERAL find_episode_memories_graph(e.id) fem
+                WHERE fem.memory_id = $1
+                ORDER BY e.started_at DESC
+                LIMIT 1
+                """,
                 mid,
             )
         result = await execute_tool("recall_episode", {"episode_id": str(episode_id)}, mem_client=mem_client)
@@ -63,6 +70,9 @@ async def test_tool_recall_episode(mem_client, db_pool):
 
 
 async def test_tool_explore_concept(mem_client, db_pool):
+    """Test explore_concept tool finds memories linked to a concept.
+    Phase 2 (ReduceScopeCreep): Concepts are now graph-only.
+    """
     test_id = get_test_identifier("tool_concept")
     content = f"Concept memory {test_id}"
     concept = f"Concept_{test_id}"
@@ -72,9 +82,9 @@ async def test_tool_explore_concept(mem_client, db_pool):
         assert result["count"] >= 1
         assert any(m["memory_id"] == str(mid) for m in result["memories"])
     finally:
+        # Note: concepts table removed in Phase 2 - concepts are now graph-only
         async with db_pool.acquire() as conn:
             await conn.execute("DELETE FROM memories WHERE id = $1", mid)
-            await conn.execute("DELETE FROM concepts WHERE name = $1", concept)
 
 
 async def test_tool_explore_cluster(mem_client, db_pool):
@@ -84,19 +94,17 @@ async def test_tool_explore_cluster(mem_client, db_pool):
     async with db_pool.acquire() as conn:
         cluster_id = await conn.fetchval(
             """
-            INSERT INTO memory_clusters (cluster_type, name, centroid_embedding)
+            INSERT INTO clusters (cluster_type, name, centroid_embedding)
             VALUES ('theme', $1, array_fill(0.1, ARRAY[embedding_dimension()])::vector)
             RETURNING id
             """,
             f"Cluster {test_id}",
         )
+        # Phase 3 (ReduceScopeCreep): Use graph edges instead of memory_cluster_members
+        await conn.execute("SELECT sync_memory_node($1)", memory_id)
         await conn.execute(
-            """
-            INSERT INTO memory_cluster_members (cluster_id, memory_id, membership_strength)
-            VALUES ($1, $2, 0.9)
-            """,
-            cluster_id,
-            memory_id,
+            "SELECT link_memory_to_cluster_graph($1, $2, $3)",
+            memory_id, cluster_id, 0.9
         )
     try:
         result = await execute_tool("explore_cluster", {"query": content}, mem_client=mem_client)
@@ -104,8 +112,14 @@ async def test_tool_explore_cluster(mem_client, db_pool):
         assert any(str(cluster_id) == str(c["id"]) for c in result["clusters"])
     finally:
         async with db_pool.acquire() as conn:
-            await conn.execute("DELETE FROM memory_cluster_members WHERE cluster_id = $1", cluster_id)
-            await conn.execute("DELETE FROM memory_clusters WHERE id = $1", cluster_id)
+            # Clean up graph edges via DETACH DELETE
+            await conn.execute("""
+                SELECT * FROM cypher('memory_graph', $q$
+                    MATCH (m:MemoryNode {memory_id: '%s'})
+                    DETACH DELETE m
+                $q$) as (result agtype)
+            """ % memory_id)
+            await conn.execute("DELETE FROM clusters WHERE id = $1", cluster_id)
             await conn.execute("DELETE FROM memories WHERE id = $1", memory_id)
 
 
@@ -166,5 +180,8 @@ async def test_tool_create_goal_and_queue_message(mem_client, db_pool):
     assert message_result.get("queued") is True
 
     async with db_pool.acquire() as conn:
-        await conn.execute("DELETE FROM goals WHERE id = $1::uuid", goal_result["goal_id"])
+        await conn.execute(
+            "DELETE FROM memories WHERE id = $1::uuid AND type = 'goal'::memory_type",
+            goal_result["goal_id"],
+        )
         await conn.execute("DELETE FROM outbox_messages WHERE id = $1::uuid", message_result["outbox_id"])

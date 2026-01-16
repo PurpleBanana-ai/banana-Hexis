@@ -184,8 +184,9 @@ async def _status_payload(
             await conn.fetchval("SELECT COUNT(*) FROM outbox_messages WHERE status = 'pending'")
         )
 
+        # Phase 7 (ReduceScopeCreep): Use unified config table
         payload["embedding_service_url"] = await conn.fetchval(
-            "SELECT value FROM embedding_config WHERE key = 'service_url'"
+            "SELECT get_config_text('embedding.service_url')"
         )
         payload["embedding_dimension"] = int(await conn.fetchval("SELECT embedding_dimension()"))
 
@@ -275,13 +276,14 @@ async def _config_validate(dsn: str, *, wait_seconds: int) -> tuple[list[str], l
 
         _validate_llm("llm.heartbeat")
         _validate_llm("llm.chat")
+        if "llm.subconscious" in cfg:
+            _validate_llm("llm.subconscious")
 
         # Basic heartbeat config sanity.
-        interval = await conn.fetchval(
-            "SELECT value FROM heartbeat_config WHERE key = 'heartbeat_interval_minutes'"
-        )
+        # Phase 7 (ReduceScopeCreep): Use unified config table
+        interval = await conn.fetchval("SELECT get_config_float('heartbeat.heartbeat_interval_minutes')")
         if interval is None or float(interval) <= 0:
-            errors.append("heartbeat_config.heartbeat_interval_minutes must be > 0")
+            errors.append("heartbeat.heartbeat_interval_minutes must be > 0")
 
         return errors, warnings
     finally:

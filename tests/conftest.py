@@ -128,8 +128,9 @@ async def configure_agent_for_tests(db_pool):
             tracked_keys,
         )
         original_config = {row["key"]: row["value"] for row in rows}
+        # Phase 7 (ReduceScopeCreep): heartbeat_config removed - use unified config
         original_hb_interval = await conn.fetchval(
-            "SELECT value FROM heartbeat_config WHERE key = 'heartbeat_interval_minutes'"
+            "SELECT value FROM config WHERE key = 'heartbeat.heartbeat_interval_minutes'"
         )
         original_hb_paused = await conn.fetchval(
             "SELECT is_paused FROM heartbeat_state WHERE id = 1"
@@ -164,7 +165,8 @@ async def configure_agent_for_tests(db_pool):
             json.dumps({"provider": "openai", "model": "gpt-4o", "endpoint": "", "api_key_env": ""}),
         )
         await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE WHERE id = 1")
-        await conn.execute("UPDATE heartbeat_config SET value = 60 WHERE key = 'heartbeat_interval_minutes'")
+        # Phase 7 (ReduceScopeCreep): use unified config
+        await conn.execute("SELECT set_config('heartbeat.heartbeat_interval_minutes', '60'::jsonb)")
 
     yield
 
@@ -183,9 +185,10 @@ async def configure_agent_for_tests(db_pool):
             await conn.execute("DELETE FROM consent_log WHERE id = $1::uuid", inserted_consent_log_id)
 
         if original_hb_interval is not None:
+            # Phase 7 (ReduceScopeCreep): use unified config
             await conn.execute(
-                "UPDATE heartbeat_config SET value = $1 WHERE key = 'heartbeat_interval_minutes'",
-                float(original_hb_interval),
+                "SELECT set_config('heartbeat.heartbeat_interval_minutes', $1::jsonb)",
+                original_hb_interval,
             )
         if original_hb_paused is not None:
             await conn.execute(
@@ -237,13 +240,9 @@ async def ensure_embedding_service(db_pool):
     with a clear timeout error (no skipping).
     """
     async with db_pool.acquire() as conn:
-        # Ensure correct service URL
+        # Phase 7 (ReduceScopeCreep): Use unified config table
         await conn.execute(
-            """
-            INSERT INTO embedding_config (key, value)
-            VALUES ('service_url', 'http://embeddings:80/embed')
-            ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value
-            """
+            "SELECT set_config('embedding.service_url', '\"http://embeddings:80/embed\"'::jsonb)"
         )
 
         wait_seconds = int(os.getenv("EMBEDDINGS_WAIT_SECONDS", "30"))

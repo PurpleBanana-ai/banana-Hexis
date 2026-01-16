@@ -45,44 +45,35 @@ The `get_embedding()` function handles:
 
 ### Architecture Layers
 
+Note: This document contains historical schema examples. The current source of truth is `db/schema.sql`.
+Goals/worldview/boundaries are stored as memories, and episode/cluster memberships are graph edges.
+
 #### Layer 1: Core Storage (Relational)
 | Table | Purpose |
 |-------|---------|
-| `memories` | Base memory with embedding, importance, decay |
-| `episodic_memories` | Events with context, action, result, emotion |
-| `semantic_memories` | Facts with confidence, sources, contradictions |
-| `procedural_memories` | How-to with steps, success tracking |
-| `strategic_memories` | Patterns with evidence, applicability |
+| `memories` | Unified memory table with embeddings and JSONB metadata |
 | `working_memory` | Transient short-term buffer |
 
-#### Layer 2: Clustering (Relational)
+#### Layer 2: Clustering (Relational + Graph)
 | Table | Purpose |
 |-------|---------|
-| `memory_clusters` | Thematic groups with centroid embedding |
-| `memory_cluster_members` | Membership with strength scores |
-| `cluster_relationships` | Inter-cluster links (evolves, contradicts) |
+| `clusters` | Thematic groups with centroid embedding |
+| Graph edges | Cluster membership and relationships (MEMBER_OF/RELATED) |
 
 #### Layer 3: Acceleration (Precomputed)
 | Table | Purpose |
 |-------|---------|
 | `episodes` | Temporal segmentation with summary embedding |
-| `episode_memories` | Ordered memory sequences within episodes |
 | `memory_neighborhoods` | Precomputed associative neighbors (JSONB) |
 | `activation_cache` | Transient activation state (UNLOGGED) |
 
-#### Layer 4: Concepts (Hybrid)
+#### Layer 4: Concepts (Graph)
 | Table | Purpose |
 |-------|---------|
-| `concepts` | Abstract ontology with flattened ancestry |
-| `memory_concepts` | Memory-to-concept links |
+| Graph nodes | ConceptNode hierarchy and memory links (INSTANCE_OF/PARENT_OF) |
 
 #### Layer 5: Identity & Worldview
-| Table | Purpose |
-|-------|---------|
-| `worldview_primitives` | Beliefs that filter perception |
-| `worldview_memory_influences` | How beliefs affect memories |
-| `identity_aspects` | Normalized self-concept components |
-| `identity_memory_resonance` | Memory-identity connections |
+Identity and worldview are stored as memories (`type='worldview'`) plus graph edges from SelfNode.
 
 #### Layer 6: Graph (AGE)
 | Node | Purpose |
@@ -160,7 +151,7 @@ SELECT * FROM fast_recall(embedding, 10);
 #### Warm Path (~50-100ms)
 ```sql
 -- Find related clusters
-SELECT * FROM memory_clusters mc
+SELECT * FROM clusters mc
 JOIN cluster_relationships cr ON mc.id = cr.to_cluster_id
 WHERE cr.from_cluster_id = $1;
 ```
@@ -290,15 +281,38 @@ The design prioritizes:
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
+#### Cognitive Layers (Conscious / Subconscious / Substrate)
+
+```
+┌─────────────────────────────────────────────────────────────────────┐
+│                           CONSCIOUS LAYER                            │
+│  Heartbeat + MCP tools: deliberate actions, energy-budgeted choices  │
+└─────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                         SUBCONSCIOUS LAYER                           │
+│  Subconscious decider: pattern detection, no actions, only notices   │
+│  (narrative, relationships, contradictions, emotional patterns)      │
+└─────────────────────────────────────────────────────────────────────┘
+                                   │
+                                   ▼
+┌─────────────────────────────────────────────────────────────────────┐
+│                           SUBSTRATE LAYER                            │
+│  PostgreSQL schema + functions: memory creation, retrieval, triggers │
+└─────────────────────────────────────────────────────────────────────┘
+```
+
 #### Separation of Concerns
 
 | Component | Responsibility | Frequency |
 |-----------|---------------|-----------|
 | **Heartbeat** | Agency, reasoning, decisions, actions | Hourly |
-| **Worker** | Memory maintenance, no agency | Continuous (5-min cycles) |
+| **Subconscious Decider** | Pattern detection, internal observations | Periodic / post-heartbeat |
+| **Worker** | Maintenance and indexing (no outward actions) | Continuous (5-min cycles) |
 | **Memory System** | Storage, retrieval, indexing | Passive (responds to queries) |
 
-**Critical Invariant:** The Worker has no agency. It maintains infrastructure but makes no decisions about goals, beliefs, or actions. All cognition happens in the Heartbeat.
+**Critical Invariant:** The Worker performs no outward actions. The subconscious decider can only emit internal observations (strategic memories, edges, flags) and cannot directly pursue goals or contact the user.
 
 ---
 
@@ -804,8 +818,8 @@ async def heartbeat():
     # Gather context
     recent_memories = recall_recent_episodic(limit=5)
     activated_clusters = get_activated_clusters()
-    current_identity = load_identity_aspects()
-    current_worldview = load_worldview_primitives()
+    current_identity = get_identity_context()
+    current_worldview = get_worldview_context()
     
     # Build context for LLM
     context = {
@@ -954,10 +968,10 @@ Flagged issues:
 {activated_clusters}
 
 ### Your Identity
-{identity_aspects}
+{identity_context}
 
 ### Your Beliefs
-{relevant_worldview}
+{worldview}
 
 ### Energy
 Available: {energy}
@@ -1070,13 +1084,15 @@ async def recompute_stale_neighborhoods(self, batch_size: int):
                 # Boost if both graph AND vector neighbor
                 neighbors[str(row['id'])] = min(existing + row['sim'] * 0.5, 1.5)
         
-        # 3. Temporal neighbors (same episode)
+        # 3. Temporal neighbors (same episode via graph)
         temporal_neighbors = await db.fetch("""
-            SELECT em2.memory_id
-            FROM episode_memories em1
-            JOIN episode_memories em2 ON em1.episode_id = em2.episode_id
-            WHERE em1.memory_id = $1 AND em2.memory_id != $1
-            AND ABS(em1.sequence_order - em2.sequence_order) <= 3
+            SELECT fem2.memory_id
+            FROM episodes e
+            CROSS JOIN LATERAL find_episode_memories_graph(e.id) fem1
+            CROSS JOIN LATERAL find_episode_memories_graph(e.id) fem2
+            WHERE fem1.memory_id = $1
+              AND fem2.memory_id != $1
+              AND ABS(fem1.sequence_order - fem2.sequence_order) <= 3
         """, memory_id)
         
         for row in temporal_neighbors:
@@ -1115,11 +1131,10 @@ async def summarize_closed_episodes(self, batch_size: int):
         
         # Get memories in order
         memories = await db.fetch("""
-            SELECT m.content, m.type, em.sequence_order
-            FROM episode_memories em
-            JOIN memories m ON em.memory_id = m.id
-            WHERE em.episode_id = $1
-            ORDER BY em.sequence_order
+            SELECT m.content, m.type, fem.sequence_order
+            FROM find_episode_memories_graph($1) fem
+            JOIN memories m ON fem.memory_id = m.id
+            ORDER BY fem.sequence_order
         """, episode_id)
         
         if not memories:
@@ -1146,9 +1161,10 @@ async def extract_concepts_for_new_memories(self, batch_size: int):
     memories = await db.fetch("""
         SELECT m.id, m.content
         FROM memories m
-        LEFT JOIN memory_concepts mc ON m.id = mc.memory_id
-        WHERE mc.memory_id IS NULL
-        AND m.created_at > NOW() - INTERVAL '1 day'
+        WHERE m.created_at > NOW() - INTERVAL '1 day'
+        AND NOT EXISTS (
+            SELECT 1 FROM find_connected_concepts(m.id, 1)
+        )
         LIMIT $1
     """, batch_size)
     

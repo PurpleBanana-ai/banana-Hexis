@@ -580,7 +580,7 @@ By default, substrate upkeep is handled by the **maintenance worker**, which run
 
 That maintenance tick currently:
 
-- Promotes/deletes working memory (`cleanup_working_memory_with_stats`)
+- Promotes/deletes working memory (`cleanup_working_memory`)
 - Recomputes stale neighborhoods (`batch_recompute_neighborhoods`)
 - Prunes embedding cache (`cleanup_embedding_cache`)
 
@@ -678,4 +678,6 @@ If you need multi-Hexis support, consider refactoring the schema to include tena
 
 ## Architecture (Design Docs)
 
-See `docs/architecture.md` for a consolidated architecture/design document (includes the heartbeat design proposal and the cognitive architecture essay).
+- `docs/architecture.md` — consolidated architecture/design (heartbeat design proposal + cognitive architecture essay)
+- `docs/architecture-philosophy-bridge.md` — maps philosophical claims to implementation
+- `docs/SELF_DEVELOPMENT.md` — how self-development works (subconscious vs conscious)
