@@ -6437,6 +6437,39 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION finalize_heartbeat(
+    p_heartbeat_id UUID,
+    p_reasoning TEXT,
+    p_actions_taken JSONB,
+    p_goal_changes JSONB DEFAULT '[]',
+    p_emotional_assessment JSONB DEFAULT NULL
+)
+RETURNS UUID AS $$
+DECLARE
+    actions JSONB := COALESCE(p_actions_taken, '[]'::jsonb);
+    goals JSONB := COALESCE(p_goal_changes, '[]'::jsonb);
+    memory_id_created UUID;
+BEGIN
+    IF jsonb_typeof(actions) <> 'array' THEN
+        actions := '[]'::jsonb;
+    END IF;
+    IF jsonb_typeof(goals) <> 'array' THEN
+        goals := '[]'::jsonb;
+    END IF;
+
+    PERFORM apply_goal_changes(goals);
+
+    memory_id_created := complete_heartbeat(
+        p_heartbeat_id,
+        p_reasoning,
+        actions,
+        goals,
+        p_emotional_assessment
+    );
+    RETURN memory_id_created;
+END;
+$$ LANGUAGE plpgsql;
+
 -- emotional_trend view - uses heartbeat_log (emotional_valence + arousal + primary emotion)
 CREATE OR REPLACE VIEW emotional_trend AS
 WITH base AS (
@@ -7755,6 +7788,87 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION apply_external_call_result(
+    p_call_id UUID,
+    p_output JSONB
+)
+RETURNS JSONB AS $$
+DECLARE
+    call_type external_call_type;
+    call_input JSONB;
+    heartbeat_id UUID;
+    kind TEXT;
+    output_payload JSONB := COALESCE(p_output, '{}'::jsonb);
+    applied JSONB;
+BEGIN
+    SELECT ec.call_type, ec.input, ec.heartbeat_id
+    INTO call_type, call_input, heartbeat_id
+    FROM external_calls ec
+    WHERE ec.id = p_call_id;
+
+    IF call_type IS NULL THEN
+        RETURN jsonb_build_object('error', 'call_not_found');
+    END IF;
+
+    IF call_type = 'think' THEN
+        kind := lower(COALESCE(call_input->>'kind', output_payload->>'kind', ''));
+        IF kind = '' THEN
+            kind := 'heartbeat_decision';
+        END IF;
+
+        IF kind = 'brainstorm_goals' AND heartbeat_id IS NOT NULL THEN
+            BEGIN
+                PERFORM apply_brainstormed_goals(heartbeat_id, output_payload->'goals');
+            EXCEPTION
+                WHEN OTHERS THEN
+                    NULL;
+            END;
+        ELSIF kind = 'inquire' AND heartbeat_id IS NOT NULL THEN
+            BEGIN
+                PERFORM apply_inquiry_result(heartbeat_id, output_payload);
+            EXCEPTION
+                WHEN OTHERS THEN
+                    NULL;
+            END;
+        ELSIF kind = 'reflect' AND heartbeat_id IS NOT NULL THEN
+            IF output_payload ? 'result' THEN
+                BEGIN
+                    PERFORM process_reflection_result(heartbeat_id, output_payload->'result');
+                EXCEPTION
+                    WHEN OTHERS THEN
+                        NULL;
+                END;
+            END IF;
+        ELSIF kind = 'termination_confirm' THEN
+            applied := apply_termination_confirmation(p_call_id, output_payload);
+            IF applied IS NOT NULL AND jsonb_typeof(applied) = 'object' THEN
+                output_payload := jsonb_set(output_payload, '{termination}', applied, true);
+                IF COALESCE((applied->>'terminated')::boolean, FALSE) THEN
+                    output_payload := jsonb_set(output_payload, '{terminated}', 'true'::jsonb, true);
+                END IF;
+            END IF;
+        END IF;
+    END IF;
+
+    UPDATE external_calls
+    SET status = 'complete'::external_call_status,
+        output = output_payload,
+        completed_at = CURRENT_TIMESTAMP,
+        error_message = NULL
+    WHERE id = p_call_id;
+
+    RETURN output_payload;
+EXCEPTION
+    WHEN OTHERS THEN
+        UPDATE external_calls
+        SET status = 'failed'::external_call_status,
+            error_message = SQLERRM,
+            completed_at = CURRENT_TIMESTAMP
+        WHERE id = p_call_id;
+        RETURN jsonb_build_object('error', SQLERRM);
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION execute_heartbeat_action(
     p_heartbeat_id UUID,
     p_action TEXT,
@@ -8178,6 +8292,205 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE OR REPLACE FUNCTION execute_heartbeat_actions_batch(
+    p_heartbeat_id UUID,
+    p_actions JSONB,
+    p_start_index INT DEFAULT 0
+)
+RETURNS JSONB AS $$
+DECLARE
+    action_spec JSONB;
+    action_name TEXT;
+    action_params JSONB;
+    action_result JSONB;
+    actions_taken JSONB := '[]'::jsonb;
+    queued_call_id UUID;
+    next_index INT := COALESCE(p_start_index, 0);
+    ord INT;
+    halt_reason TEXT;
+BEGIN
+    IF p_actions IS NULL OR jsonb_typeof(p_actions) <> 'array' THEN
+        RETURN jsonb_build_object(
+            'actions_taken', '[]'::jsonb,
+            'next_index', next_index,
+            'halt_reason', 'invalid_actions'
+        );
+    END IF;
+
+    FOR action_spec, ord IN
+        SELECT value, ordinality
+        FROM jsonb_array_elements(p_actions) WITH ORDINALITY
+        WHERE ordinality > COALESCE(p_start_index, 0)
+        ORDER BY ordinality
+    LOOP
+        action_name := COALESCE(action_spec->>'action', 'rest');
+        action_params := COALESCE(action_spec->'params', '{}'::jsonb);
+
+        action_result := execute_heartbeat_action(p_heartbeat_id, action_name, action_params);
+        actions_taken := actions_taken || jsonb_build_array(jsonb_build_object(
+            'action', action_name,
+            'params', action_params,
+            'result', action_result
+        ));
+        next_index := ord;
+
+        IF COALESCE((action_result->>'success')::boolean, FALSE) = FALSE THEN
+            halt_reason := COALESCE(action_result->>'error', 'action_failed');
+            RETURN jsonb_build_object(
+                'actions_taken', actions_taken,
+                'next_index', next_index,
+                'halt_reason', halt_reason
+            );
+        END IF;
+
+        queued_call_id := NULL;
+        BEGIN
+            queued_call_id := NULLIF(action_result#>>'{result,external_call_id}', '')::uuid;
+        EXCEPTION
+            WHEN OTHERS THEN
+                queued_call_id := NULL;
+        END;
+
+        IF queued_call_id IS NOT NULL THEN
+            RETURN jsonb_build_object(
+                'actions_taken', actions_taken,
+                'next_index', next_index,
+                'pending_external_call_id', queued_call_id,
+                'halt_reason', 'external_call'
+            );
+        END IF;
+
+        IF action_name = 'terminate'
+            AND COALESCE((action_result#>>'{result,terminated}')::boolean, FALSE) THEN
+            RETURN jsonb_build_object(
+                'actions_taken', actions_taken,
+                'next_index', next_index,
+                'halt_reason', 'terminated'
+            );
+        END IF;
+    END LOOP;
+
+    RETURN jsonb_build_object(
+        'actions_taken', actions_taken,
+        'next_index', next_index,
+        'halt_reason', NULL
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION apply_heartbeat_decision(
+    p_heartbeat_id UUID,
+    p_decision JSONB,
+    p_start_index INT DEFAULT 0
+)
+RETURNS JSONB AS $$
+DECLARE
+    actions JSONB;
+    goal_changes JSONB;
+    reasoning TEXT;
+    emotional JSONB;
+    batch JSONB;
+    new_actions JSONB;
+    existing_actions JSONB;
+    next_index INT;
+    pending_external UUID;
+    halt_reason TEXT;
+    memory_id UUID;
+BEGIN
+    IF p_decision IS NULL OR jsonb_typeof(p_decision) <> 'object' THEN
+        RETURN jsonb_build_object('error', 'invalid_decision');
+    END IF;
+
+    actions := COALESCE(p_decision->'actions', '[]'::jsonb);
+    IF jsonb_typeof(actions) <> 'array' THEN
+        actions := '[]'::jsonb;
+    END IF;
+
+    goal_changes := COALESCE(p_decision->'goal_changes', '[]'::jsonb);
+    IF jsonb_typeof(goal_changes) <> 'array' THEN
+        goal_changes := '[]'::jsonb;
+    END IF;
+
+    reasoning := COALESCE(p_decision->>'reasoning', '');
+    emotional := CASE
+        WHEN jsonb_typeof(p_decision->'emotional_assessment') = 'object' THEN p_decision->'emotional_assessment'
+        ELSE NULL
+    END;
+
+    batch := execute_heartbeat_actions_batch(p_heartbeat_id, actions, p_start_index);
+    new_actions := COALESCE(batch->'actions_taken', '[]'::jsonb);
+    IF jsonb_typeof(new_actions) <> 'array' THEN
+        new_actions := '[]'::jsonb;
+    END IF;
+
+    BEGIN
+        next_index := COALESCE((batch->>'next_index')::int, COALESCE(p_start_index, 0));
+    EXCEPTION
+        WHEN OTHERS THEN
+            next_index := COALESCE(p_start_index, 0);
+    END;
+
+    BEGIN
+        pending_external := NULLIF(batch->>'pending_external_call_id', '')::uuid;
+    EXCEPTION
+        WHEN OTHERS THEN
+            pending_external := NULL;
+    END;
+
+    halt_reason := NULLIF(batch->>'halt_reason', '');
+
+    SELECT COALESCE(actions_taken, '[]'::jsonb)
+    INTO existing_actions
+    FROM heartbeat_log
+    WHERE id = p_heartbeat_id;
+
+    IF existing_actions IS NULL OR jsonb_typeof(existing_actions) <> 'array' THEN
+        existing_actions := '[]'::jsonb;
+    END IF;
+
+    existing_actions := existing_actions || new_actions;
+    UPDATE heartbeat_log
+    SET actions_taken = existing_actions
+    WHERE id = p_heartbeat_id;
+
+    IF pending_external IS NOT NULL THEN
+        RETURN jsonb_build_object(
+            'pending_external_call_id', pending_external,
+            'next_index', next_index,
+            'actions_taken', existing_actions,
+            'completed', false,
+            'halt_reason', halt_reason
+        );
+    END IF;
+
+    IF halt_reason = 'terminated' THEN
+        RETURN jsonb_build_object(
+            'terminated', true,
+            'completed', false,
+            'actions_taken', existing_actions,
+            'next_index', next_index,
+            'halt_reason', halt_reason
+        );
+    END IF;
+
+    memory_id := finalize_heartbeat(
+        p_heartbeat_id,
+        reasoning,
+        existing_actions,
+        goal_changes,
+        emotional
+    );
+
+    RETURN jsonb_build_object(
+        'completed', true,
+        'memory_id', memory_id,
+        'actions_taken', existing_actions,
+        'next_index', next_index,
+        'halt_reason', halt_reason
+    );
+END;
+$$ LANGUAGE plpgsql;
+
 -- ============================================================================
 -- COMMENTS FOR HEARTBEAT SYSTEM
 -- ============================================================================
@@ -8191,7 +8504,10 @@ COMMENT ON TABLE external_calls IS 'Queue for LLM and embedding API calls. Worke
 COMMENT ON FUNCTION should_run_heartbeat IS 'Check if heartbeat interval has elapsed and system is not paused.';
 COMMENT ON FUNCTION start_heartbeat IS 'Initialize heartbeat: regenerate energy, gather context, queue think request.';
 COMMENT ON FUNCTION execute_heartbeat_action IS 'Execute a single action, deducting energy and returning results.';
+COMMENT ON FUNCTION execute_heartbeat_actions_batch IS 'Execute a batch of heartbeat actions, halting on queued external calls or failure.';
+COMMENT ON FUNCTION apply_heartbeat_decision IS 'Apply a heartbeat decision across actions, halting for external calls or termination.';
 COMMENT ON FUNCTION complete_heartbeat IS 'Finalize heartbeat: create episodic memory, update log, set next heartbeat time.';
+COMMENT ON FUNCTION finalize_heartbeat IS 'Finalize heartbeat with goal changes applied and episodic memory recorded.';
 COMMENT ON FUNCTION gather_turn_context IS 'Gather full context for LLM decision: environment, goals, memories, identity, self_model, worldview, narrative, relationships, contradictions, emotional patterns, energy.';
 
 -- ============================================================================
@@ -8211,6 +8527,10 @@ COMMENT ON FUNCTION gather_turn_context IS 'Gather full context for LLM decision
 --   get_relationships_context, get_contradictions_context, get_emotional_patterns_context
 --   get_subconscious_context, match_emotional_triggers
 --   apply_subconscious_observations, apply_brainstormed_goals, apply_inquiry_result, apply_goal_changes
+--   apply_external_call_result
+--   execute_heartbeat_actions_batch
+--   apply_heartbeat_decision
+--   finalize_heartbeat
 --   calculate_relevance, age_in_days
 
 -- ============================================================================

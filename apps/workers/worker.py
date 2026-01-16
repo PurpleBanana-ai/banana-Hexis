@@ -577,11 +577,23 @@ class HeartbeatWorker:
     async def complete_call(self, call_id: str, output: dict):
         """Mark an external call as complete with its output."""
         async with self.pool.acquire() as conn:
-            await conn.execute("""
-                UPDATE external_calls
-                SET status = 'complete'::external_call_status, output = $1, completed_at = CURRENT_TIMESTAMP
-                WHERE id = $2
-            """, json.dumps(output), call_id)
+            try:
+                await conn.fetchval(
+                    "SELECT apply_external_call_result($1::uuid, $2::jsonb)",
+                    call_id,
+                    json.dumps(output),
+                )
+            except Exception as e:
+                logger.warning(f"Failed to apply external call result: {e}")
+                await conn.execute(
+                    """
+                    UPDATE external_calls
+                    SET status = 'complete'::external_call_status, output = $1, completed_at = CURRENT_TIMESTAMP
+                    WHERE id = $2
+                    """,
+                    json.dumps(output),
+                    call_id,
+                )
 
     async def fail_call(self, call_id: str, error: str, retry: bool = True):
         """Mark an external call as failed."""
@@ -1136,81 +1148,64 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
 
     async def execute_heartbeat_actions(self, heartbeat_id: str, decision: dict):
         """Execute the actions decided by the LLM and complete the heartbeat."""
-        actions = decision.get('actions', [])
-        goal_changes = decision.get('goal_changes', [])
-        reasoning = decision.get('reasoning', '')
-
-        actions_taken = []
+        start_index = 0
+        raw_decision = json.dumps(decision)
 
         async with self.pool.acquire() as conn:
-            for action_spec in actions:
-                action = action_spec.get('action', 'rest')
-                params = action_spec.get('params', {})
-
-                # Execute the action via the database function
-                result = await conn.fetchval("""
-                    SELECT execute_heartbeat_action($1::uuid, $2, $3::jsonb)
-                """, heartbeat_id, action, json.dumps(params))
-
-                result_dict = json.loads(result) if result else {}
-                # If this action queued an LLM call (e.g., brainstorm/inquire), process it immediately
-                queued_call_id = (
-                    (result_dict.get("result") or {}).get("external_call_id")
-                    if isinstance(result_dict, dict)
-                    else None
+            while True:
+                raw = await conn.fetchval(
+                    "SELECT apply_heartbeat_decision($1::uuid, $2::jsonb, $3::int)",
+                    heartbeat_id,
+                    raw_decision,
+                    start_index,
                 )
-                external_result = None
-                if queued_call_id:
+                batch = raw
+                if isinstance(batch, str):
                     try:
-                        external_result = await self._process_external_call_by_id(conn, str(queued_call_id))
+                        batch = json.loads(batch)
+                    except Exception:
+                        batch = {}
+                if not isinstance(batch, dict):
+                    batch = {}
+
+                if batch.get("terminated") is True:
+                    logger.info("Termination action executed; stopping workers and skipping heartbeat completion.")
+                    self.stop()
+                    return
+
+                pending_call_id = batch.get("pending_external_call_id")
+                if pending_call_id:
+                    try:
+                        external_result = await self._process_external_call_by_id(conn, str(pending_call_id))
                     except Exception as e:
                         external_result = {"error": str(e)}
-                    if isinstance(result_dict, dict) and isinstance(result_dict.get("result"), dict):
-                        result_dict["result"]["external_call_result"] = external_result
 
-                actions_taken.append({
-                    'action': action,
-                    'params': params,
-                    'result': result_dict
-                })
+                    if isinstance(external_result, dict):
+                        applied = external_result.get("termination")
+                        if isinstance(applied, dict) and applied.get("terminated") is True:
+                            logger.info("Termination confirmed; stopping workers and skipping heartbeat completion.")
+                            self.stop()
+                            return
+                        if external_result.get("terminated") is True:
+                            logger.info("Termination action executed; stopping workers and skipping heartbeat completion.")
+                            self.stop()
+                            return
 
-                if action == "terminate":
-                    termination_result = result_dict.get("result") if isinstance(result_dict, dict) else None
-                    confirmation_required = (
-                        isinstance(termination_result, dict)
-                        and termination_result.get("confirmation_required") is True
-                    )
-                    if confirmation_required and isinstance(termination_result, dict) and external_result is not None:
-                        termination_result["confirmation"] = external_result
-                        if isinstance(external_result, dict):
-                            applied = external_result.get("termination")
-                            if isinstance(applied, dict) and applied.get("terminated") is True:
-                                logger.info("Termination confirmed; stopping workers and skipping heartbeat completion.")
-                                self.stop()
-                                return
-                    elif result_dict.get("success"):
-                        logger.info("Termination action executed; stopping workers and skipping heartbeat completion.")
-                        self.stop()
-                        return
+                    next_index = batch.get("next_index")
+                    if isinstance(next_index, int):
+                        start_index = next_index
+                    else:
+                        start_index = 0
+                    continue
 
-                # Check if we ran out of energy
-                if not result_dict.get('success', True):
-                    logger.info(f"Action {action} failed: {result_dict.get('error', 'unknown')}")
-                    break
+                if batch.get("completed") is True:
+                    memory_id = batch.get("memory_id")
+                    logger.info(f"Heartbeat {heartbeat_id} completed. Memory: {memory_id}")
+                    return
 
-            # Apply goal changes
-            if isinstance(goal_changes, list) and goal_changes:
-                await conn.execute(
-                    "SELECT apply_goal_changes($1::jsonb)",
-                    json.dumps(goal_changes),
-                )
-
-            # Complete the heartbeat
-            memory_id = await conn.fetchval("""
-                SELECT complete_heartbeat($1::uuid, $2, $3::jsonb, $4::jsonb, $5::jsonb)
-            """, heartbeat_id, reasoning, json.dumps(actions_taken), json.dumps(goal_changes), json.dumps(decision.get("emotional_assessment")) if isinstance(decision.get("emotional_assessment"), dict) else None)
-
-            logger.info(f"Heartbeat {heartbeat_id} completed. Memory: {memory_id}")
+                halt_reason = batch.get("halt_reason")
+                logger.info(f"Heartbeat decision halted: {halt_reason or 'unknown'}")
+                return
 
     async def _process_external_call_by_id(self, conn: asyncpg.Connection, call_id: str) -> dict:
         """
@@ -1238,105 +1233,40 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                 call_input = json.loads(call_input)
             except Exception:
                 pass
-        heartbeat_id = row["heartbeat_id"]
 
         if call_type == "think":
             result = await self.process_think_call(call_input)
-            # Apply side-effects for non-heartbeat think kinds
-            kind = result.get("kind")
-            if kind == "brainstorm_goals" and heartbeat_id:
-                created = await self._apply_brainstormed_goals(conn, str(heartbeat_id), result.get("goals", []))
-                result["created_goal_ids"] = created
-            if kind == "inquire" and heartbeat_id:
-                mem_id = await self._apply_inquiry_result(conn, str(heartbeat_id), result)
-                result["memory_id"] = mem_id
-            if kind == "reflect" and heartbeat_id:
-                await self._apply_reflection_result(conn, str(heartbeat_id), result.get("result"))
-                result["applied"] = True
-            if kind == "termination_confirm" and heartbeat_id:
-                applied_raw = await conn.fetchval(
-                    "SELECT apply_termination_confirmation($1::uuid, $2::jsonb)",
-                    call_id,
-                    json.dumps(result),
-                )
-                applied = json.loads(applied_raw) if applied_raw else {}
-                result["termination"] = applied
-                if isinstance(applied, dict) and applied.get("terminated") is True:
-                    result["terminated"] = True
         elif call_type == "embed":
             result = await self.process_embed_call(call_input)
         else:
             result = {"error": f"Unsupported call_type: {call_type}"}
 
-        await conn.execute(
-            """
-            UPDATE external_calls
-            SET status = 'complete'::external_call_status, output = $1::jsonb, completed_at = CURRENT_TIMESTAMP, error_message = NULL
-            WHERE id = $2::uuid
-            """,
-            json.dumps(result),
-            call_id,
-        )
-        return result
-
-    async def _apply_brainstormed_goals(self, conn: asyncpg.Connection, heartbeat_id: str, goals: list[dict]) -> list[str]:
-        if not goals:
-            return []
         try:
             raw = await conn.fetchval(
-                "SELECT apply_brainstormed_goals($1::uuid, $2::jsonb)",
-                heartbeat_id,
-                json.dumps(goals),
-            )
-        except Exception as e:
-            logger.warning(f"Failed to apply brainstormed goals: {e}")
-            return []
-        if isinstance(raw, str):
-            try:
-                raw = json.loads(raw)
-            except Exception:
-                raw = {}
-        if isinstance(raw, dict):
-            ids = raw.get("created_goal_ids")
-            if isinstance(ids, list):
-                return [str(i) for i in ids if i]
-        return []
-
-    async def _apply_inquiry_result(self, conn: asyncpg.Connection, heartbeat_id: str, result: dict) -> str | None:
-        try:
-            raw = await conn.fetchval(
-                "SELECT apply_inquiry_result($1::uuid, $2::jsonb)",
-                heartbeat_id,
+                "SELECT apply_external_call_result($1::uuid, $2::jsonb)",
+                call_id,
                 json.dumps(result),
             )
         except Exception as e:
-            logger.warning(f"Failed to persist inquiry result: {e}")
-            return None
+            logger.warning(f"Failed to apply external call result: {e}")
+            await conn.execute(
+                """
+                UPDATE external_calls
+                SET status = 'complete'::external_call_status, output = $1::jsonb,
+                    completed_at = CURRENT_TIMESTAMP, error_message = NULL
+                WHERE id = $2::uuid
+                """,
+                json.dumps(result),
+                call_id,
+            )
+            return result
+
         if isinstance(raw, str):
             try:
                 raw = json.loads(raw)
             except Exception:
                 raw = {}
-        if isinstance(raw, dict):
-            mem_id = raw.get("memory_id")
-            return str(mem_id) if mem_id else None
-        return None
-
-    async def _apply_reflection_result(self, conn: asyncpg.Connection, heartbeat_id: str, payload: dict | None) -> None:
-        if not payload:
-            return
-        try:
-            await conn.execute(
-                "SELECT process_reflection_result($1::uuid, $2::jsonb)",
-                heartbeat_id,
-                json.dumps(payload),
-            )
-            logger.info(
-                f"Applied reflection result for heartbeat {heartbeat_id} with keys: {sorted(payload.keys())}"
-            )
-        except Exception as e:
-            logger.warning(f"Failed to apply reflection result: {e}")
-        return None
+        return raw if isinstance(raw, dict) else result
 
     async def check_and_run_heartbeat(self):
         """Check if a heartbeat should run and trigger it if so."""
@@ -1399,29 +1329,6 @@ What do you want to do this heartbeat? Respond with STRICT JSON."""
                                         # The decision is already persisted; action execution failures should not flip the call back to failed.
                                         logger.error(f"Heartbeat action execution failed for {heartbeat_id}: {e}")
                                     result = result | {"actions_executed": True}
-                                elif heartbeat_id and result.get("kind") == "brainstorm_goals":
-                                    async with self.pool.acquire() as conn:
-                                        created = await self._apply_brainstormed_goals(conn, str(heartbeat_id), result.get("goals", []))
-                                    result["created_goal_ids"] = created
-                                elif heartbeat_id and result.get("kind") == "inquire":
-                                    async with self.pool.acquire() as conn:
-                                        mem_id = await self._apply_inquiry_result(conn, str(heartbeat_id), result)
-                                    result["memory_id"] = mem_id
-                                elif heartbeat_id and result.get("kind") == "reflect":
-                                    async with self.pool.acquire() as conn:
-                                        await self._apply_reflection_result(conn, str(heartbeat_id), result.get("result"))
-                                    result["applied"] = True
-                                elif heartbeat_id and result.get("kind") == "termination_confirm":
-                                    async with self.pool.acquire() as conn:
-                                        applied_raw = await conn.fetchval(
-                                            "SELECT apply_termination_confirmation($1::uuid, $2::jsonb)",
-                                            call_id,
-                                            json.dumps(result),
-                                        )
-                                    applied = json.loads(applied_raw) if applied_raw else {}
-                                    result["termination"] = applied
-                                    if isinstance(applied, dict) and applied.get("terminated") is True:
-                                        result["terminated"] = True
                             else:
                                 result = {'error': f'Unknown call type: {call_type}'}
 
