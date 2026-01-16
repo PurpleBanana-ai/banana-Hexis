@@ -154,6 +154,7 @@ You receive:
 - Current narrative context (LifeChapterNode)
 - Current emotional state and recent history
 - Current relationship edges
+- Matched emotional triggers (if any)
 
 You detect:
 1. NARRATIVE MOMENTS
@@ -1654,6 +1655,23 @@ class SubconsciousDecider:
         emotional_patterns = _coerce(await conn.fetchval("SELECT get_emotional_patterns_context(5)")) or []
         emotional_state = _coerce(await conn.fetchval("SELECT get_current_affective_state()")) or {}
         goals = _coerce(await conn.fetchval("SELECT get_goals_snapshot()")) or {}
+        trigger_seed = " ".join(
+            [
+                str(item.get("content", "")).strip()
+                for item in recent
+                if isinstance(item, dict) and item.get("content")
+            ][:5]
+        ).strip()
+        emotional_triggers = []
+        if trigger_seed:
+            emotional_triggers = _coerce(
+                await conn.fetchval(
+                    "SELECT match_emotional_triggers($1::text, $2::int, $3::float)",
+                    trigger_seed,
+                    5,
+                    0.75,
+                )
+            ) or []
 
         return {
             "recent_memories": recent,
@@ -1664,6 +1682,7 @@ class SubconsciousDecider:
             "contradictions": contradictions,
             "emotional_patterns": emotional_patterns,
             "emotional_state": emotional_state,
+            "emotional_triggers": emotional_triggers,
             "goals": goals,
         }
 

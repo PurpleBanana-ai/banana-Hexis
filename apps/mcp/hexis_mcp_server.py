@@ -129,6 +129,14 @@ async def _dispatch_tool(client: CognitiveMemory, name: str, args: dict[str, Any
             include_partial=include_partial,
         )
 
+    if name == "sense_memory_availability":
+        query = _require(args, "query", name)
+        return await client.sense_memory_availability(query)
+
+    if name == "request_background_search":
+        query = _require(args, "query", name)
+        return await client.request_background_search(query)
+
     if name == "recall_by_id":
         memory_id = UUID(_require(args, "memory_id", name))
         return await client.recall_by_id(memory_id)
@@ -341,6 +349,26 @@ def _tools() -> list[Any]:
                     "min_importance": {"type": "number", "minimum": 0.0, "maximum": 1.0, "default": 0.0},
                     "include_partial": {"type": "boolean", "default": True},
                 },
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        ),
+        _tool(
+            "sense_memory_availability",
+            "Feeling-of-knowing check before a full recall.",
+            {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
+                "required": ["query"],
+                "additionalProperties": False,
+            },
+        ),
+        _tool(
+            "request_background_search",
+            "Request a background search after a failed recall.",
+            {
+                "type": "object",
+                "properties": {"query": {"type": "string"}},
                 "required": ["query"],
                 "additionalProperties": False,
             },

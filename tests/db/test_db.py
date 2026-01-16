@@ -6776,7 +6776,7 @@ async def test_reach_out_public_boundary_refusal_no_energy_spent(db_pool):
 async def test_complete_heartbeat_records_emotion(db_pool):
     """Test that complete_heartbeat updates affective_state in heartbeat_state.
     Note: emotional_states table was removed in Phase 8 (ReduceScopeCreep).
-    Emotion is now only stored in heartbeat_state.affective_state and heartbeat_log.emotional_valence.
+    Emotion is now stored in heartbeat_state.affective_state and heartbeat_log emotional columns.
     """
     async with db_pool.acquire() as conn:
         hb_id = await conn.fetchval("SELECT start_heartbeat()")
@@ -6794,9 +6794,14 @@ async def test_complete_heartbeat_records_emotion(db_pool):
             affective = json.loads(affective)
         assert affective is not None and affective != {}, "Affective state should be set"
         assert "valence" in affective, "Affective state should have valence"
-        # Check that emotional_valence was recorded in heartbeat_log
-        valence = await conn.fetchval("SELECT emotional_valence FROM heartbeat_log WHERE id = $1", hb_id)
-        assert valence is not None, "Emotional valence should be recorded in heartbeat_log"
+        # Check heartbeat_log emotional fields
+        row = await conn.fetchrow(
+            "SELECT emotional_valence, emotional_arousal, emotional_primary_emotion FROM heartbeat_log WHERE id = $1",
+            hb_id,
+        )
+        assert row["emotional_valence"] is not None, "Emotional valence should be recorded in heartbeat_log"
+        assert row["emotional_arousal"] is not None, "Emotional arousal should be recorded in heartbeat_log"
+        assert row["emotional_primary_emotion"] is not None, "Primary emotion should be recorded in heartbeat_log"
 
 
 async def test_complete_heartbeat_blends_emotional_assessment_into_state(db_pool):

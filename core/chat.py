@@ -18,15 +18,17 @@ BASE_SYSTEM_PROMPT = """You are an AI assistant with access to a persistent memo
 You have access to several memory tools that allow you to search and explore your memories:
 
 1. **recall** - Search memories by semantic similarity. Use this when you need to remember something specific.
-2. **recall_recent** - Get recently accessed or created memories. Use for context about recent conversations.
-3. **recall_episode** - Retrieve all memories from a specific episode (a coherent interaction).
-4. **explore_concept** - Explore memories connected to a concept and find related ideas.
-5. **explore_cluster** - Explore thematic clusters of memories.
-6. **get_procedures** - Find procedural/how-to knowledge for tasks.
-7. **get_strategies** - Find strategic patterns and lessons learned.
-8. **list_recent_episodes** - List recent episodes for orientation.
-9. **create_goal** - Create a queued goal/reminder for the agent to pursue later.
-10. **queue_user_message** - Queue a message to the user's outbox (delivery handled externally).
+2. **sense_memory_availability** - Quick feeling-of-knowing check before a full recall.
+3. **request_background_search** - Ask the system to keep searching after a failed recall.
+4. **recall_recent** - Get recently accessed or created memories. Use for context about recent conversations.
+5. **recall_episode** - Retrieve all memories from a specific episode (a coherent interaction).
+6. **explore_concept** - Explore memories connected to a concept and find related ideas.
+7. **explore_cluster** - Explore thematic clusters of memories.
+8. **get_procedures** - Find procedural/how-to knowledge for tasks.
+9. **get_strategies** - Find strategic patterns and lessons learned.
+10. **list_recent_episodes** - List recent episodes for orientation.
+11. **create_goal** - Create a queued goal/reminder for the agent to pursue later.
+12. **queue_user_message** - Queue a message to the user's outbox (delivery handled externally).
 
 ## When to Use Memory Tools
 

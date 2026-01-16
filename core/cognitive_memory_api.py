@@ -613,6 +613,34 @@ class CognitiveMemory:
             row = await conn.fetchrow("SELECT * FROM current_emotional_state")
             return dict(row) if row else None
 
+    async def sense_memory_availability(self, query: str) -> dict[str, Any]:
+        async with self._pool.acquire() as conn:
+            raw = await conn.fetchval("SELECT sense_memory_availability($1::text)", query)
+            return _coerce_json(raw) if raw is not None else {}
+
+    async def request_background_search(self, query: str) -> UUID | None:
+        async with self._pool.acquire() as conn:
+            return await conn.fetchval("SELECT request_background_search($1::text)", query)
+
+    async def get_spontaneous_memories(self, *, limit: int = 3) -> list[Memory]:
+        async with self._pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT
+                    id,
+                    type,
+                    content,
+                    importance,
+                    trust_level,
+                    source_attribution,
+                    created_at,
+                    (metadata->>'emotional_valence')::float as emotional_valence
+                FROM get_spontaneous_memories($1::int)
+                """,
+                limit,
+            )
+            return [self._row_to_memory(row) for row in rows]
+
     async def get_drives(self) -> list[dict[str, Any]]:
         async with self._pool.acquire() as conn:
             rows = await conn.fetch("SELECT * FROM drive_status")

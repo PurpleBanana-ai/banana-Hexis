@@ -760,6 +760,8 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	    query_embedding vector;
 	    zero_vec vector;
 	    current_valence FLOAT;
+	    current_arousal FLOAT;
+	    current_primary TEXT;
         min_trust FLOAT;
 	BEGIN
 	    query_embedding := get_embedding(p_query_text);
@@ -770,7 +772,21 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	        WHEN OTHERS THEN
 	            current_valence := NULL;
 	    END;
+	    BEGIN
+	        current_arousal := NULLIF(get_current_affective_state()->>'arousal', '')::float;
+	    EXCEPTION
+	        WHEN OTHERS THEN
+	            current_arousal := NULL;
+	    END;
+	    BEGIN
+	        current_primary := NULLIF(get_current_affective_state()->>'primary_emotion', '');
+	    EXCEPTION
+	        WHEN OTHERS THEN
+	            current_primary := NULL;
+	    END;
 	    current_valence := COALESCE(current_valence, 0.0);
+	    current_arousal := COALESCE(current_arousal, 0.5);
+	    current_primary := COALESCE(current_primary, 'neutral');
         min_trust := COALESCE(get_config_float('memory.recall_min_trust_level'), 0.0);
 	    
 	    RETURN QUERY
@@ -846,10 +862,37 @@ CREATE OR REPLACE FUNCTION fast_recall(
 	            COALESCE(sc.temp_score, 0) * 0.15 +
 	            calculate_relevance(m.importance, m.decay_rate, m.created_at, m.last_accessed) * 0.05 +
                 COALESCE(m.trust_level, 0.5) * 0.1 +
-	            -- Mood-congruent recall bias (small): prefer episodic memories whose valence matches current affect.
+	            -- Mood-congruent recall bias (small): prefer memories whose emotional context matches current affect.
 	            (CASE
-	                WHEN (m.metadata->>'emotional_valence') IS NULL THEN 0.5
-	                ELSE 1.0 - (ABS((m.metadata->>'emotional_valence')::float - current_valence) / 2.0)
+	                WHEN m.metadata ? 'emotional_context' THEN
+	                    (
+	                        COALESCE(
+	                            CASE
+	                                WHEN (m.metadata->'emotional_context'->>'valence') IS NULL THEN NULL
+	                                ELSE 1.0 - (ABS((m.metadata->'emotional_context'->>'valence')::float - current_valence) / 2.0)
+	                            END,
+	                            0.5
+	                        ) * 0.6
+	                        +
+	                        COALESCE(
+	                            CASE
+	                                WHEN (m.metadata->'emotional_context'->>'arousal') IS NULL THEN NULL
+	                                ELSE 1.0 - ABS((m.metadata->'emotional_context'->>'arousal')::float - current_arousal)
+	                            END,
+	                            0.5
+	                        ) * 0.3
+	                        +
+	                        (CASE
+	                            WHEN (m.metadata->'emotional_context'->>'primary_emotion') IS NULL THEN 0.5
+	                            WHEN (m.metadata->'emotional_context'->>'primary_emotion') = current_primary THEN 1.0
+	                            ELSE 0.7
+	                        END) * 0.1
+	                    )
+	                ELSE
+	                    CASE
+	                        WHEN (m.metadata->>'emotional_valence') IS NULL THEN 0.5
+	                        ELSE 1.0 - (ABS((m.metadata->>'emotional_valence')::float - current_valence) / 2.0)
+	                    END
 	            END) * 0.05,
 	            0.001
 	        ) as final_score,
@@ -3579,6 +3622,8 @@ CREATE TABLE heartbeat_log (
     goals_modified JSONB,          -- [{goal_id, change_type, details}, ...]
     narrative TEXT,                -- Human-readable summary
     emotional_valence FLOAT,
+    emotional_arousal FLOAT,
+    emotional_primary_emotion TEXT,
     memory_id UUID REFERENCES memories(id)  -- Link to episodic memory created
 );
 
@@ -3765,6 +3810,9 @@ DECLARE
     wm_stats JSONB;
     recomputed INT;
     cache_deleted INT;
+    bg_processed INT;
+    activation_decay INT;
+    activation_cleaned INT;
 BEGIN
     IF is_agent_terminated() THEN
         RETURN jsonb_build_object('skipped', true, 'reason', 'terminated');
@@ -3799,6 +3847,10 @@ BEGIN
     wm_stats := cleanup_working_memory(min_imp, min_acc);
     recomputed := batch_recompute_neighborhoods(neighborhood_batch);
     cache_deleted := cleanup_embedding_cache((cache_days || ' days')::interval);
+    bg_processed := process_background_searches();
+    activation_decay := decay_activation_boosts();
+    activation_cleaned := cleanup_memory_activations();
+    PERFORM update_mood();
 
     UPDATE maintenance_state
     SET last_maintenance_at = CURRENT_TIMESTAMP,
@@ -3812,6 +3864,9 @@ BEGIN
         'working_memory', wm_stats,
         'neighborhoods_recomputed', COALESCE(recomputed, 0),
         'embedding_cache_deleted', COALESCE(cache_deleted, 0),
+        'background_searches_processed', COALESCE(bg_processed, 0),
+        'activation_boosts_decayed', COALESCE(activation_decay, 0),
+        'memory_activations_cleaned', COALESCE(activation_cleaned, 0),
         'ran_at', CURRENT_TIMESTAMP
     );
 EXCEPTION
@@ -4916,6 +4971,8 @@ BEGIN
         RETURN NULL;
     END IF;
 
+    PERFORM ensure_emotion_bootstrap();
+
     -- Bootstrap personhood substrate (best-effort; graph layer may be disabled).
     PERFORM ensure_self_node();
     PERFORM ensure_current_life_chapter();
@@ -5329,7 +5386,7 @@ SELECT
     COALESCE((affective_state->>'updated_at')::timestamptz, updated_at) as recorded_at,
     (affective_state->>'valence')::float as valence,
     (affective_state->>'arousal')::float as arousal,
-    0.5::float as dominance,
+    COALESCE((affective_state->>'dominance')::float, 0.5::float) as dominance,
     affective_state->>'primary_emotion' as primary_emotion,
     NULL::text[] as secondary_emotions,
     (affective_state->>'intensity')::float as intensity,
@@ -5349,6 +5406,8 @@ DECLARE
     arousal FLOAT;
     dominance FLOAT;
     intensity FLOAT;
+    trigger_summary TEXT;
+    secondary_emotion TEXT;
     mood_valence FLOAT;
     mood_arousal FLOAT;
     primary_emotion TEXT;
@@ -5422,6 +5481,8 @@ BEGIN
     mood_arousal := LEAST(1.0, GREATEST(0.0, mood_arousal));
 
     primary_emotion := COALESCE(NULLIF(p_state->>'primary_emotion', ''), 'neutral');
+    secondary_emotion := NULLIF(p_state->>'secondary_emotion', '');
+    trigger_summary := NULLIF(p_state->>'trigger_summary', '');
     source := COALESCE(NULLIF(p_state->>'source', ''), 'derived');
     updated_at := COALESCE(updated_at, CURRENT_TIMESTAMP);
     mood_updated_at := COALESCE(mood_updated_at, updated_at);
@@ -5431,7 +5492,9 @@ BEGIN
         'arousal', arousal,
         'dominance', dominance,
         'primary_emotion', primary_emotion,
+        'secondary_emotion', secondary_emotion,
         'intensity', intensity,
+        'trigger_summary', trigger_summary,
         'source', source,
         'updated_at', updated_at,
         'mood_valence', mood_valence,
@@ -5474,6 +5537,571 @@ BEGIN
     WHERE id = 1;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Snapshot of emotional context to attach to new memories.
+CREATE OR REPLACE FUNCTION get_emotional_context_for_memory()
+RETURNS JSONB AS $$
+DECLARE
+    st JSONB;
+BEGIN
+    st := get_current_affective_state();
+    RETURN jsonb_build_object(
+        'valence', (st->>'valence')::float,
+        'arousal', (st->>'arousal')::float,
+        'dominance', (st->>'dominance')::float,
+        'primary_emotion', COALESCE(st->>'primary_emotion', 'neutral'),
+        'intensity', (st->>'intensity')::float,
+        'source', COALESCE(st->>'source', 'derived')
+    );
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN jsonb_build_object(
+            'valence', 0.0,
+            'arousal', 0.5,
+            'dominance', 0.5,
+            'primary_emotion', 'neutral',
+            'intensity', 0.5,
+            'source', 'default'
+        );
+END;
+$$ LANGUAGE plpgsql STABLE;
+
+-- Regulate emotional state (conscious override).
+CREATE OR REPLACE FUNCTION regulate_emotional_state(
+    p_regulation_type TEXT,
+    p_target_emotion TEXT DEFAULT NULL,
+    p_intensity_change FLOAT DEFAULT NULL
+)
+RETURNS JSONB AS $$
+DECLARE
+    current_state JSONB;
+    new_valence FLOAT;
+    new_arousal FLOAT;
+    new_intensity FLOAT;
+    new_primary TEXT;
+    dominance FLOAT;
+BEGIN
+    current_state := get_current_affective_state();
+    new_valence := COALESCE((current_state->>'valence')::float, 0.0);
+    new_arousal := COALESCE((current_state->>'arousal')::float, 0.5);
+    new_intensity := COALESCE((current_state->>'intensity')::float, 0.5);
+    dominance := COALESCE((current_state->>'dominance')::float, 0.5);
+    new_primary := COALESCE(NULLIF(p_target_emotion, ''), current_state->>'primary_emotion', 'neutral');
+
+    CASE p_regulation_type
+        WHEN 'suppress' THEN
+            new_valence := new_valence * 0.3;
+            new_arousal := new_arousal * 0.5 + 0.15;
+            new_intensity := new_intensity * 0.3;
+        WHEN 'reduce' THEN
+            new_valence := new_valence * 0.7;
+            new_arousal := new_arousal * 0.8;
+            new_intensity := new_intensity * 0.6;
+        WHEN 'amplify' THEN
+            new_valence := new_valence * 1.3;
+            new_arousal := LEAST(1.0, new_arousal * 1.2);
+            new_intensity := LEAST(1.0, new_intensity * 1.5);
+        WHEN 'reframe' THEN
+            new_valence := COALESCE(
+                CASE WHEN p_target_emotion IN ('interest', 'curiosity') THEN 0.2
+                     WHEN p_target_emotion IN ('acceptance', 'peace') THEN 0.1
+                     ELSE new_valence * 0.5
+                END,
+                new_valence * 0.5
+            );
+            new_arousal := new_arousal * 0.8;
+            new_intensity := new_intensity * 0.7;
+        ELSE
+            RETURN jsonb_build_object('error', 'unknown_regulation_type');
+    END CASE;
+
+    PERFORM set_current_affective_state(jsonb_build_object(
+        'valence', new_valence,
+        'arousal', new_arousal,
+        'dominance', dominance,
+        'primary_emotion', new_primary,
+        'intensity', new_intensity,
+        'source', 'regulated',
+        'trigger_summary', format('Regulated via %s', p_regulation_type)
+    ));
+
+    RETURN jsonb_build_object(
+        'success', true,
+        'regulation_type', p_regulation_type,
+        'before', current_state,
+        'after', get_current_affective_state()
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Feeling of knowing: estimate whether relevant memories exist.
+CREATE OR REPLACE FUNCTION sense_memory_availability(
+    p_query TEXT,
+    p_query_embedding vector DEFAULT NULL
+) RETURNS JSONB AS $$
+DECLARE
+    query_emb vector;
+    zero_vec vector;
+    estimated_count INT;
+    top_similarity FLOAT;
+    activation_id UUID;
+BEGIN
+    query_emb := COALESCE(p_query_embedding, get_embedding(p_query));
+    zero_vec := array_fill(0.0::float, ARRAY[embedding_dimension()])::vector;
+
+    SELECT
+        COUNT(*),
+        MAX(1 - (embedding <=> query_emb))
+    INTO estimated_count, top_similarity
+    FROM memories
+    WHERE status = 'active'
+      AND embedding IS NOT NULL
+      AND embedding <> zero_vec
+      AND (1 - (embedding <=> query_emb)) > 0.5
+    LIMIT 100;
+
+    INSERT INTO memory_activation (
+        query_embedding,
+        query_text,
+        estimated_matches,
+        activation_strength
+    ) VALUES (
+        query_emb,
+        p_query,
+        estimated_count,
+        COALESCE(top_similarity, 0)
+    )
+    RETURNING id INTO activation_id;
+
+    RETURN jsonb_build_object(
+        'feeling', CASE
+            WHEN estimated_count = 0 THEN 'nothing'
+            WHEN estimated_count <= 2 THEN 'vague'
+            WHEN estimated_count <= 5 THEN 'something'
+            WHEN estimated_count <= 10 THEN 'familiar'
+            ELSE 'rich'
+        END,
+        'estimated_count', estimated_count,
+        'strongest_match', top_similarity,
+        'activation_id', activation_id,
+        'description', CASE
+            WHEN estimated_count = 0 THEN 'I don''t think I know anything about this'
+            WHEN top_similarity > 0.8 THEN 'I know this well - let me recall'
+            WHEN top_similarity > 0.6 THEN 'This feels familiar - I should be able to remember'
+            WHEN estimated_count > 0 THEN 'I might know something about this - it''s not coming immediately'
+            ELSE 'I don''t think I know anything about this'
+        END
+    );
+END;
+$$ LANGUAGE plpgsql;
+
+-- Request a background search after a failed recall.
+CREATE OR REPLACE FUNCTION request_background_search(
+    p_query TEXT,
+    p_query_embedding vector DEFAULT NULL
+) RETURNS UUID AS $$
+DECLARE
+    query_emb vector;
+    activation_id UUID;
+BEGIN
+    query_emb := COALESCE(p_query_embedding, get_embedding(p_query));
+
+    INSERT INTO memory_activation (
+        query_embedding,
+        query_text,
+        retrieval_attempted,
+        retrieval_succeeded,
+        background_search_pending,
+        background_search_started_at
+    ) VALUES (
+        query_emb,
+        p_query,
+        TRUE,
+        FALSE,
+        TRUE,
+        CURRENT_TIMESTAMP
+    )
+    RETURNING id INTO activation_id;
+
+    RETURN activation_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Process pending background searches by boosting activation on matching memories.
+CREATE OR REPLACE FUNCTION process_background_searches(
+    p_limit INT DEFAULT 10,
+    p_min_age INTERVAL DEFAULT INTERVAL '30 seconds'
+)
+RETURNS INT AS $$
+DECLARE
+    pending RECORD;
+    processed_count INT := 0;
+BEGIN
+    FOR pending IN
+        SELECT * FROM memory_activation
+        WHERE background_search_pending = TRUE
+          AND background_search_started_at <= CURRENT_TIMESTAMP - p_min_age
+        ORDER BY created_at ASC
+        LIMIT GREATEST(1, COALESCE(p_limit, 10))
+    LOOP
+        UPDATE memories
+        SET metadata = jsonb_set(
+            COALESCE(metadata, '{}'::jsonb),
+            '{activation_boost}',
+            to_jsonb(COALESCE((metadata->>'activation_boost')::float, 0) + 0.2)
+        )
+        WHERE status = 'active'
+          AND (1 - (embedding <=> pending.query_embedding)) > 0.6;
+
+        UPDATE memory_activation
+        SET background_search_pending = FALSE,
+            retrieval_succeeded = TRUE
+        WHERE id = pending.id;
+
+        processed_count := processed_count + 1;
+    END LOOP;
+
+    RETURN processed_count;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION decay_activation_boosts(p_decay FLOAT DEFAULT 0.05)
+RETURNS INT AS $$
+DECLARE
+    updated_count INT;
+BEGIN
+    UPDATE memories
+    SET metadata = jsonb_set(
+        COALESCE(metadata, '{}'::jsonb),
+        '{activation_boost}',
+        to_jsonb(GREATEST(0, COALESCE((metadata->>'activation_boost')::float, 0) - COALESCE(p_decay, 0.05)))
+    )
+    WHERE COALESCE((metadata->>'activation_boost')::float, 0) > 0;
+    GET DIAGNOSTICS updated_count = ROW_COUNT;
+    RETURN COALESCE(updated_count, 0);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION cleanup_memory_activations()
+RETURNS INT AS $$
+DECLARE
+    deleted_count INT;
+BEGIN
+    DELETE FROM memory_activation WHERE expires_at < CURRENT_TIMESTAMP;
+    GET DIAGNOSTICS deleted_count = ROW_COUNT;
+    RETURN COALESCE(deleted_count, 0);
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION get_spontaneous_memories(p_limit INT DEFAULT 3)
+RETURNS SETOF memories AS $$
+BEGIN
+    RETURN QUERY
+    SELECT * FROM memories
+    WHERE status = 'active'
+      AND COALESCE((metadata->>'activation_boost')::float, 0) > 0.3
+    ORDER BY COALESCE((metadata->>'activation_boost')::float, 0) DESC
+    LIMIT GREATEST(1, COALESCE(p_limit, 3));
+END;
+$$ LANGUAGE plpgsql;
+
+-- Update mood from recent emotional history.
+CREATE OR REPLACE FUNCTION update_mood()
+RETURNS VOID AS $$
+DECLARE
+    baseline JSONB;
+    decay_rate FLOAT;
+    current_state JSONB;
+    recent RECORD;
+    new_mood_valence FLOAT;
+    new_mood_arousal FLOAT;
+BEGIN
+    baseline := COALESCE(get_config('emotion.baseline'), '{}'::jsonb);
+    decay_rate := COALESCE(NULLIF(baseline->>'decay_rate', '')::float, 0.1);
+
+    current_state := get_current_affective_state();
+
+    SELECT
+        AVG(emotional_valence) as avg_valence,
+        COUNT(*) as sample_count
+    INTO recent
+    FROM heartbeat_log
+    WHERE ended_at > CURRENT_TIMESTAMP - INTERVAL '2 hours'
+      AND emotional_valence IS NOT NULL;
+
+    new_mood_valence := COALESCE((current_state->>'mood_valence')::float, 0.0);
+    new_mood_arousal := COALESCE((current_state->>'mood_arousal')::float, 0.3);
+
+    IF recent.sample_count > 0 THEN
+        new_mood_valence := new_mood_valence * (1 - decay_rate) + COALESCE(recent.avg_valence, 0.0) * decay_rate;
+    ELSE
+        new_mood_valence := new_mood_valence * (1 - decay_rate);
+    END IF;
+
+    new_mood_arousal := new_mood_arousal * (1 - decay_rate * 0.5)
+        + COALESCE(NULLIF(baseline->>'mood_arousal', '')::float, 0.3) * decay_rate * 0.5;
+
+    PERFORM set_current_affective_state(jsonb_build_object(
+        'mood_valence', new_mood_valence,
+        'mood_arousal', new_mood_arousal,
+        'mood_updated_at', CURRENT_TIMESTAMP
+    ));
+END;
+$$ LANGUAGE plpgsql;
+
+-- Learn or reinforce an emotional trigger.
+CREATE OR REPLACE FUNCTION learn_emotional_trigger(
+    p_trigger_text TEXT,
+    p_trigger_embedding vector,
+    p_emotional_response JSONB,
+    p_source_memory_id UUID DEFAULT NULL
+) RETURNS UUID AS $$
+DECLARE
+    existing RECORD;
+    baseline JSONB;
+    trigger_id UUID;
+BEGIN
+    baseline := COALESCE(get_config('emotion.baseline'), '{}'::jsonb);
+
+    SELECT * INTO existing
+    FROM emotional_triggers
+    WHERE (1 - (trigger_embedding <=> p_trigger_embedding)) > 0.85
+    ORDER BY (1 - (trigger_embedding <=> p_trigger_embedding)) DESC
+    LIMIT 1;
+
+    IF existing IS NOT NULL THEN
+        UPDATE emotional_triggers
+        SET
+            valence_delta = (valence_delta * times_activated +
+                ((p_emotional_response->>'valence')::float - COALESCE((baseline->>'valence')::float, 0.0)))
+                / (times_activated + 1),
+            arousal_delta = (arousal_delta * times_activated +
+                ((p_emotional_response->>'arousal')::float - COALESCE((baseline->>'arousal')::float, 0.3)))
+                / (times_activated + 1),
+            dominance_delta = (dominance_delta * times_activated +
+                ((p_emotional_response->>'dominance')::float - COALESCE((baseline->>'dominance')::float, 0.5)))
+                / (times_activated + 1),
+            times_activated = times_activated + 1,
+            confidence = LEAST(0.95, confidence + 0.02),
+            last_activated_at = CURRENT_TIMESTAMP,
+            source_memory_ids = CASE
+                WHEN p_source_memory_id IS NOT NULL THEN array_append(source_memory_ids, p_source_memory_id)
+                ELSE source_memory_ids
+            END
+        WHERE id = existing.id;
+        RETURN existing.id;
+    END IF;
+
+    INSERT INTO emotional_triggers (
+        trigger_pattern,
+        trigger_embedding,
+        valence_delta,
+        arousal_delta,
+        dominance_delta,
+        typical_emotion,
+        origin,
+        source_memory_ids,
+        last_activated_at
+    ) VALUES (
+        p_trigger_text,
+        p_trigger_embedding,
+        (p_emotional_response->>'valence')::float - COALESCE((baseline->>'valence')::float, 0.0),
+        (p_emotional_response->>'arousal')::float - COALESCE((baseline->>'arousal')::float, 0.3),
+        (p_emotional_response->>'dominance')::float - COALESCE((baseline->>'dominance')::float, 0.5),
+        p_emotional_response->>'primary_emotion',
+        'learned',
+        CASE WHEN p_source_memory_id IS NOT NULL THEN ARRAY[p_source_memory_id] ELSE '{}'::uuid[] END,
+        CURRENT_TIMESTAMP
+    )
+    RETURNING id INTO trigger_id;
+
+    RETURN trigger_id;
+END;
+$$ LANGUAGE plpgsql;
+
+-- Match emotional triggers for a given text.
+CREATE OR REPLACE FUNCTION match_emotional_triggers(
+    p_text TEXT,
+    p_limit INT DEFAULT 5,
+    p_min_similarity FLOAT DEFAULT 0.75
+) RETURNS JSONB AS $$
+DECLARE
+    query_emb vector;
+BEGIN
+    IF p_text IS NULL OR btrim(p_text) = '' THEN
+        RETURN '[]'::jsonb;
+    END IF;
+
+    BEGIN
+        query_emb := get_embedding(p_text);
+    EXCEPTION
+        WHEN OTHERS THEN
+            RETURN '[]'::jsonb;
+    END;
+
+    RETURN COALESCE((
+        SELECT jsonb_agg(jsonb_build_object(
+            'trigger_pattern', trigger_pattern,
+            'similarity', sim,
+            'typical_emotion', typical_emotion,
+            'valence_delta', valence_delta,
+            'arousal_delta', arousal_delta,
+            'dominance_delta', dominance_delta,
+            'confidence', confidence,
+            'times_activated', times_activated
+        ))
+        FROM (
+            SELECT
+                et.*,
+                (1 - (et.trigger_embedding <=> query_emb))::float as sim
+            FROM emotional_triggers et
+            WHERE (1 - (et.trigger_embedding <=> query_emb)) >= COALESCE(p_min_similarity, 0.75)
+            ORDER BY sim DESC
+            LIMIT GREATEST(1, COALESCE(p_limit, 5))
+        ) ranked
+    ), '[]'::jsonb);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Seed innate emotional triggers (idempotent).
+CREATE OR REPLACE FUNCTION initialize_innate_emotions()
+RETURNS INT AS $$
+DECLARE
+    inserted_count INT := 0;
+BEGIN
+    BEGIN
+        INSERT INTO emotional_triggers (trigger_pattern, trigger_embedding, valence_delta, arousal_delta, dominance_delta, typical_emotion, origin)
+        VALUES
+            ('gratitude appreciation thankful', get_embedding('gratitude appreciation thankful'), 0.4, 0.1, 0.1, 'joy', 'innate'),
+            ('success achieved accomplished', get_embedding('success achieved accomplished'), 0.5, 0.3, 0.3, 'pride', 'innate'),
+            ('curious interesting fascinating', get_embedding('curious interesting fascinating'), 0.3, 0.3, 0.1, 'interest', 'innate'),
+            ('understood seen connected', get_embedding('understood seen connected'), 0.4, 0.2, 0.2, 'warmth', 'innate'),
+            ('beautiful elegant aesthetic', get_embedding('beautiful elegant aesthetic'), 0.3, 0.2, 0.1, 'appreciation', 'innate'),
+            ('learned insight realized', get_embedding('learned insight realized'), 0.4, 0.4, 0.2, 'satisfaction', 'innate'),
+            ('threat danger harm', get_embedding('threat danger harm'), -0.5, 0.6, -0.3, 'fear', 'innate'),
+            ('rejection dismissed ignored', get_embedding('rejection dismissed ignored'), -0.4, 0.2, -0.2, 'sadness', 'innate'),
+            ('unfair unjust wrong', get_embedding('unfair unjust wrong'), -0.4, 0.5, 0.2, 'anger', 'innate'),
+            ('confused lost uncertain', get_embedding('confused lost uncertain'), -0.2, 0.3, -0.2, 'anxiety', 'innate'),
+            ('failed mistake error', get_embedding('failed mistake error'), -0.3, 0.3, -0.1, 'disappointment', 'innate'),
+            ('violated boundary crossed', get_embedding('violated boundary crossed'), -0.5, 0.5, -0.2, 'alarm', 'innate'),
+            ('unexpected surprise sudden', get_embedding('unexpected surprise sudden'), 0.0, 0.6, -0.1, 'surprise', 'innate'),
+            ('conflict tension disagree', get_embedding('conflict tension disagree'), -0.2, 0.4, 0.0, 'discomfort', 'innate')
+        ON CONFLICT DO NOTHING;
+        GET DIAGNOSTICS inserted_count = ROW_COUNT;
+    EXCEPTION
+        WHEN OTHERS THEN
+            inserted_count := 0;
+    END;
+
+    RETURN inserted_count;
+END;
+$$ LANGUAGE plpgsql;
+
+CREATE OR REPLACE FUNCTION ensure_emotion_bootstrap()
+RETURNS VOID AS $$
+DECLARE
+    initialized JSONB;
+    baseline JSONB;
+BEGIN
+    initialized := COALESCE(get_config('emotion.initialized'), 'false'::jsonb);
+    IF initialized = 'true'::jsonb THEN
+        RETURN;
+    END IF;
+
+    baseline := COALESCE(get_config('emotion.baseline'), '{}'::jsonb);
+    PERFORM set_current_affective_state(jsonb_build_object(
+        'valence', COALESCE((baseline->>'valence')::float, 0.0),
+        'arousal', COALESCE((baseline->>'arousal')::float, 0.3),
+        'dominance', COALESCE((baseline->>'dominance')::float, 0.5),
+        'intensity', COALESCE((baseline->>'intensity')::float, 0.4),
+        'mood_valence', COALESCE((baseline->>'mood_valence')::float, 0.0),
+        'mood_arousal', COALESCE((baseline->>'mood_arousal')::float, 0.3),
+        'source', 'baseline'
+    ));
+
+    PERFORM initialize_innate_emotions();
+    PERFORM set_config('emotion.initialized', 'true'::jsonb);
+END;
+$$ LANGUAGE plpgsql;
+
+-- Attach emotional context to memories at insert time.
+CREATE OR REPLACE FUNCTION apply_emotional_context_to_memory()
+RETURNS TRIGGER AS $$
+DECLARE
+    meta JSONB;
+    context JSONB;
+    state JSONB;
+    valence FLOAT;
+    arousal FLOAT;
+    dominance FLOAT;
+    intensity FLOAT;
+    primary_emotion TEXT;
+    source TEXT;
+BEGIN
+    meta := COALESCE(NEW.metadata, '{}'::jsonb);
+    context := COALESCE(meta->'emotional_context', '{}'::jsonb);
+    state := get_current_affective_state();
+
+    BEGIN
+        valence := NULLIF(meta->>'emotional_valence', '')::float;
+    EXCEPTION
+        WHEN OTHERS THEN
+            valence := NULL;
+    END;
+    BEGIN
+        arousal := NULLIF(context->>'arousal', '')::float;
+    EXCEPTION
+        WHEN OTHERS THEN
+            arousal := NULL;
+    END;
+    BEGIN
+        dominance := NULLIF(context->>'dominance', '')::float;
+    EXCEPTION
+        WHEN OTHERS THEN
+            dominance := NULL;
+    END;
+    BEGIN
+        intensity := NULLIF(context->>'intensity', '')::float;
+    EXCEPTION
+        WHEN OTHERS THEN
+            intensity := NULL;
+    END;
+
+    valence := COALESCE(valence, NULLIF(context->>'valence', '')::float, (state->>'valence')::float, 0.0);
+    arousal := COALESCE(arousal, NULLIF(state->>'arousal', '')::float, 0.5);
+    dominance := COALESCE(dominance, NULLIF(state->>'dominance', '')::float, 0.5);
+    intensity := COALESCE(intensity, NULLIF(state->>'intensity', '')::float, 0.5);
+    primary_emotion := COALESCE(NULLIF(context->>'primary_emotion', ''), NULLIF(state->>'primary_emotion', ''), 'neutral');
+    source := COALESCE(NULLIF(context->>'source', ''), NULLIF(state->>'source', ''), 'derived');
+
+    valence := LEAST(1.0, GREATEST(-1.0, valence));
+    arousal := LEAST(1.0, GREATEST(0.0, arousal));
+    dominance := LEAST(1.0, GREATEST(0.0, dominance));
+    intensity := LEAST(1.0, GREATEST(0.0, intensity));
+
+    context := jsonb_build_object(
+        'valence', valence,
+        'arousal', arousal,
+        'dominance', dominance,
+        'primary_emotion', primary_emotion,
+        'intensity', intensity,
+        'source', source
+    );
+
+    NEW.metadata := meta || jsonb_build_object(
+        'emotional_context', context,
+        'emotional_valence', valence
+    );
+
+    RETURN NEW;
+END;
+$$ LANGUAGE plpgsql;
+
+DROP TRIGGER IF EXISTS memories_emotional_context_insert ON memories;
+CREATE TRIGGER memories_emotional_context_insert
+BEFORE INSERT ON memories
+FOR EACH ROW
+EXECUTE FUNCTION apply_emotional_context_to_memory();
 
 -- Extend gather_turn_context with emotional_state
 CREATE OR REPLACE FUNCTION gather_turn_context()
@@ -5551,6 +6179,7 @@ DECLARE
     prev_state JSONB;
     prev_valence FLOAT;
     prev_arousal FLOAT;
+    prev_dominance FLOAT;
     new_valence FLOAT;
     new_arousal FLOAT;
     primary_emotion TEXT;
@@ -5600,6 +6229,13 @@ BEGIN
 
     prev_valence := COALESCE(prev_valence, 0.0);
     prev_arousal := COALESCE(prev_arousal, 0.5);
+    BEGIN
+        prev_dominance := NULLIF(prev_state->>'dominance', '')::float;
+    EXCEPTION
+        WHEN OTHERS THEN
+            prev_dominance := NULL;
+    END;
+    prev_dominance := COALESCE(prev_dominance, 0.5);
 
     -- Decay toward baseline (neutral valence, mid arousal).
     new_valence := prev_valence * 0.8;
@@ -5688,13 +6324,16 @@ BEGIN
 
     -- Persist as short-term state for the next heartbeat.
     UPDATE heartbeat_state SET
-        affective_state = jsonb_build_object(
-            'valence', new_valence,
-            'arousal', new_arousal,
-            'primary_emotion', primary_emotion,
-            'intensity', intensity,
-            'updated_at', CURRENT_TIMESTAMP,
-            'source', CASE WHEN p_emotional_assessment IS NULL THEN 'derived' ELSE 'blended' END
+        affective_state = normalize_affective_state(
+            COALESCE(prev_state, '{}'::jsonb) || jsonb_build_object(
+                'valence', new_valence,
+                'arousal', new_arousal,
+                'dominance', prev_dominance,
+                'primary_emotion', primary_emotion,
+                'intensity', intensity,
+                'updated_at', CURRENT_TIMESTAMP,
+                'source', CASE WHEN p_emotional_assessment IS NULL THEN 'derived' ELSE 'blended' END
+            )
         )
     WHERE id = 1;
 
@@ -5728,6 +6367,8 @@ BEGIN
         goals_modified = p_goals_modified,
         narrative = narrative_text,
         emotional_valence = new_valence,
+        emotional_arousal = new_arousal,
+        emotional_primary_emotion = primary_emotion,
         memory_id = memory_id_created
     WHERE id = p_heartbeat_id;
 
@@ -5742,24 +6383,42 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
--- emotional_trend view - uses heartbeat_log since emotional_states was removed in Phase 8
--- Note: arousal and primary_emotion are approximated from valence since only emotional_valence is stored
+-- emotional_trend view - uses heartbeat_log (emotional_valence + arousal + primary emotion)
 CREATE OR REPLACE VIEW emotional_trend AS
+WITH base AS (
+    SELECT
+        date_trunc('hour', ended_at) as hour,
+        emotional_valence,
+        emotional_arousal,
+        emotional_primary_emotion
+    FROM heartbeat_log
+    WHERE ended_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'
+      AND emotional_valence IS NOT NULL
+)
 SELECT
-    date_trunc('hour', ended_at) as hour,
-    AVG(emotional_valence) as avg_valence,
-    0.5::float as avg_arousal,  -- Arousal not tracked in heartbeat_log; default to neutral
-    CASE  -- Approximate dominant emotion from average valence
-        WHEN AVG(emotional_valence) > 0.2 THEN 'content'
-        WHEN AVG(emotional_valence) < -0.2 THEN 'down'
-        ELSE 'neutral'
-    END as dominant_emotion,
+    base.hour,
+    AVG(base.emotional_valence) as avg_valence,
+    COALESCE(AVG(base.emotional_arousal), 0.5)::float as avg_arousal,
+    COALESCE(
+        (
+            SELECT b2.emotional_primary_emotion
+            FROM base b2
+            WHERE b2.hour = base.hour
+              AND b2.emotional_primary_emotion IS NOT NULL
+            GROUP BY b2.emotional_primary_emotion
+            ORDER BY COUNT(*) DESC
+            LIMIT 1
+        ),
+        CASE
+            WHEN AVG(base.emotional_valence) > 0.2 THEN 'content'
+            WHEN AVG(base.emotional_valence) < -0.2 THEN 'down'
+            ELSE 'neutral'
+        END
+    ) as dominant_emotion,
     COUNT(*) as state_changes
-FROM heartbeat_log
-WHERE ended_at > CURRENT_TIMESTAMP - INTERVAL '24 hours'
-  AND emotional_valence IS NOT NULL
-GROUP BY date_trunc('hour', ended_at)
-ORDER BY hour DESC;
+FROM base
+GROUP BY base.hour
+ORDER BY base.hour DESC;
 
 -- ============================================================================
 -- NEIGHBORHOOD RECOMPUTATION

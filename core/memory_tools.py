@@ -74,6 +74,40 @@ MEMORY_TOOLS = [
     {
         "type": "function",
         "function": {
+            "name": "sense_memory_availability",
+            "description": "Sense whether you likely have relevant memories before doing a full recall. Use this for a quick feeling-of-knowing check.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language query describing the topic."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
+            "name": "request_background_search",
+            "description": "Request a background search after a failed recall. This can surface memories later via spontaneous activation.",
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "Natural language query describing what you tried to recall."
+                    }
+                },
+                "required": ["query"]
+            }
+        }
+    },
+    {
+        "type": "function",
+        "function": {
             "name": "recall_recent",
             "description": "Retrieve the most recently accessed or created memories. Useful for continuing recent conversations or recalling what was just discussed.",
             "parameters": {
@@ -281,7 +315,17 @@ MEMORY_TOOLS = [
     }
 ]
 
-_API_TOOL_NAMES = {"recall", "recall_recent", "explore_concept", "get_procedures", "get_strategies", "create_goal", "queue_user_message"}
+_API_TOOL_NAMES = {
+    "recall",
+    "sense_memory_availability",
+    "request_background_search",
+    "recall_recent",
+    "explore_concept",
+    "get_procedures",
+    "get_strategies",
+    "create_goal",
+    "queue_user_message",
+}
 
 
 # ============================================================================
@@ -326,6 +370,8 @@ class MemoryToolHandler:
             'get_procedures': self._handle_get_procedures,
             'get_strategies': self._handle_get_strategies,
             'list_recent_episodes': self._handle_list_episodes,
+            'sense_memory_availability': self._handle_sense_memory_availability,
+            'request_background_search': self._handle_request_background_search,
         }
         
         handler = handlers.get(tool_name)
@@ -632,6 +678,8 @@ class ApiMemoryToolHandler:
 
         handlers = {
             "recall": self._handle_recall,
+            "sense_memory_availability": self._handle_sense_memory_availability,
+            "request_background_search": self._handle_request_background_search,
             "recall_recent": self._handle_recall_recent,
             "explore_concept": self._handle_explore_concept,
             "get_procedures": self._handle_get_procedures,
@@ -673,6 +721,20 @@ class ApiMemoryToolHandler:
             for m in result.memories
         ]
         return {"memories": memories, "count": len(memories), "query": query}
+
+    def _handle_sense_memory_availability(self, args: dict) -> dict:
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return {"error": "Missing query"}
+        payload = self.client.sense_memory_availability(query)
+        return payload if isinstance(payload, dict) else {"result": payload}
+
+    def _handle_request_background_search(self, args: dict) -> dict:
+        query = str(args.get("query", "")).strip()
+        if not query:
+            return {"error": "Missing query"}
+        activation_id = self.client.request_background_search(query)
+        return {"activation_id": str(activation_id) if activation_id else None}
 
     def _handle_recall_recent(self, args: dict) -> dict:
         limit = min(int(args.get("limit", 5)), 20)

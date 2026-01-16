@@ -20,6 +20,8 @@ async def execute_tool(
 ) -> dict[str, Any]:
     handlers = {
         "recall": _handle_recall,
+        "sense_memory_availability": _handle_sense_memory_availability,
+        "request_background_search": _handle_request_background_search,
         "recall_recent": _handle_recall_recent,
         "recall_episode": _handle_recall_episode,
         "explore_concept": _handle_explore_concept,
@@ -72,6 +74,21 @@ async def _handle_recall(args: dict[str, Any], mem_client: CognitiveMemory) -> d
         for m in result.memories
     ]
     return {"memories": memories, "count": len(memories), "query": query}
+
+
+async def _handle_sense_memory_availability(args: dict[str, Any], mem_client: CognitiveMemory) -> dict[str, Any]:
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return {"error": "Missing query"}
+    return await mem_client.sense_memory_availability(query)
+
+
+async def _handle_request_background_search(args: dict[str, Any], mem_client: CognitiveMemory) -> dict[str, Any]:
+    query = str(args.get("query", "")).strip()
+    if not query:
+        return {"error": "Missing query"}
+    activation_id = await mem_client.request_background_search(query)
+    return {"activation_id": str(activation_id) if activation_id else None}
 
 
 async def _handle_recall_recent(args: dict[str, Any], mem_client: CognitiveMemory) -> dict[str, Any]:
