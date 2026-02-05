@@ -1,0 +1,432 @@
+"""
+Hexis Channel System - Conversation Handler
+
+Routes inbound channel messages through the memory-enriched conversation
+pipeline and manages per-sender session state in the database.
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+from typing import Any, TYPE_CHECKING
+
+from .base import ChannelMessage, chunk_text
+
+if TYPE_CHECKING:
+    import asyncpg
+
+logger = logging.getLogger(__name__)
+
+# Maximum conversation turns to keep in session history
+MAX_SESSION_HISTORY = 40
+
+# Trim to this many when we exceed the max
+TRIM_TO_HISTORY = 30
+
+# Default energy cost per channel message (0 = free)
+DEFAULT_CHANNEL_ENERGY_COST = 0.0
+
+# Default rate limit (messages per sender per hour, None = unlimited)
+DEFAULT_RATE_LIMIT: int | None = None
+
+
+async def _check_channel_energy(
+    conn: asyncpg.Connection,
+    msg: ChannelMessage,
+) -> tuple[bool, float, str | None]:
+    """
+    Check if the agent has enough energy for a channel message and if the
+    sender is within rate limits.
+
+    Returns (allowed, cost, rejection_reason).
+    """
+    # Load per-channel energy cost
+    cost_raw = await conn.fetchval(
+        "SELECT value FROM config WHERE key = $1",
+        f"channel.{msg.channel_type}.energy_cost",
+    )
+    if cost_raw is not None:
+        try:
+            cost = float(json.loads(cost_raw) if isinstance(cost_raw, str) else cost_raw)
+        except (ValueError, TypeError):
+            cost = DEFAULT_CHANNEL_ENERGY_COST
+    else:
+        cost = DEFAULT_CHANNEL_ENERGY_COST
+
+    # Load energy multiplier
+    mult_raw = await conn.fetchval(
+        "SELECT value FROM config WHERE key = $1",
+        f"channel.{msg.channel_type}.energy_multiplier",
+    )
+    if mult_raw is not None:
+        try:
+            mult = float(json.loads(mult_raw) if isinstance(mult_raw, str) else mult_raw)
+        except (ValueError, TypeError):
+            mult = 1.0
+    else:
+        mult = 1.0
+
+    effective_cost = cost * mult
+
+    # Check rate limit
+    rate_limit_raw = await conn.fetchval(
+        "SELECT value FROM config WHERE key = $1",
+        f"channel.{msg.channel_type}.rate_limit.max_per_sender_per_hour",
+    )
+    rate_limit = DEFAULT_RATE_LIMIT
+    if rate_limit_raw is not None:
+        try:
+            rate_limit = int(json.loads(rate_limit_raw) if isinstance(rate_limit_raw, str) else rate_limit_raw)
+        except (ValueError, TypeError):
+            pass
+
+    if rate_limit is not None:
+        # Count recent messages from this sender
+        count = await conn.fetchval(
+            """
+            SELECT COUNT(*) FROM channel_messages cm
+            JOIN channel_sessions cs ON cm.session_id = cs.id
+            WHERE cs.sender_id = $1 AND cs.channel_type = $2
+              AND cm.direction = 'inbound'
+              AND cm.created_at > CURRENT_TIMESTAMP - INTERVAL '1 hour'
+            """,
+            msg.sender_id,
+            msg.channel_type,
+        )
+        if count and count >= rate_limit:
+            return False, effective_cost, "Rate limit exceeded. Please try again later."
+
+    # Check energy (skip if cost is 0)
+    if effective_cost > 0:
+        updated = await conn.fetchval(
+            """
+            UPDATE heartbeat_state
+            SET current_energy = current_energy - $1
+            WHERE current_energy >= $1
+            RETURNING current_energy
+            """,
+            effective_cost,
+        )
+        if updated is None:
+            return False, effective_cost, "I need to rest and recharge before I can respond. Please try again later."
+
+    return True, effective_cost, None
+
+
+async def _get_or_create_session(
+    conn: asyncpg.Connection,
+    msg: ChannelMessage,
+) -> tuple[str, list[dict[str, Any]]]:
+    """
+    Load or create a channel session for this sender.
+
+    Returns (session_id, history).
+    """
+    row = await conn.fetchrow(
+        """
+        SELECT id, history FROM channel_sessions
+        WHERE channel_type = $1 AND channel_id = $2 AND sender_id = $3
+        """,
+        msg.channel_type,
+        msg.channel_id,
+        msg.sender_id,
+    )
+
+    if row:
+        session_id = str(row["id"])
+        raw_history = row["history"]
+        if isinstance(raw_history, str):
+            history = json.loads(raw_history)
+        elif isinstance(raw_history, list):
+            history = raw_history
+        else:
+            history = []
+        return session_id, history
+
+    # Create new session
+    session_id = await conn.fetchval(
+        """
+        INSERT INTO channel_sessions (channel_type, channel_id, sender_id, sender_name, history)
+        VALUES ($1, $2, $3, $4, '[]'::jsonb)
+        RETURNING id::text
+        """,
+        msg.channel_type,
+        msg.channel_id,
+        msg.sender_id,
+        msg.sender_name,
+    )
+    return str(session_id), []
+
+
+async def _update_session(
+    conn: asyncpg.Connection,
+    session_id: str,
+    history: list[dict[str, Any]],
+) -> None:
+    """Update session history and last_active timestamp."""
+    # Trim history if too long (keep recent turns)
+    if len(history) > MAX_SESSION_HISTORY:
+        history = history[-TRIM_TO_HISTORY:]
+
+    await conn.execute(
+        """
+        UPDATE channel_sessions
+        SET history = $2::jsonb, last_active = CURRENT_TIMESTAMP
+        WHERE id = $1::uuid
+        """,
+        session_id,
+        json.dumps(history),
+    )
+
+
+async def _log_message(
+    conn: asyncpg.Connection,
+    session_id: str,
+    direction: str,
+    content: str,
+    platform_message_id: str | None = None,
+    metadata: dict[str, Any] | None = None,
+) -> None:
+    """Log a message to channel_messages for audit."""
+    await conn.execute(
+        """
+        INSERT INTO channel_messages (session_id, direction, content, platform_message_id, metadata)
+        VALUES ($1::uuid, $2, $3, $4, $5::jsonb)
+        """,
+        session_id,
+        direction,
+        content,
+        platform_message_id,
+        json.dumps(metadata or {}),
+    )
+
+
+async def process_channel_message(
+    msg: ChannelMessage,
+    pool: asyncpg.Pool,
+    *,
+    max_message_length: int = 4000,
+) -> list[str]:
+    """
+    Process an inbound channel message through the conversation pipeline.
+
+    1. Load/create session (conversation history per sender)
+    2. Delegate to services.chat.chat_turn() for enrichment + LLM + tools + memory
+    3. Update session with new history
+    4. Log messages for audit
+    5. Chunk response for channel limits
+
+    Args:
+        msg: Normalized channel message.
+        pool: Database connection pool.
+        max_message_length: Channel's max message length for chunking.
+
+    Returns:
+        List of response text chunks to send back.
+    """
+    from core.agent_api import db_dsn_from_env
+    from core.llm_config import load_llm_config
+
+    try:
+        async with pool.acquire() as conn:
+            # Check energy budget and rate limits
+            allowed, cost, rejection = await _check_channel_energy(conn, msg)
+            if not allowed:
+                return [rejection or "I can't respond right now."]
+
+            # Load session
+            session_id, history = await _get_or_create_session(conn, msg)
+
+            # Log inbound message
+            await _log_message(
+                conn,
+                session_id,
+                "inbound",
+                msg.content,
+                platform_message_id=msg.message_id,
+                metadata={
+                    "channel_type": msg.channel_type,
+                    "sender_name": msg.sender_name,
+                },
+            )
+
+            # Load LLM config from DB
+            llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm.heartbeat")
+
+        # Build DSN for chat_turn (it manages its own connections)
+        dsn = db_dsn_from_env()
+
+        # Inject attachment context so the LLM knows about media
+        user_content = msg.content
+        if msg.attachments:
+            from .media import Attachment
+            descs = []
+            for att in msg.attachments:
+                if isinstance(att, Attachment):
+                    descs.append(att.describe())
+                elif isinstance(att, dict):
+                    descs.append(str(att.get("filename") or att.get("url", "attachment")))
+            if descs:
+                attachment_note = "[User attached: " + "; ".join(descs) + "]"
+                user_content = f"{attachment_note}\n\n{user_content}" if user_content else attachment_note
+
+        # Run the conversation turn
+        from services.chat import chat_turn
+
+        result = await chat_turn(
+            user_message=user_content,
+            history=history,
+            llm_config=llm_config,
+            dsn=dsn,
+            session_id=f"channel:{msg.channel_type}:{msg.channel_id}:{msg.sender_id}",
+            pool=pool,
+        )
+
+        assistant_text = result.get("assistant", "")
+        new_history = result.get("history", [])
+
+        async with pool.acquire() as conn:
+            # Update session with new history
+            await _update_session(conn, session_id, new_history)
+
+            # Log outbound message
+            await _log_message(
+                conn,
+                session_id,
+                "outbound",
+                assistant_text,
+                metadata={"channel_type": msg.channel_type},
+            )
+
+        # Chunk for channel limits
+        if not assistant_text:
+            return ["I processed your message but have no response to give."]
+
+        return chunk_text(assistant_text, max_message_length)
+
+    except Exception:
+        logger.exception("Error processing channel message from %s/%s", msg.channel_type, msg.sender_id)
+        return ["Sorry, I encountered an error processing your message. Please try again."]
+
+
+async def stream_channel_message(
+    msg: ChannelMessage,
+    pool: asyncpg.Pool,
+    adapter: Any,
+) -> str | None:
+    """
+    Process an inbound channel message with streaming edit-in-place delivery.
+
+    Uses StreamCoalescer to progressively edit a message as tokens arrive.
+    Falls back to process_channel_message() if streaming fails.
+
+    Args:
+        msg: Normalized channel message.
+        pool: Database connection pool.
+        adapter: The channel adapter (must support edit_message).
+
+    Returns:
+        The platform message ID of the final response, or None.
+    """
+    from channels.streaming import StreamCoalescer
+    from core.agent_api import db_dsn_from_env
+    from core.llm_config import load_llm_config
+    from services.chat import stream_chat_turn
+
+    try:
+        async with pool.acquire() as conn:
+            # Check energy budget and rate limits
+            allowed, cost, rejection = await _check_channel_energy(conn, msg)
+            if not allowed:
+                await adapter.send(msg.channel_id, rejection or "I can't respond right now.", reply_to=msg.message_id)
+                return None
+
+            session_id, history = await _get_or_create_session(conn, msg)
+            await _log_message(
+                conn,
+                session_id,
+                "inbound",
+                msg.content,
+                platform_message_id=msg.message_id,
+                metadata={
+                    "channel_type": msg.channel_type,
+                    "sender_name": msg.sender_name,
+                },
+            )
+            llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm.heartbeat")
+
+        dsn = db_dsn_from_env()
+
+        # Inject attachment context
+        user_content = msg.content
+        if msg.attachments:
+            from .media import Attachment
+            descs = []
+            for att in msg.attachments:
+                if isinstance(att, Attachment):
+                    descs.append(att.describe())
+                elif isinstance(att, dict):
+                    descs.append(str(att.get("filename") or att.get("url", "attachment")))
+            if descs:
+                attachment_note = "[User attached: " + "; ".join(descs) + "]"
+                user_content = f"{attachment_note}\n\n{user_content}" if user_content else attachment_note
+
+        coalescer = StreamCoalescer(
+            adapter,
+            msg.channel_id,
+            reply_to=msg.message_id,
+            thread_id=msg.thread_id,
+        )
+
+        collected: list[str] = []
+        async for token in stream_chat_turn(
+            user_message=user_content,
+            history=history,
+            llm_config=llm_config,
+            dsn=dsn,
+            session_id=f"channel:{msg.channel_type}:{msg.channel_id}:{msg.sender_id}",
+            pool=pool,
+        ):
+            collected.append(token)
+            await coalescer.push(token)
+
+        message_id = await coalescer.flush()
+        assistant_text = "".join(collected)
+
+        # Update session and log
+        new_history = list(history)
+        new_history.append({"role": "user", "content": user_content})
+        new_history.append({"role": "assistant", "content": assistant_text})
+
+        async with pool.acquire() as conn:
+            await _update_session(conn, session_id, new_history)
+            await _log_message(
+                conn,
+                session_id,
+                "outbound",
+                assistant_text,
+                platform_message_id=message_id,
+                metadata={"channel_type": msg.channel_type, "streamed": True},
+            )
+
+        return message_id
+
+    except Exception:
+        logger.exception("Streaming failed for %s/%s, falling back to chunked", msg.channel_type, msg.sender_id)
+        # Fall back to non-streaming
+        chunks = await process_channel_message(
+            msg, pool, max_message_length=adapter.capabilities.max_message_length,
+        )
+        reply_to = msg.message_id
+        for i, chunk in enumerate(chunks):
+            try:
+                await adapter.send(
+                    msg.channel_id,
+                    chunk,
+                    reply_to=reply_to if i == 0 else None,
+                    thread_id=msg.thread_id,
+                )
+            except Exception:
+                break
+        return None

@@ -65,12 +65,6 @@ def test_anthropic_tools_conversion():
     assert out == [{"name": "recall", "description": "desc", "input_schema": {"type": "object"}}]
 
 
-def test_chunk_text():
-    assert llm._chunk_text("") == []  # noqa: SLF001
-    chunks = llm._chunk_text("abcd", chunk_size=2)  # noqa: SLF001
-    assert chunks == ["ab", "cd"]
-
-
 @pytest.mark.asyncio(loop_scope="session")
 async def test_chat_completion_unsupported_provider():
     with pytest.raises(ValueError):

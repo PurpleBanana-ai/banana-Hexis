@@ -147,10 +147,80 @@ services:
       - private
       - public
 
+  channel_worker:
+    build:
+      context: .
+      dockerfile: ops/Dockerfile.channels
+    container_name: hexis_channel_worker
+    profiles:
+      - active
+    command: ["hexis-channels"]
+    depends_on:
+      db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    environment:
+      POSTGRES_HOST: db
+      POSTGRES_PORT: 5432
+      POSTGRES_DB: ${POSTGRES_DB:-hexis_memory}
+      POSTGRES_USER: ${POSTGRES_USER:-hexis_user}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hexis_password}
+      EMBEDDING_MODEL_ID: ${EMBEDDING_MODEL_ID:-unsloth/embeddinggemma-300m}
+      EMBEDDING_DIMENSION: ${EMBEDDING_DIMENSION:-768}
+      RABBITMQ_MANAGEMENT_URL: http://rabbitmq:15672
+      RABBITMQ_USER: ${RABBITMQ_DEFAULT_USER:-hexis}
+      RABBITMQ_PASSWORD: ${RABBITMQ_DEFAULT_PASS:-hexis_password}
+      DISCORD_BOT_TOKEN: ${DISCORD_BOT_TOKEN:-}
+      TELEGRAM_BOT_TOKEN: ${TELEGRAM_BOT_TOKEN:-}
+      SLACK_BOT_TOKEN: ${SLACK_BOT_TOKEN:-}
+      SLACK_APP_TOKEN: ${SLACK_APP_TOKEN:-}
+      SIGNAL_PHONE_NUMBER: ${SIGNAL_PHONE_NUMBER:-}
+      SIGNAL_API_URL: ${SIGNAL_API_URL:-http://signal-cli:8080}
+      WHATSAPP_ACCESS_TOKEN: ${WHATSAPP_ACCESS_TOKEN:-}
+      WHATSAPP_PHONE_NUMBER_ID: ${WHATSAPP_PHONE_NUMBER_ID:-}
+      WHATSAPP_VERIFY_TOKEN: ${WHATSAPP_VERIFY_TOKEN:-hexis_verify}
+      IMESSAGE_API_URL: ${IMESSAGE_API_URL:-}
+      IMESSAGE_PASSWORD: ${IMESSAGE_PASSWORD:-}
+      MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-}
+      MATRIX_ACCESS_TOKEN: ${MATRIX_ACCESS_TOKEN:-}
+      MATRIX_USER_ID: ${MATRIX_USER_ID:-}
+    networks:
+      - private
+      - public
+
+  signal-cli:
+    image: bbernhard/signal-cli-rest-api:latest
+    container_name: hexis_signal_cli
+    profiles:
+      - signal
+    environment:
+      MODE: native
+    volumes:
+      - signal_data:/home/.local/share/signal-cli
+    expose:
+      - "8080"
+    networks:
+      - private
+
+  browser:
+    image: ghcr.io/browserless/chromium:latest
+    container_name: hexis_browser
+    profiles:
+      - browser
+    ports:
+      - "${HEXIS_BIND_ADDRESS:-127.0.0.1}:${BROWSER_CDP_PORT:-9222}:3000"
+    environment:
+      TIMEOUT: 60000
+      CONCURRENT: 5
+    networks:
+      - private
+
 volumes:
   postgres_data:
   embeddings_cache:
   rabbitmq_data:
+  signal_data:
 
 networks:
   private:

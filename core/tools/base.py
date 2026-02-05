@@ -27,6 +27,8 @@ class ToolCategory(str, Enum):
     WEB = "web"  # Web search, fetch
     FILESYSTEM = "filesystem"  # File read, write, glob, grep
     SHELL = "shell"  # Command execution
+    CODE = "code"  # Code execution (sandboxed REPL)
+    BROWSER = "browser"  # Browser automation (Playwright/CDP)
     CALENDAR = "calendar"  # Calendar integrations
     EMAIL = "email"  # Email sending
     MESSAGING = "messaging"  # Discord, Slack, Telegram
@@ -98,6 +100,7 @@ class ToolSpec:
     requires_approval: bool = False
     is_read_only: bool = True
     supports_parallel: bool = True
+    optional: bool = False  # Requires explicit allowlist inclusion
     allowed_contexts: set[ToolContext] = field(
         default_factory=lambda: {ToolContext.HEARTBEAT, ToolContext.CHAT, ToolContext.MCP}
     )

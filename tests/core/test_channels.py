@@ -1,0 +1,555 @@
+"""
+Tests for the Hexis Channel System.
+
+Covers:
+- ChannelMessage, ChannelCapabilities, chunk_text (base types)
+- ChannelManager (routing, lifecycle)
+- Discord adapter (normalization, allowlists, chunking)
+- Telegram adapter (normalization, allowlists)
+- Conversation handler (session management, message logging)
+- Hook event registration
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+from datetime import datetime, timezone
+from typing import Any
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+pytestmark = [pytest.mark.asyncio(loop_scope="session")]
+
+
+# ============================================================================
+# Base Types
+# ============================================================================
+
+
+class TestChannelMessage:
+    def test_defaults(self):
+        from channels.base import ChannelMessage
+
+        msg = ChannelMessage(
+            channel_type="discord",
+            channel_id="123",
+            sender_id="456",
+            sender_name="TestUser",
+            content="Hello",
+            message_id="789",
+        )
+        assert msg.channel_type == "discord"
+        assert msg.content == "Hello"
+        assert msg.reply_to_id is None
+        assert msg.thread_id is None
+        assert msg.attachments == []
+        assert msg.metadata == {}
+        assert isinstance(msg.timestamp, datetime)
+
+    def test_full_fields(self):
+        from channels.base import ChannelMessage
+
+        ts = datetime(2025, 1, 1, tzinfo=timezone.utc)
+        msg = ChannelMessage(
+            channel_type="telegram",
+            channel_id="chat-1",
+            sender_id="user-1",
+            sender_name="Alice",
+            content="Hello World",
+            message_id="msg-1",
+            reply_to_id="msg-0",
+            thread_id="thread-1",
+            attachments=[{"type": "image", "url": "http://example.com/img.png"}],
+            metadata={"is_private": True},
+            timestamp=ts,
+        )
+        assert msg.reply_to_id == "msg-0"
+        assert msg.thread_id == "thread-1"
+        assert len(msg.attachments) == 1
+        assert msg.metadata["is_private"] is True
+        assert msg.timestamp == ts
+
+
+class TestChannelCapabilities:
+    def test_defaults(self):
+        from channels.base import ChannelCapabilities
+
+        caps = ChannelCapabilities()
+        assert caps.threads is False
+        assert caps.reactions is False
+        assert caps.media is False
+        assert caps.typing_indicator is False
+        assert caps.edit_message is False
+        assert caps.max_message_length == 4000
+
+    def test_discord_capabilities(self):
+        from channels.base import ChannelCapabilities
+
+        caps = ChannelCapabilities(
+            threads=True,
+            reactions=True,
+            media=True,
+            typing_indicator=True,
+            edit_message=True,
+            max_message_length=2000,
+        )
+        assert caps.threads is True
+        assert caps.max_message_length == 2000
+
+
+class TestChunkText:
+    def test_short_text_no_chunk(self):
+        from channels.base import chunk_text
+
+        result = chunk_text("Hello", 100)
+        assert result == ["Hello"]
+
+    def test_exact_limit(self):
+        from channels.base import chunk_text
+
+        text = "x" * 100
+        result = chunk_text(text, 100)
+        assert result == [text]
+
+    def test_paragraph_split(self):
+        from channels.base import chunk_text
+
+        text = "First paragraph.\n\nSecond paragraph."
+        result = chunk_text(text, 25)
+        assert len(result) == 2
+        assert result[0] == "First paragraph."
+        assert result[1] == "Second paragraph."
+
+    def test_newline_split(self):
+        from channels.base import chunk_text
+
+        text = "Line one.\nLine two.\nLine three."
+        result = chunk_text(text, 20)
+        assert len(result) >= 2
+
+    def test_sentence_split(self):
+        from channels.base import chunk_text
+
+        text = "First sentence. Second sentence. Third sentence."
+        result = chunk_text(text, 30)
+        assert len(result) >= 2
+
+    def test_hard_split(self):
+        from channels.base import chunk_text
+
+        text = "x" * 200
+        result = chunk_text(text, 100)
+        assert len(result) == 2
+        assert len(result[0]) == 100
+        assert len(result[1]) == 100
+
+    def test_empty_text(self):
+        from channels.base import chunk_text
+
+        result = chunk_text("", 100)
+        assert result == [""]
+
+
+# ============================================================================
+# Channel Manager
+# ============================================================================
+
+
+class _MockAdapter:
+    """A mock adapter for testing the ChannelManager."""
+
+    def __init__(self, ctype: str = "mock"):
+        self._ctype = ctype
+        self._connected = False
+        self._on_message = None
+        self._sent_messages: list[dict] = []
+        self._typing_channels: list[str] = []
+        self.start_called = False
+        self.stop_called = False
+
+    @property
+    def channel_type(self) -> str:
+        return self._ctype
+
+    @property
+    def capabilities(self):
+        from channels.base import ChannelCapabilities
+        return ChannelCapabilities(
+            typing_indicator=True,
+            max_message_length=2000,
+        )
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    async def start(self, on_message):
+        self.start_called = True
+        self._on_message = on_message
+        self._connected = True
+        # Don't block - just mark as started
+        # In real adapters, this would block
+
+    async def stop(self):
+        self.stop_called = True
+        self._connected = False
+
+    async def send(self, channel_id, text, *, reply_to=None, thread_id=None):
+        self._sent_messages.append({
+            "channel_id": channel_id,
+            "text": text,
+            "reply_to": reply_to,
+            "thread_id": thread_id,
+        })
+        return "sent-msg-1"
+
+    async def send_typing(self, channel_id):
+        self._typing_channels.append(channel_id)
+
+
+class TestChannelManager:
+    def test_register_adapter(self):
+        from channels.manager import ChannelManager
+
+        manager = ChannelManager(pool=MagicMock())
+        adapter = _MockAdapter("test-channel")
+        manager.register(adapter)
+
+        assert "test-channel" in manager.adapters
+        assert manager.adapters["test-channel"] is adapter
+
+    def test_register_duplicate_replaces(self):
+        from channels.manager import ChannelManager
+
+        manager = ChannelManager(pool=MagicMock())
+        adapter1 = _MockAdapter("test")
+        adapter2 = _MockAdapter("test")
+        manager.register(adapter1)
+        manager.register(adapter2)
+
+        assert manager.adapters["test"] is adapter2
+
+    async def test_send_routes_to_adapter(self):
+        from channels.manager import ChannelManager
+
+        manager = ChannelManager(pool=MagicMock())
+        adapter = _MockAdapter("test")
+        manager.register(adapter)
+
+        result = await manager.send("test", "channel-1", "Hello!")
+        assert result == "sent-msg-1"
+        assert len(adapter._sent_messages) == 1
+        assert adapter._sent_messages[0]["text"] == "Hello!"
+
+    async def test_send_unknown_channel_returns_none(self):
+        from channels.manager import ChannelManager
+
+        manager = ChannelManager(pool=MagicMock())
+        result = await manager.send("nonexistent", "ch-1", "Hello!")
+        assert result is None
+
+    def test_status(self):
+        from channels.manager import ChannelManager
+
+        manager = ChannelManager(pool=MagicMock())
+        adapter = _MockAdapter("discord")
+        manager.register(adapter)
+
+        status = manager.status()
+        assert len(status) == 1
+        assert status[0]["channel_type"] == "discord"
+        assert status[0]["connected"] is False
+        assert status[0]["capabilities"]["max_message_length"] == 2000
+
+
+# ============================================================================
+# Discord Adapter
+# ============================================================================
+
+
+class TestDiscordAdapter:
+    def test_channel_type(self):
+        from channels.discord_adapter import DiscordAdapter
+
+        adapter = DiscordAdapter()
+        assert adapter.channel_type == "discord"
+
+    def test_capabilities(self):
+        from channels.discord_adapter import DiscordAdapter
+
+        adapter = DiscordAdapter()
+        caps = adapter.capabilities
+        assert caps.threads is True
+        assert caps.reactions is True
+        assert caps.media is True
+        assert caps.typing_indicator is True
+        assert caps.max_message_length == 2000
+
+    def test_parse_allowlist_star(self):
+        from channels.discord_adapter import DiscordAdapter
+
+        assert DiscordAdapter._parse_allowlist("*") is None
+        assert DiscordAdapter._parse_allowlist(None) is None
+
+    def test_parse_allowlist_json(self):
+        from channels.discord_adapter import DiscordAdapter
+
+        result = DiscordAdapter._parse_allowlist('["123", "456"]')
+        assert result == {"123", "456"}
+
+    def test_parse_allowlist_list(self):
+        from channels.discord_adapter import DiscordAdapter
+
+        result = DiscordAdapter._parse_allowlist([123, 456])
+        assert result == {"123", "456"}
+
+    def test_parse_allowlist_single(self):
+        from channels.discord_adapter import DiscordAdapter
+
+        result = DiscordAdapter._parse_allowlist("not-json")
+        assert result == {"not-json"}
+
+    def test_not_connected_by_default(self):
+        from channels.discord_adapter import DiscordAdapter
+
+        adapter = DiscordAdapter()
+        assert adapter.is_connected is False
+
+    def test_token_resolution_env(self, monkeypatch):
+        from channels.discord_adapter import _resolve_token
+
+        monkeypatch.setenv("MY_TOKEN", "bot-token-value")
+        result = _resolve_token({"bot_token": "MY_TOKEN"})
+        assert result == "bot-token-value"
+
+    def test_token_resolution_missing(self, monkeypatch):
+        from channels.discord_adapter import _resolve_token
+
+        monkeypatch.delenv("DISCORD_BOT_TOKEN", raising=False)
+        result = _resolve_token({})
+        assert result is None
+
+
+# ============================================================================
+# Telegram Adapter
+# ============================================================================
+
+
+class TestTelegramAdapter:
+    def test_channel_type(self):
+        from channels.telegram_adapter import TelegramAdapter
+
+        adapter = TelegramAdapter()
+        assert adapter.channel_type == "telegram"
+
+    def test_capabilities(self):
+        from channels.telegram_adapter import TelegramAdapter
+
+        adapter = TelegramAdapter()
+        caps = adapter.capabilities
+        assert caps.threads is False
+        assert caps.reactions is True
+        assert caps.media is True
+        assert caps.typing_indicator is True
+        assert caps.max_message_length == 4096
+
+    def test_parse_allowlist(self):
+        from channels.telegram_adapter import TelegramAdapter
+
+        assert TelegramAdapter._parse_allowlist("*") is None
+        assert TelegramAdapter._parse_allowlist(["-100123"]) == {"-100123"}
+
+    def test_not_connected_by_default(self):
+        from channels.telegram_adapter import TelegramAdapter
+
+        adapter = TelegramAdapter()
+        assert adapter.is_connected is False
+
+    def test_token_resolution_env(self, monkeypatch):
+        from channels.telegram_adapter import _resolve_token
+
+        monkeypatch.setenv("MY_TG_TOKEN", "123:ABC-def")
+        result = _resolve_token({"bot_token": "MY_TG_TOKEN"})
+        assert result == "123:ABC-def"
+
+    def test_token_resolution_missing(self, monkeypatch):
+        from channels.telegram_adapter import _resolve_token
+
+        monkeypatch.delenv("TELEGRAM_BOT_TOKEN", raising=False)
+        result = _resolve_token({})
+        assert result is None
+
+
+# ============================================================================
+# Conversation Handler (DB integration)
+# ============================================================================
+
+
+class TestChannelConversation:
+    """Integration tests for channel conversation session management."""
+
+    _TEST_PREFIX = "test_ch_conv_"
+
+    async def _cleanup(self, conn, sender_id: str):
+        """Delete test data by sender_id."""
+        session_ids = await conn.fetch(
+            "SELECT id FROM channel_sessions WHERE sender_id = $1", sender_id,
+        )
+        for row in session_ids:
+            await conn.execute("DELETE FROM channel_messages WHERE session_id = $1", row["id"])
+        await conn.execute("DELETE FROM channel_sessions WHERE sender_id = $1", sender_id)
+
+    async def test_session_creation(self, db_pool):
+        """Test that a session is created for a new sender."""
+        from channels.conversation import _get_or_create_session
+        from channels.base import ChannelMessage
+
+        sender_id = f"{self._TEST_PREFIX}create_{id(self)}"
+        msg = ChannelMessage(
+            channel_type="test",
+            channel_id="test-channel-1",
+            sender_id=sender_id,
+            sender_name="TestBot",
+            content="Hello",
+            message_id="test-msg-1",
+        )
+
+        async with db_pool.acquire() as conn:
+            try:
+                session_id, history = await _get_or_create_session(conn, msg)
+                assert session_id is not None
+                assert history == []
+
+                # Second call returns same session
+                session_id2, _ = await _get_or_create_session(conn, msg)
+                assert session_id2 == session_id
+            finally:
+                await self._cleanup(conn, sender_id)
+
+    async def test_session_history_update(self, db_pool):
+        """Test session history is stored and retrieved."""
+        from channels.conversation import _get_or_create_session, _update_session
+        from channels.base import ChannelMessage
+
+        sender_id = f"{self._TEST_PREFIX}hist_{id(self)}"
+        msg = ChannelMessage(
+            channel_type="test",
+            channel_id="test-channel-2",
+            sender_id=sender_id,
+            sender_name="TestBot",
+            content="Hello",
+            message_id="test-msg-2",
+        )
+
+        async with db_pool.acquire() as conn:
+            try:
+                session_id, _ = await _get_or_create_session(conn, msg)
+
+                history = [
+                    {"role": "user", "content": "Hello"},
+                    {"role": "assistant", "content": "Hi there!"},
+                ]
+                await _update_session(conn, session_id, history)
+
+                _, retrieved = await _get_or_create_session(conn, msg)
+                assert len(retrieved) == 2
+                assert retrieved[0]["role"] == "user"
+                assert retrieved[1]["content"] == "Hi there!"
+            finally:
+                await self._cleanup(conn, sender_id)
+
+    async def test_message_logging(self, db_pool):
+        """Test that messages are logged to channel_messages."""
+        from channels.conversation import _get_or_create_session, _log_message
+        from channels.base import ChannelMessage
+
+        sender_id = f"{self._TEST_PREFIX}log_{id(self)}"
+        msg = ChannelMessage(
+            channel_type="test",
+            channel_id="test-channel-3",
+            sender_id=sender_id,
+            sender_name="TestBot",
+            content="Hello",
+            message_id="test-msg-3",
+        )
+
+        async with db_pool.acquire() as conn:
+            try:
+                session_id, _ = await _get_or_create_session(conn, msg)
+
+                await _log_message(conn, session_id, "inbound", "Hello", platform_message_id="test-msg-3")
+                await _log_message(conn, session_id, "outbound", "Hi there!")
+
+                count = await conn.fetchval(
+                    "SELECT COUNT(*) FROM channel_messages WHERE session_id = $1::uuid",
+                    session_id,
+                )
+                assert count == 2
+            finally:
+                await self._cleanup(conn, sender_id)
+
+
+# ============================================================================
+# Hook Event
+# ============================================================================
+
+
+class TestChannelHookEvent:
+    def test_channel_message_received_event(self):
+        from core.tools.hooks import HookEvent
+
+        assert HookEvent.CHANNEL_MESSAGE_RECEIVED == "channel_message_received"
+
+    async def test_hook_fires_for_channel_event(self):
+        from core.tools.hooks import HookEvent, HookContext, HookOutcome, HookRegistry
+
+        registry = HookRegistry()
+        received = []
+
+        async def on_channel_msg(ctx: HookContext):
+            received.append(ctx)
+            return HookOutcome.passthrough()
+
+        registry.register_function(
+            HookEvent.CHANNEL_MESSAGE_RECEIVED,
+            on_channel_msg,
+            source="test",
+        )
+
+        ctx = HookContext(
+            event=HookEvent.CHANNEL_MESSAGE_RECEIVED,
+            metadata={"channel_type": "discord", "sender": "user-1"},
+        )
+        await registry.run(HookEvent.CHANNEL_MESSAGE_RECEIVED, ctx)
+        assert len(received) == 1
+        assert received[0].metadata["channel_type"] == "discord"
+
+
+# ============================================================================
+# Channel Worker Config Loading
+# ============================================================================
+
+
+class TestChannelWorkerConfig:
+    async def test_load_channel_config(self, db_pool):
+        """Test loading channel config from DB."""
+        from services.channel_worker import _load_channel_config
+
+        async with db_pool.acquire() as conn:
+            try:
+                # Insert a test config value via set_config(key, jsonb)
+                await conn.execute(
+                    "SELECT set_config($1, $2::jsonb)",
+                    "channel.test.bot_token",
+                    '"MY_TEST_TOKEN"',
+                )
+
+                config = await _load_channel_config(conn, "test")
+                assert config.get("bot_token") == "MY_TEST_TOKEN"
+            finally:
+                await conn.execute(
+                    "DELETE FROM config WHERE key = $1",
+                    "channel.test.bot_token",
+                )

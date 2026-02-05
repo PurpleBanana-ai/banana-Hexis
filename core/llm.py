@@ -211,22 +211,15 @@ async def stream_text_completion(
             raise RuntimeError("anthropic package is required for Anthropic provider.")
         client = anthropic.AsyncAnthropic(api_key=api_key)
         system_prompt, rest = _extract_system_prompt(messages)
-        response = await client.messages.create(
+        async with client.messages.stream(
             model=model,
             system=system_prompt or None,
             messages=rest,
             max_tokens=max_tokens,
             temperature=temperature,
-        )
-        text = "".join(block.text for block in response.content if block.type == "text")
-        for chunk in _chunk_text(text):
-            yield chunk
+        ) as stream:
+            async for text in stream.text_stream:
+                yield text
         return
 
     raise ValueError(f"Unsupported provider: {provider}")
-
-
-def _chunk_text(text: str, *, chunk_size: int = 120) -> list[str]:
-    if not text:
-        return []
-    return [text[i : i + chunk_size] for i in range(0, len(text), chunk_size)]

@@ -28,10 +28,18 @@ dependencies = [
 hexis = "apps.hexis_cli:main"
 hexis-worker = "apps.worker:main"
 hexis-mcp = "apps.hexis_mcp_server:main"
+hexis-channels = "services.channel_worker:main"
 
 [project.optional-dependencies]
 anthropic = [
   "anthropic>=0.18.0",
+]
+channels = [
+  "discord.py>=2.3.0",
+  "python-telegram-bot>=21.0",
+  "slack-bolt>=1.18.0",
+  "slack-sdk>=3.27.0",
+  "matrix-nio>=0.24.0",
 ]
 dev = [
   "pytest>=7.4.3",
@@ -51,7 +59,7 @@ include-package-data = true
 
 [tool.setuptools.packages.find]
 where = ["."]
-include = ["apps*", "core*", "services*"]
+include = ["apps*", "core*", "services*", "channels*", "plugins*", "skills*"]
 
 [tool.setuptools.package-data]
 services = ["prompts/*.md"]

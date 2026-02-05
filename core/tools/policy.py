@@ -113,6 +113,12 @@ class ToolPolicy:
                 f"Tool '{spec.name}' is disabled",
                 ToolErrorType.DISABLED,
             )
+        # Optional tools require explicit allowlist inclusion
+        if spec.optional and not config.is_optional_allowed(spec.name, spec.category):
+            return PolicyCheckResult.deny(
+                f"Optional tool '{spec.name}' not in allowlist",
+                ToolErrorType.DISABLED,
+            )
         return PolicyCheckResult.allow()
 
     def _check_context(

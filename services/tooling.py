@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import warnings
 from datetime import datetime
 from typing import Any
 from uuid import UUID
@@ -7,8 +8,14 @@ from uuid import UUID
 from core.cognitive_memory_api import CognitiveMemory, GoalPriority, GoalSource, MemoryType
 from core.memory_tools import MEMORY_TOOLS
 
+_DEPRECATION_MSG = (
+    "services.tooling is deprecated. Use core.tools.ToolRegistry via "
+    "create_default_registry(pool) instead. This module will be removed in a future release."
+)
+
 
 def get_tool_definitions(allowed: list[str] | None = None) -> list[dict[str, Any]]:
+    warnings.warn(_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
     if allowed is None:
         return MEMORY_TOOLS
     allowed_set = {name for name in allowed if isinstance(name, str)}
@@ -25,6 +32,7 @@ async def execute_tool(
     *,
     mem_client: CognitiveMemory,
 ) -> dict[str, Any]:
+    warnings.warn(_DEPRECATION_MSG, DeprecationWarning, stacklevel=2)
     handlers = {
         "recall": _handle_recall,
         "sense_memory_availability": _handle_sense_memory_availability,

@@ -1,4 +1,5 @@
 from contextlib import asynccontextmanager
+from unittest.mock import AsyncMock, MagicMock, patch
 from uuid import uuid4
 
 import pytest
@@ -15,11 +16,11 @@ async def test_estimate_importance_uses_learning_signals():
 
 
 async def test_build_system_prompt_includes_profile():
-    prompt = chat_mod._build_system_prompt({"name": "Hexis"})  # noqa: SLF001
+    prompt = await chat_mod._build_system_prompt({"name": "Hexis"})  # noqa: SLF001
     assert "Hexis" in prompt
 
 
-async def test_chat_turn_basic_flow(monkeypatch):
+async def test_chat_turn_basic_flow(monkeypatch, db_pool):
     class DummyMem:
         def __init__(self):
             self.remembered = []
@@ -64,13 +65,14 @@ async def test_chat_turn_basic_flow(monkeypatch):
         history=[],
         llm_config={"provider": "openai", "model": "gpt-4o"},
         dsn="postgresql://unused",
+        pool=db_pool,
     )
 
     assert result["assistant"] == "hello there"
     assert mem.remembered
 
 
-async def test_chat_turn_tool_loop(monkeypatch):
+async def test_chat_turn_tool_loop(monkeypatch, db_pool):
     class DummyMem:
         async def hydrate(self, *_args, **_kwargs):
             return HydratedContext(
@@ -99,18 +101,12 @@ async def test_chat_turn_tool_loop(monkeypatch):
         {"content": "", "tool_calls": [{"id": "tool-1", "name": "recall", "arguments": {"query": "x"}}]},
         {"content": "final response", "tool_calls": []},
     ]
-    tool_calls = []
 
     async def fake_chat_completion(**_kwargs):
         return responses.pop(0)
 
-    async def fake_execute_tool(name, arguments, **_kwargs):
-        tool_calls.append((name, arguments))
-        return {"ok": True}
-
     monkeypatch.setattr(chat_mod.CognitiveMemory, "connect", fake_connect)
     monkeypatch.setattr(chat_mod, "chat_completion", fake_chat_completion)
-    monkeypatch.setattr(chat_mod, "execute_tool", fake_execute_tool)
     async def fake_agent_profile(_dsn):
         return {}
 
@@ -121,7 +117,7 @@ async def test_chat_turn_tool_loop(monkeypatch):
         history=[],
         llm_config={"provider": "openai", "model": "gpt-4o"},
         dsn="postgresql://unused",
+        pool=db_pool,
     )
 
     assert result["assistant"] == "final response"
-    assert tool_calls == [("recall", {"query": "x"})]

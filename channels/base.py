@@ -1,0 +1,224 @@
+"""
+Hexis Channel System - Base Types
+
+Core abstractions for multi-channel messaging:
+- ChannelMessage: Normalized message format across all platforms
+- ChannelAdapter: ABC that each channel (Discord, Telegram, etc.) implements
+- ChannelCapabilities: What a channel supports (threads, reactions, media)
+"""
+
+from __future__ import annotations
+
+from abc import ABC, abstractmethod
+from dataclasses import dataclass, field
+from datetime import datetime, timezone
+from typing import Any, Callable, Awaitable, TYPE_CHECKING
+
+if TYPE_CHECKING:
+    from .media import Attachment
+
+
+@dataclass
+class ChannelCapabilities:
+    """Declares what a channel supports."""
+
+    threads: bool = False
+    reactions: bool = False
+    media: bool = False
+    typing_indicator: bool = False
+    edit_message: bool = False
+    max_message_length: int = 4000
+
+
+@dataclass
+class ChannelMessage:
+    """
+    Normalized message from any channel.
+
+    Every channel adapter converts platform-specific messages into this
+    format before handing them to the conversation handler.
+    """
+
+    channel_type: str  # "discord", "telegram"
+    channel_id: str  # Platform chat/channel ID
+    sender_id: str  # Platform user ID
+    sender_name: str  # Display name
+    content: str  # Text content
+    message_id: str  # Platform message ID (for replies)
+    reply_to_id: str | None = None
+    thread_id: str | None = None
+    attachments: list[Any] = field(default_factory=list)
+    metadata: dict[str, Any] = field(default_factory=dict)
+    timestamp: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
+
+    def __post_init__(self) -> None:
+        """Convert raw dicts in attachments to Attachment instances."""
+        from .media import Attachment as Att
+
+        converted = []
+        for item in self.attachments:
+            if isinstance(item, dict):
+                converted.append(Att.from_dict(item))
+            else:
+                converted.append(item)
+        self.attachments = converted
+
+
+class ChannelAdapter(ABC):
+    """
+    Base class for channel adapters.
+
+    Each platform (Discord, Telegram, etc.) implements this interface.
+    The adapter handles:
+    - Connecting to the platform API
+    - Listening for inbound messages and normalizing them
+    - Sending outbound messages in the platform's format
+    """
+
+    @abstractmethod
+    async def start(
+        self,
+        on_message: Callable[[ChannelMessage], Awaitable[None]],
+    ) -> None:
+        """
+        Start listening for messages.
+
+        Args:
+            on_message: Callback invoked for each inbound message.
+                        The callback should process the message and send
+                        a reply via this adapter's send() method.
+        """
+        ...
+
+    @abstractmethod
+    async def stop(self) -> None:
+        """Stop listening and disconnect from the platform."""
+        ...
+
+    @abstractmethod
+    async def send(
+        self,
+        channel_id: str,
+        text: str,
+        *,
+        reply_to: str | None = None,
+        thread_id: str | None = None,
+    ) -> str | None:
+        """
+        Send a message to a channel.
+
+        Args:
+            channel_id: Platform-specific channel/chat ID.
+            text: Message text.
+            reply_to: Platform message ID to reply to.
+            thread_id: Thread ID for threaded replies.
+
+        Returns:
+            Platform message ID of the sent message, or None.
+        """
+        ...
+
+    @abstractmethod
+    async def send_typing(self, channel_id: str) -> None:
+        """Send a typing indicator to signal the bot is processing."""
+        ...
+
+    @property
+    @abstractmethod
+    def channel_type(self) -> str:
+        """Unique channel identifier, e.g. 'discord', 'telegram'."""
+        ...
+
+    @property
+    @abstractmethod
+    def capabilities(self) -> ChannelCapabilities:
+        """Declare what this channel supports."""
+        ...
+
+    @property
+    def is_connected(self) -> bool:
+        """Whether the adapter is currently connected and listening."""
+        return False
+
+    async def edit_message(
+        self,
+        channel_id: str,
+        message_id: str,
+        text: str,
+    ) -> bool:
+        """
+        Edit a previously sent message.
+
+        Override in adapters that support message editing (Discord, Telegram,
+        Slack, Matrix).  Returns True on success, False if not supported.
+        """
+        return False
+
+    async def send_media(
+        self,
+        channel_id: str,
+        attachment: Attachment,
+        caption: str | None = None,
+        *,
+        reply_to: str | None = None,
+    ) -> str | None:
+        """
+        Send a media attachment to a channel.
+
+        Override in adapters that support media sending.
+        Returns platform message ID, or None if not supported.
+        """
+        return None
+
+
+def chunk_text(text: str, max_length: int) -> list[str]:
+    """
+    Split text into chunks respecting the channel's max message length.
+
+    Tries to split on paragraph boundaries, then sentence boundaries,
+    then falls back to hard splits.
+    """
+    if len(text) <= max_length:
+        return [text]
+
+    chunks: list[str] = []
+    remaining = text
+
+    while remaining:
+        if len(remaining) <= max_length:
+            chunks.append(remaining)
+            break
+
+        # Try to split on double newline (paragraph)
+        split_at = remaining.rfind("\n\n", 0, max_length)
+        if split_at > max_length // 3:
+            chunks.append(remaining[:split_at].rstrip())
+            remaining = remaining[split_at:].lstrip()
+            continue
+
+        # Try to split on single newline
+        split_at = remaining.rfind("\n", 0, max_length)
+        if split_at > max_length // 3:
+            chunks.append(remaining[:split_at].rstrip())
+            remaining = remaining[split_at:].lstrip()
+            continue
+
+        # Try to split on sentence boundary
+        for sep in (". ", "! ", "? "):
+            split_at = remaining.rfind(sep, 0, max_length)
+            if split_at > max_length // 3:
+                chunks.append(remaining[: split_at + 1].rstrip())
+                remaining = remaining[split_at + 1 :].lstrip()
+                break
+        else:
+            # Hard split on space
+            split_at = remaining.rfind(" ", 0, max_length)
+            if split_at > max_length // 3:
+                chunks.append(remaining[:split_at].rstrip())
+                remaining = remaining[split_at:].lstrip()
+            else:
+                # Last resort: hard split
+                chunks.append(remaining[:max_length])
+                remaining = remaining[max_length:]
+
+    return chunks

@@ -632,19 +632,55 @@ async def _run_server(dsn: str) -> None:
             "MCP dependencies not installed. Install with: pip install -e ."
         ) from e
 
+    import asyncpg
+
+    from core.tools import ToolContext, ToolExecutionContext
+    from core.tools.registry import create_full_registry
+
     server = Server("hexis-mcp")
 
     client = await CognitiveMemory.connect(dsn)
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=5)
+    registry = await create_full_registry(pool)
+
+    # Build a set of registry tool names for routing
+    _registry_tool_names: set[str] = set()
 
     @server.list_tools()
     async def list_tools():
-        return _tools()
+        nonlocal _registry_tool_names
+
+        # Start with legacy memory tools
+        tools = _tools()
+        legacy_names = {t.name for t in tools}
+
+        # Add registry tools available in MCP context (skip duplicates)
+        mcp_specs = await registry.get_mcp_tools(ToolContext.MCP)
+        for spec in mcp_specs:
+            name = spec["name"]
+            if name not in legacy_names:
+                tools.append(_tool(name, spec["description"], spec["inputSchema"]))
+                _registry_tool_names.add(name)
+
+        return tools
 
     @server.call_tool()
     async def call_tool(name: str, arguments: dict[str, Any]):
         try:
-            result = await _dispatch_tool(client, name, arguments or {})
-            text = json.dumps(_jsonable(result), indent=2, sort_keys=True)
+            # Route to registry if it's a registry-provided tool
+            if name in _registry_tool_names:
+                import uuid
+
+                ctx = ToolExecutionContext(
+                    tool_context=ToolContext.MCP,
+                    call_id=str(uuid.uuid4()),
+                )
+                result = await registry.execute(name, arguments or {}, ctx)
+                text = result.to_model_output()
+            else:
+                # Legacy dispatch for memory tools
+                result = await _dispatch_tool(client, name, arguments or {})
+                text = json.dumps(_jsonable(result), indent=2, sort_keys=True)
         except Exception as exc:
             text = f"Error: {exc}"
         return [TextContent(type="text", text=text)]
@@ -665,6 +701,7 @@ async def _run_server(dsn: str) -> None:
             await server.run(read_stream, write_stream, init_opts)
     finally:
         await client.close()
+        await pool.close()
 
 
 def build_parser() -> argparse.ArgumentParser:

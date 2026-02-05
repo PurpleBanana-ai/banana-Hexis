@@ -103,6 +103,10 @@ class ToolsConfig:
     # Context-specific overrides
     context_overrides: dict[ToolContext, ContextOverrides] = field(default_factory=dict)
 
+    # Optional tool allowlists
+    allowed_optional: list[str] = field(default_factory=list)
+    allowed_optional_groups: list[str] = field(default_factory=list)
+
     # Workspace restrictions
     workspace_path: str | None = None
 
@@ -153,6 +157,8 @@ class ToolsConfig:
             api_keys=dict(data.get("api_keys", {})),
             costs=dict(data.get("costs", {})),
             context_overrides=context_overrides,
+            allowed_optional=list(data.get("allowed_optional", [])),
+            allowed_optional_groups=list(data.get("allowed_optional_groups", [])),
             workspace_path=data.get("workspace_path"),
         )
 
@@ -172,6 +178,8 @@ class ToolsConfig:
             "context_overrides": {
                 k.value: v.to_dict() for k, v in self.context_overrides.items()
             },
+            "allowed_optional": self.allowed_optional,
+            "allowed_optional_groups": self.allowed_optional_groups,
             "workspace_path": self.workspace_path,
         }
 
@@ -213,6 +221,16 @@ class ToolsConfig:
                 return False
 
         return True
+
+    def is_optional_allowed(self, tool_name: str, category: "ToolCategory") -> bool:
+        """Check if an optional tool is in the allowlist."""
+        if tool_name in self.allowed_optional:
+            return True
+        if category.value in self.allowed_optional_groups:
+            return True
+        if "plugins" in self.allowed_optional_groups:
+            return True
+        return False
 
     def get_energy_cost(self, tool_name: str, default_cost: int) -> int:
         """Get energy cost for a tool (custom or default)."""

@@ -1,0 +1,60 @@
+-- ============================================================================
+-- Channel System Tables
+--
+-- Stores conversation sessions and message logs for channel adapters
+-- (Discord, Telegram, etc.)
+-- ============================================================================
+
+-- Channel sessions: per-sender conversation state
+CREATE TABLE IF NOT EXISTS channel_sessions (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    channel_type TEXT NOT NULL,            -- 'discord', 'telegram', etc.
+    channel_id TEXT NOT NULL,              -- platform chat/channel ID
+    sender_id TEXT NOT NULL,               -- platform user ID
+    sender_name TEXT,                      -- display name (informational)
+    history JSONB DEFAULT '[]'::jsonb,     -- conversation messages array
+    last_active TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    UNIQUE(channel_type, channel_id, sender_id)
+);
+
+-- Channel message log: audit trail for all channel messages
+CREATE TABLE IF NOT EXISTS channel_messages (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    session_id UUID REFERENCES channel_sessions(id) ON DELETE CASCADE,
+    direction TEXT NOT NULL CHECK (direction IN ('inbound', 'outbound')),
+    content TEXT NOT NULL,
+    platform_message_id TEXT,              -- platform's message ID
+    metadata JSONB DEFAULT '{}'::jsonb,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+-- Indexes for fast lookups
+CREATE INDEX IF NOT EXISTS idx_channel_sessions_lookup
+    ON channel_sessions(channel_type, channel_id, sender_id);
+
+CREATE INDEX IF NOT EXISTS idx_channel_sessions_active
+    ON channel_sessions(last_active DESC);
+
+CREATE INDEX IF NOT EXISTS idx_channel_messages_session
+    ON channel_messages(session_id, created_at);
+
+CREATE INDEX IF NOT EXISTS idx_channel_messages_created
+    ON channel_messages(created_at DESC);
+
+-- Channel deliveries: log of outbox-initiated (proactive) messages
+CREATE TABLE IF NOT EXISTS channel_deliveries (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    outbox_message_id TEXT,                -- RabbitMQ message ID
+    channel_type TEXT NOT NULL,
+    channel_id TEXT NOT NULL,
+    sender_id TEXT,                        -- target sender (if known)
+    content TEXT NOT NULL,
+    delivery_mode TEXT NOT NULL,           -- 'direct', 'last_active', 'broadcast'
+    success BOOLEAN NOT NULL,
+    error TEXT,
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE INDEX IF NOT EXISTS idx_channel_deliveries_created
+    ON channel_deliveries(created_at DESC);

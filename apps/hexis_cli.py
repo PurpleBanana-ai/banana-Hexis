@@ -319,6 +319,32 @@ def build_parser() -> argparse.ArgumentParser:
     tools_status.add_argument("--json", action="store_true", help="Output JSON")
     tools_status.set_defaults(func="tools_status")
 
+    # Channels subcommand
+    channels = sub.add_parser("channels", help="Manage channel adapters (Discord, Telegram, etc.)")
+    channels_sub = channels.add_subparsers(dest="channels_command")
+
+    ch_start = channels_sub.add_parser("start", help="Start channel adapters (foreground)")
+    ch_start.add_argument("--channel", "-c", action="append",
+                          choices=["discord", "telegram", "slack", "signal", "whatsapp", "imessage", "matrix"],
+                          help="Start specific channel(s). Default: all configured.")
+    ch_start.set_defaults(func="channels_start")
+
+    ch_status = channels_sub.add_parser("status", help="Show channel session counts")
+    ch_status.add_argument("--dsn", default=None)
+    ch_status.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    ch_status.add_argument("--json", action="store_true", help="Output JSON")
+    ch_status.set_defaults(func="channels_status")
+
+    ch_setup = channels_sub.add_parser("setup", help="Configure a channel")
+    ch_setup.add_argument("channel_type",
+                          choices=["discord", "telegram", "slack", "signal", "whatsapp", "imessage", "matrix"],
+                          help="Channel to configure")
+    ch_setup.add_argument("--dsn", default=None)
+    ch_setup.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
+    ch_setup.set_defaults(func="channels_setup")
+
+    channels.set_defaults(func="channels")
+
     return p
 
 
@@ -902,6 +928,206 @@ def _get_dsn(args) -> str:
     return db_dsn_from_env()
 
 
+async def _channels_status(dsn: str, as_json: bool) -> int:
+    """Show channel session counts."""
+    import asyncpg
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            rows = await conn.fetch("""
+                SELECT channel_type,
+                       COUNT(*) AS sessions,
+                       COUNT(*) FILTER (WHERE last_active > CURRENT_TIMESTAMP - INTERVAL '1 hour') AS active_1h,
+                       MAX(last_active) AS last_active
+                FROM channel_sessions
+                GROUP BY channel_type
+                ORDER BY channel_type
+            """)
+            total_messages = await conn.fetchval("SELECT COUNT(*) FROM channel_messages") or 0
+
+        data = {
+            "channels": [
+                {
+                    "type": row["channel_type"],
+                    "sessions": row["sessions"],
+                    "active_1h": row["active_1h"],
+                    "last_active": str(row["last_active"]) if row["last_active"] else None,
+                }
+                for row in rows
+            ],
+            "total_messages": total_messages,
+        }
+        if as_json:
+            sys.stdout.write(json.dumps(data, indent=2) + "\n")
+        else:
+            if not rows:
+                sys.stdout.write("No channel sessions found.\n")
+            else:
+                sys.stdout.write("Channel Sessions:\n")
+                for row in rows:
+                    sys.stdout.write(
+                        f"  {row['channel_type']}: {row['sessions']} sessions "
+                        f"({row['active_1h']} active in last hour)\n"
+                    )
+            sys.stdout.write(f"Total messages: {total_messages}\n")
+        return 0
+    except Exception as e:
+        if "channel_sessions" in str(e):
+            _print_err("Channel tables not found. Bounce the DB to apply schema: docker-compose down -v && docker-compose build db && docker-compose up -d")
+        else:
+            _print_err(f"Error: {e}")
+        return 1
+    finally:
+        await pool.close()
+
+
+async def _channels_setup(dsn: str, channel_type: str) -> int:
+    """Interactive channel setup."""
+    import asyncpg
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    try:
+        if channel_type == "discord":
+            sys.stdout.write("Discord Bot Setup\n")
+            sys.stdout.write("=" * 40 + "\n")
+            sys.stdout.write("1. Go to https://discord.com/developers/applications\n")
+            sys.stdout.write("2. Create a New Application\n")
+            sys.stdout.write("3. Go to Bot > Token > Copy\n")
+            sys.stdout.write("4. Enable Message Content Intent in Bot settings\n")
+            sys.stdout.write("5. Invite bot to your server with bot + applications.commands scopes\n\n")
+            token_env = input("Bot token env var name [DISCORD_BOT_TOKEN]: ").strip() or "DISCORD_BOT_TOKEN"
+            guilds = input("Allowed guild IDs (comma-separated, or * for all) [*]: ").strip() or "*"
+
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.discord.bot_token", json.dumps(token_env))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.discord.allowed_guilds", json.dumps(guilds))
+
+            sys.stdout.write(f"\nDiscord configured. Set {token_env} in your environment.\n")
+            sys.stdout.write("Start with: hexis channels start --channel discord\n")
+
+        elif channel_type == "telegram":
+            sys.stdout.write("Telegram Bot Setup\n")
+            sys.stdout.write("=" * 40 + "\n")
+            sys.stdout.write("1. Message @BotFather on Telegram\n")
+            sys.stdout.write("2. Send /newbot and follow the prompts\n")
+            sys.stdout.write("3. Copy the bot token\n\n")
+            token_env = input("Bot token env var name [TELEGRAM_BOT_TOKEN]: ").strip() or "TELEGRAM_BOT_TOKEN"
+            chats = input("Allowed chat IDs (comma-separated, or * for all) [*]: ").strip() or "*"
+
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.telegram.bot_token", json.dumps(token_env))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.telegram.allowed_chat_ids", json.dumps(chats))
+
+            sys.stdout.write(f"\nTelegram configured. Set {token_env} in your environment.\n")
+            sys.stdout.write("Start with: hexis channels start --channel telegram\n")
+
+        elif channel_type == "slack":
+            sys.stdout.write("Slack Bot Setup\n")
+            sys.stdout.write("=" * 40 + "\n")
+            sys.stdout.write("1. Go to https://api.slack.com/apps and create a new app\n")
+            sys.stdout.write("2. Under OAuth & Permissions, add scopes: chat:write, channels:history, users:read\n")
+            sys.stdout.write("3. Install to workspace and copy the Bot User OAuth Token (xoxb-...)\n")
+            sys.stdout.write("4. For Socket Mode: enable it under Socket Mode and copy the App Token (xapp-...)\n\n")
+            bot_env = input("Bot token env var name [SLACK_BOT_TOKEN]: ").strip() or "SLACK_BOT_TOKEN"
+            app_env = input("App token env var name (for Socket Mode) [SLACK_APP_TOKEN]: ").strip() or "SLACK_APP_TOKEN"
+            channels_allow = input("Allowed channel IDs (comma-separated, or * for all) [*]: ").strip() or "*"
+
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.slack.bot_token", json.dumps(bot_env))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.slack.app_token", json.dumps(app_env))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.slack.allowed_channels", json.dumps(channels_allow))
+
+            sys.stdout.write(f"\nSlack configured. Set {bot_env} and {app_env} in your environment.\n")
+            sys.stdout.write("Start with: hexis channels start --channel slack\n")
+
+        elif channel_type == "signal":
+            sys.stdout.write("Signal Setup (via signal-cli-rest-api)\n")
+            sys.stdout.write("=" * 40 + "\n")
+            sys.stdout.write("1. Run signal-cli-rest-api as a sidecar (or use 'docker compose --profile signal up')\n")
+            sys.stdout.write("2. Register/link your phone number with signal-cli\n")
+            sys.stdout.write("3. Provide the registered phone number\n\n")
+            phone_env = input("Phone number env var name [SIGNAL_PHONE_NUMBER]: ").strip() or "SIGNAL_PHONE_NUMBER"
+            api_url = input("Signal CLI API URL [http://localhost:8080]: ").strip() or "http://localhost:8080"
+            numbers = input("Allowed sender numbers (comma-separated, or * for all) [*]: ").strip() or "*"
+
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.signal.phone_number", json.dumps(phone_env))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.signal.api_url", json.dumps(api_url))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.signal.allowed_numbers", json.dumps(numbers))
+
+            sys.stdout.write(f"\nSignal configured. Set {phone_env} in your environment.\n")
+            sys.stdout.write("Start with: hexis channels start --channel signal\n")
+
+        elif channel_type == "whatsapp":
+            sys.stdout.write("WhatsApp Business Cloud API Setup\n")
+            sys.stdout.write("=" * 40 + "\n")
+            sys.stdout.write("1. Go to https://developers.facebook.com and create a Meta Business app\n")
+            sys.stdout.write("2. Add the WhatsApp product\n")
+            sys.stdout.write("3. Get your access token and phone number ID\n")
+            sys.stdout.write("4. Configure a webhook pointing to your server\n\n")
+            token_env = input("Access token env var name [WHATSAPP_ACCESS_TOKEN]: ").strip() or "WHATSAPP_ACCESS_TOKEN"
+            phone_id = input("Phone number ID (or env var) [WHATSAPP_PHONE_NUMBER_ID]: ").strip() or "WHATSAPP_PHONE_NUMBER_ID"
+            verify = input("Webhook verify token [hexis_verify]: ").strip() or "hexis_verify"
+            port = input("Webhook port [8443]: ").strip() or "8443"
+            numbers = input("Allowed sender numbers (comma-separated, or * for all) [*]: ").strip() or "*"
+
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.whatsapp.access_token", json.dumps(token_env))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.whatsapp.phone_number_id", json.dumps(phone_id))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.whatsapp.verify_token", json.dumps(verify))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.whatsapp.webhook_port", json.dumps(port))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.whatsapp.allowed_numbers", json.dumps(numbers))
+
+            sys.stdout.write(f"\nWhatsApp configured. Set {token_env} in your environment.\n")
+            sys.stdout.write("Start with: hexis channels start --channel whatsapp\n")
+
+        elif channel_type == "imessage":
+            sys.stdout.write("iMessage Setup (via BlueBubbles)\n")
+            sys.stdout.write("=" * 40 + "\n")
+            sys.stdout.write("1. Install BlueBubbles server on a Mac with iMessage\n")
+            sys.stdout.write("2. Configure and start the BlueBubbles server\n")
+            sys.stdout.write("3. Note the server URL and password\n\n")
+            api_url = input("BlueBubbles API URL [http://localhost:1234]: ").strip() or "http://localhost:1234"
+            password_env = input("Password env var name [IMESSAGE_PASSWORD]: ").strip() or "IMESSAGE_PASSWORD"
+            handles = input("Allowed handles (comma-separated, or * for all) [*]: ").strip() or "*"
+
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.imessage.api_url", json.dumps(api_url))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.imessage.password", json.dumps(password_env))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.imessage.allowed_handles", json.dumps(handles))
+
+            sys.stdout.write(f"\niMessage configured. Set {password_env} in your environment.\n")
+            sys.stdout.write("Start with: hexis channels start --channel imessage\n")
+
+        elif channel_type == "matrix":
+            sys.stdout.write("Matrix Setup\n")
+            sys.stdout.write("=" * 40 + "\n")
+            sys.stdout.write("1. Create a bot account on your Matrix homeserver\n")
+            sys.stdout.write("2. Generate an access token for the bot\n")
+            sys.stdout.write("3. Invite the bot to rooms you want it to monitor\n\n")
+            homeserver = input("Homeserver URL [https://matrix.org]: ").strip() or "https://matrix.org"
+            user_id = input("Bot user ID (e.g. @hexis:matrix.org): ").strip()
+            token_env = input("Access token env var name [MATRIX_ACCESS_TOKEN]: ").strip() or "MATRIX_ACCESS_TOKEN"
+            rooms = input("Allowed room IDs (comma-separated, or * for all) [*]: ").strip() or "*"
+
+            async with pool.acquire() as conn:
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.matrix.homeserver", json.dumps(homeserver))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.matrix.user_id", json.dumps(user_id))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.matrix.access_token", json.dumps(token_env))
+                await conn.execute("SELECT set_config($1, $2::jsonb)", "channel.matrix.allowed_rooms", json.dumps(rooms))
+
+            sys.stdout.write(f"\nMatrix configured. Set {token_env} in your environment.\n")
+            sys.stdout.write("Start with: hexis channels start --channel matrix\n")
+
+        return 0
+    except Exception as e:
+        _print_err(f"Error: {e}")
+        return 1
+    finally:
+        await pool.close()
+
+
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = build_parser().parse_args(argv)
@@ -1082,6 +1308,21 @@ def main(argv: list[str] | None = None) -> int:
     if args.func == "tools_status":
         dsn = _get_dsn(args)
         return asyncio.run(_tools_status(dsn, args.json))
+
+    # Channels commands
+    if args.func == "channels":
+        _print_err("Usage: hexis channels {start|status|setup}")
+        return 1
+    if args.func == "channels_start":
+        from services.channel_worker import run_channel_worker
+        asyncio.run(run_channel_worker(channels=args.channel, instance=args.instance))
+        return 0
+    if args.func == "channels_status":
+        dsn = _get_dsn(args)
+        return asyncio.run(_channels_status(dsn, args.json))
+    if args.func == "channels_setup":
+        dsn = _get_dsn(args)
+        return asyncio.run(_channels_setup(dsn, args.channel_type))
 
     _print_err("Unknown command")
     return 2

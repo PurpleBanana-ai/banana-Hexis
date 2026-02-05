@@ -1,0 +1,241 @@
+"""
+Hexis Channel System - Signal Adapter
+
+Connects to Signal via signal-cli-rest-api sidecar.
+Inbound: SSE event stream.  Outbound: HTTP REST calls.
+"""
+
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+from typing import Any, Callable, Awaitable
+
+from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage
+from .media import Attachment
+
+logger = logging.getLogger(__name__)
+
+DEFAULT_API_URL = "http://localhost:8080"
+
+
+def _resolve_token(config: dict[str, Any]) -> str | None:
+    """Resolve Signal phone number from config or environment."""
+    phone_env = config.get("phone_number") or "SIGNAL_PHONE_NUMBER"
+    phone = os.getenv(str(phone_env))
+    if phone:
+        return phone
+    raw = config.get("phone_number", "")
+    if raw and str(raw).startswith("+"):
+        return str(raw)
+    return None
+
+
+class SignalAdapter(ChannelAdapter):
+    """
+    Signal channel adapter via signal-cli-rest-api sidecar.
+
+    Config keys (from DB config table):
+        channel.signal.api_url: REST API base URL (default: http://localhost:8080)
+        channel.signal.phone_number: Bot's registered phone number (or env var name)
+        channel.signal.allowed_numbers: JSON array of phone numbers, or "*"
+
+    Requires signal-cli-rest-api running as a sidecar service.
+    """
+
+    def __init__(self, config: dict[str, Any] | None = None) -> None:
+        self._config = config or {}
+        self._on_message: Callable[[ChannelMessage], Awaitable[None]] | None = None
+        self._connected = False
+        self._api_url = str(self._config.get("api_url") or os.getenv("SIGNAL_API_URL") or DEFAULT_API_URL).rstrip("/")
+        self._phone_number: str | None = None
+        self._allowed_numbers = self._parse_allowlist(self._config.get("allowed_numbers"))
+        self._session = None
+
+    @staticmethod
+    def _parse_allowlist(value: Any) -> set[str] | None:
+        if value is None or value == "*":
+            return None
+        if isinstance(value, str):
+            try:
+                value = json.loads(value)
+            except Exception:
+                return {value}
+        if isinstance(value, list):
+            return {str(v) for v in value}
+        return None
+
+    @property
+    def channel_type(self) -> str:
+        return "signal"
+
+    @property
+    def capabilities(self) -> ChannelCapabilities:
+        return ChannelCapabilities(
+            threads=False,
+            reactions=True,
+            media=True,
+            typing_indicator=False,
+            edit_message=False,
+            max_message_length=8000,
+        )
+
+    @property
+    def is_connected(self) -> bool:
+        return self._connected
+
+    async def start(
+        self,
+        on_message: Callable[[ChannelMessage], Awaitable[None]],
+    ) -> None:
+        import aiohttp
+
+        self._phone_number = _resolve_token(self._config)
+        if not self._phone_number:
+            raise RuntimeError(
+                "Signal phone number not found. Set SIGNAL_PHONE_NUMBER env var "
+                "or configure channel.signal.phone_number in the database."
+            )
+
+        self._on_message = on_message
+        self._session = aiohttp.ClientSession()
+        self._connected = True
+        logger.info("Signal adapter started for %s via %s", self._phone_number, self._api_url)
+
+        try:
+            await self._listen_sse()
+        except asyncio.CancelledError:
+            pass
+        finally:
+            self._connected = False
+            if self._session and not self._session.closed:
+                await self._session.close()
+            self._session = None
+
+    async def _listen_sse(self) -> None:
+        """Listen to SSE event stream from signal-cli REST API."""
+        url = f"{self._api_url}/api/v1/receive/{self._phone_number}"
+        while self._connected:
+            try:
+                async with self._session.get(url, timeout=None) as resp:
+                    if resp.status != 200:
+                        logger.warning("Signal SSE connection failed: HTTP %d", resp.status)
+                        await asyncio.sleep(5)
+                        continue
+
+                    async for line in resp.content:
+                        line_str = line.decode("utf-8", errors="replace").strip()
+                        if not line_str or line_str.startswith(":"):
+                            continue
+                        if line_str.startswith("data:"):
+                            data_str = line_str[5:].strip()
+                            if data_str:
+                                await self._handle_sse_event(data_str)
+
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Signal SSE stream error, reconnecting in 5s")
+                await asyncio.sleep(5)
+
+    async def _handle_sse_event(self, data_str: str) -> None:
+        """Parse and route an SSE event from signal-cli."""
+        try:
+            data = json.loads(data_str)
+        except json.JSONDecodeError:
+            return
+
+        envelope = data.get("envelope", {})
+        data_message = envelope.get("dataMessage")
+        if not data_message:
+            return
+
+        source = envelope.get("source") or envelope.get("sourceNumber")
+        if not source:
+            return
+
+        # Check allowlist
+        if self._allowed_numbers is not None:
+            if source not in self._allowed_numbers:
+                return
+
+        text = data_message.get("message", "")
+        group_info = data_message.get("groupInfo")
+        channel_id = group_info.get("groupId") if group_info else source
+        timestamp = str(data_message.get("timestamp", ""))
+
+        # Convert attachments
+        attachments: list[Attachment] = []
+        for att in data_message.get("attachments", []):
+            attachments.append(Attachment(
+                url=att.get("url", ""),
+                filename=att.get("filename"),
+                mime_type=att.get("contentType"),
+                size=att.get("size"),
+                platform_id=att.get("id"),
+            ))
+
+        sender_name = envelope.get("sourceName") or source
+
+        channel_msg = ChannelMessage(
+            channel_type="signal",
+            channel_id=str(channel_id),
+            sender_id=source,
+            sender_name=sender_name,
+            content=text or "",
+            message_id=timestamp,
+            attachments=attachments,
+            metadata={
+                "is_group": group_info is not None,
+            },
+        )
+
+        if self._on_message:
+            await self._on_message(channel_msg)
+
+    async def stop(self) -> None:
+        self._connected = False
+        if self._session and not self._session.closed:
+            await self._session.close()
+        self._session = None
+
+    async def send(
+        self,
+        channel_id: str,
+        text: str,
+        *,
+        reply_to: str | None = None,
+        thread_id: str | None = None,
+    ) -> str | None:
+        if not self._session or self._session.closed:
+            logger.error("Signal session not connected")
+            return None
+
+        try:
+            payload: dict[str, Any] = {
+                "message": text,
+                "number": self._phone_number,
+                "recipients": [channel_id],
+            }
+
+            async with self._session.post(
+                f"{self._api_url}/api/v2/send",
+                json=payload,
+                timeout=30,
+            ) as resp:
+                if resp.status in (200, 201):
+                    result = await resp.json()
+                    return str(result.get("timestamp", ""))
+                else:
+                    body = await resp.text()
+                    logger.error("Signal send failed: HTTP %d: %s", resp.status, body[:200])
+                    return None
+        except Exception:
+            logger.exception("Failed to send Signal message to %s", channel_id)
+            return None
+
+    async def send_typing(self, channel_id: str) -> None:
+        # Signal doesn't support bot typing indicators via REST API
+        pass

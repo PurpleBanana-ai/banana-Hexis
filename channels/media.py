@@ -1,0 +1,215 @@
+"""
+Hexis Channel System - Media Handling
+
+Centralized media download, normalization, and SSRF protection for channel
+attachments. Each channel adapter converts platform-native attachments to the
+Attachment dataclass; the media module handles safe download and caching.
+"""
+
+from __future__ import annotations
+
+import ipaddress
+import logging
+import os
+import tempfile
+from dataclasses import dataclass, field
+from typing import Any
+from urllib.parse import urlparse
+
+logger = logging.getLogger(__name__)
+
+# Default maximum attachment size (10 MB)
+DEFAULT_MAX_SIZE = 10 * 1024 * 1024
+
+# IP ranges that should never be fetched (SSRF protection)
+_BLOCKED_NETWORKS = [
+    ipaddress.ip_network("10.0.0.0/8"),
+    ipaddress.ip_network("172.16.0.0/12"),
+    ipaddress.ip_network("192.168.0.0/16"),
+    ipaddress.ip_network("127.0.0.0/8"),
+    ipaddress.ip_network("169.254.0.0/16"),  # link-local / cloud metadata
+    ipaddress.ip_network("0.0.0.0/8"),
+    ipaddress.ip_network("::1/128"),
+    ipaddress.ip_network("fc00::/7"),  # IPv6 unique-local
+    ipaddress.ip_network("fe80::/10"),  # IPv6 link-local
+]
+
+
+@dataclass
+class Attachment:
+    """
+    Normalized attachment from any channel.
+
+    Adapters populate the platform-facing fields (url, filename, mime_type,
+    size, platform_id).  download_attachment() populates local_path.
+    """
+
+    url: str
+    filename: str | None = None
+    mime_type: str | None = None
+    size: int | None = None
+    platform_id: str | None = None
+    local_path: str | None = None
+
+    @classmethod
+    def from_dict(cls, data: dict[str, Any]) -> Attachment:
+        """Create an Attachment from a raw dict (backward compat)."""
+        return cls(
+            url=str(data.get("url") or ""),
+            filename=data.get("filename"),
+            mime_type=data.get("mime_type") or data.get("type"),
+            size=data.get("size"),
+            platform_id=data.get("platform_id") or data.get("id"),
+            local_path=data.get("local_path"),
+        )
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "url": self.url,
+            "filename": self.filename,
+            "mime_type": self.mime_type,
+            "size": self.size,
+            "platform_id": self.platform_id,
+            "local_path": self.local_path,
+        }
+
+    def describe(self) -> str:
+        """Human-readable one-liner for LLM context injection."""
+        parts = []
+        if self.filename:
+            parts.append(self.filename)
+        if self.mime_type:
+            parts.append(self.mime_type)
+        if self.size:
+            if self.size >= 1024 * 1024:
+                parts.append(f"{self.size / (1024 * 1024):.1f}MB")
+            elif self.size >= 1024:
+                parts.append(f"{self.size / 1024:.0f}KB")
+            else:
+                parts.append(f"{self.size}B")
+        return ", ".join(parts) if parts else self.url
+
+
+def is_safe_url(url: str) -> bool:
+    """
+    SSRF guard: returns False for URLs that resolve to private/internal IPs.
+
+    Checks the hostname against blocked IP ranges.  DNS resolution is NOT
+    performed here (that would be async); this catches obvious literal-IP
+    cases and known-bad hostnames.
+    """
+    try:
+        parsed = urlparse(url)
+        hostname = parsed.hostname
+        if not hostname:
+            return False
+
+        # Block common metadata endpoints
+        if hostname in ("metadata.google.internal", "metadata.internal"):
+            return False
+
+        # Try to parse as an IP address
+        try:
+            addr = ipaddress.ip_address(hostname)
+            for network in _BLOCKED_NETWORKS:
+                if addr in network:
+                    return False
+        except ValueError:
+            # Not a literal IP — allow (DNS resolution happens at fetch time)
+            pass
+
+        return True
+    except Exception:
+        return False
+
+
+async def download_attachment(
+    attachment: Attachment,
+    *,
+    max_size: int = DEFAULT_MAX_SIZE,
+    cache_dir: str | None = None,
+) -> Attachment:
+    """
+    Download an attachment to a local file with SSRF protection and size limits.
+
+    Returns a new Attachment with local_path populated (or the original if
+    download fails or is skipped).
+    """
+    import aiohttp
+
+    if not attachment.url:
+        return attachment
+
+    if not is_safe_url(attachment.url):
+        logger.warning("Blocked unsafe URL: %s", attachment.url[:100])
+        return attachment
+
+    target_dir = cache_dir or tempfile.gettempdir()
+    os.makedirs(target_dir, exist_ok=True)
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(attachment.url, timeout=aiohttp.ClientTimeout(total=30)) as resp:
+                if resp.status != 200:
+                    logger.warning("Download failed: HTTP %d for %s", resp.status, attachment.url[:100])
+                    return attachment
+
+                # Check Content-Length before downloading
+                content_length = resp.content_length
+                if content_length and content_length > max_size:
+                    logger.warning("Attachment too large: %d bytes (max %d)", content_length, max_size)
+                    return attachment
+
+                # Derive filename
+                filename = attachment.filename or _filename_from_response(resp, attachment.url)
+                filepath = os.path.join(target_dir, filename)
+
+                # Stream download with size enforcement
+                downloaded = 0
+                with open(filepath, "wb") as f:
+                    async for chunk in resp.content.iter_chunked(8192):
+                        downloaded += len(chunk)
+                        if downloaded > max_size:
+                            logger.warning("Attachment exceeded max size during download")
+                            break
+                        f.write(chunk)
+
+                if downloaded > max_size:
+                    os.unlink(filepath)
+                    return attachment
+
+                # Return updated attachment
+                return Attachment(
+                    url=attachment.url,
+                    filename=filename,
+                    mime_type=attachment.mime_type or resp.content_type,
+                    size=downloaded,
+                    platform_id=attachment.platform_id,
+                    local_path=filepath,
+                )
+
+    except Exception:
+        logger.exception("Failed to download attachment: %s", attachment.url[:100])
+        return attachment
+
+
+def _filename_from_response(resp, url: str) -> str:
+    """Derive a filename from Content-Disposition header or URL path."""
+    # Try Content-Disposition
+    cd = resp.headers.get("Content-Disposition", "")
+    if "filename=" in cd:
+        parts = cd.split("filename=")
+        if len(parts) > 1:
+            name = parts[1].strip().strip('"').strip("'")
+            if name:
+                return name
+
+    # Fall back to URL path
+    parsed = urlparse(url)
+    path = parsed.path.rstrip("/")
+    if "/" in path:
+        name = path.rsplit("/", 1)[-1]
+        if "." in name:
+            return name
+
+    return "attachment"

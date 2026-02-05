@@ -28,6 +28,7 @@ from .base import (
     ToolSpec,
 )
 from .config import ToolsConfig, load_tools_config
+from .hooks import HookContext, HookEvent, HookRegistry
 from .policy import ToolPolicy
 
 if TYPE_CHECKING:
@@ -75,10 +76,16 @@ class ToolRegistry:
         self._handlers: dict[str, ToolHandler] = {}
         self._mcp_handlers: dict[str, ToolHandler] = {}
         self._policy = ToolPolicy(pool)
+        self._hooks = HookRegistry()
         self._stats = ExecutionStats()
         self._config_cache: ToolsConfig | None = None
         self._config_cache_time: float = 0
         self._config_cache_ttl: float = 60.0  # Refresh config every 60s
+
+    @property
+    def hooks(self) -> HookRegistry:
+        """Access the hook registry."""
+        return self._hooks
 
     # =========================================================================
     # Registration
@@ -259,6 +266,26 @@ class ToolRegistry:
             self._stats.record(tool_name, result)
             return result
 
+        # Run before-tool-call hooks
+        hook_outcome = await self._hooks.run(
+            HookEvent.BEFORE_TOOL_CALL,
+            HookContext(
+                event=HookEvent.BEFORE_TOOL_CALL,
+                tool_name=tool_name,
+                arguments=arguments,
+            ),
+        )
+        if hook_outcome.block:
+            result = ToolResult.error_result(
+                hook_outcome.block_reason or "Blocked by hook",
+                ToolErrorType.DISABLED,
+            )
+            invocation.complete(result)
+            self._stats.record(tool_name, result)
+            return result
+        if hook_outcome.mutated_arguments is not None:
+            arguments = hook_outcome.mutated_arguments
+
         # Execute with timeout
         try:
             # Set registry reference in context for nested calls
@@ -291,6 +318,22 @@ class ToolRegistry:
 
         invocation.complete(result)
         self._stats.record(tool_name, result)
+
+        # Run after-tool-call hooks
+        await self._hooks.run(
+            HookEvent.AFTER_TOOL_CALL,
+            HookContext(
+                event=HookEvent.AFTER_TOOL_CALL,
+                tool_name=tool_name,
+                arguments=arguments,
+                result=result,
+                metadata={
+                    "tool_context": context.tool_context.value,
+                    "call_id": context.call_id,
+                    "session_id": context.session_id,
+                },
+            ),
+        )
 
         logger.debug(
             f"Tool {tool_name} completed: success={result.success}, "
@@ -511,25 +554,90 @@ class ToolRegistryBuilder:
 
 
 def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
-    """Create a registry with all default tools."""
+    """Create a registry with all default tools (no plugins)."""
     from .memory import create_memory_tools
     from .web import create_web_tools
     from .filesystem import create_filesystem_tools
     from .shell import create_shell_tools
+    from .code_execution import create_code_execution_tools
+    from .browser import create_browser_tools
     from .calendar import create_calendar_tools
     from .email import create_email_tools
     from .messaging import create_messaging_tools
-
     from .ingest import create_ingest_tools
+    from .workflow import create_workflow_tools
+    from .dynamic import create_dynamic_tools
+    from .hooks import AuditTrailHook
 
     builder = ToolRegistryBuilder(pool)
     builder.add_all(create_memory_tools())
     builder.add_all(create_web_tools())
     builder.add_all(create_filesystem_tools())
     builder.add_all(create_shell_tools())
+    builder.add_all(create_code_execution_tools())
+    builder.add_all(create_browser_tools())
     builder.add_all(create_calendar_tools())
     builder.add_all(create_email_tools())
     builder.add_all(create_messaging_tools())
     builder.add_all(create_ingest_tools())
+    builder.add_all(create_workflow_tools())
+    builder.add_all(create_dynamic_tools())
 
-    return builder.build()
+    registry = builder.build()
+
+    # Register built-in audit trail hook
+    registry.hooks.register(
+        HookEvent.AFTER_TOOL_CALL,
+        AuditTrailHook(pool),
+        source="core.audit",
+    )
+
+    return registry
+
+
+async def create_full_registry(pool: "asyncpg.Pool") -> ToolRegistry:
+    """Create a registry with default tools + plugins + dynamic tools."""
+    registry = create_default_registry(pool)
+
+    # Load persisted dynamic tools
+    try:
+        from .dynamic import load_dynamic_tools
+
+        dynamic_handlers = await load_dynamic_tools(pool)
+        existing_names = set(registry.list_names())
+        for handler in dynamic_handlers:
+            name = handler.spec.name
+            if name in existing_names:
+                logger.warning("Dynamic tool '%s' conflicts with existing tool, skipping", name)
+                continue
+            registry.register(handler)
+            existing_names.add(name)
+    except Exception:
+        logger.debug("Failed to load dynamic tools", exc_info=True)
+
+    # Load plugins
+    try:
+        from plugins.loader import load_plugins
+
+        plugin_registry = await load_plugins(pool)
+
+        # Register plugin tools
+        existing_names = set(registry.list_names())
+        for handler in plugin_registry.get_tool_handlers():
+            name = handler.spec.name
+            if name in existing_names:
+                logger.warning("Plugin tool '%s' conflicts with core tool, skipping", name)
+                continue
+            registry.register(handler)
+            existing_names.add(name)
+
+        # Register plugin hooks
+        for event, handler, plugin_id in plugin_registry.get_hooks():
+            registry.hooks.register(event, handler, source=plugin_id)
+
+    except ImportError:
+        logger.debug("Plugin system not available")
+    except Exception:
+        logger.exception("Failed to load plugins")
+
+    return registry

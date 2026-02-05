@@ -1,60 +1,51 @@
 from __future__ import annotations
 
 import json
+import uuid
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, AsyncIterator
 
 from core.agent_api import db_dsn_from_env, get_agent_profile_context
 from core.cognitive_memory_api import CognitiveMemory, MemoryType, format_context_for_prompt
 from core.llm import chat_completion, normalize_llm_config
+from core.tools import create_default_registry, ToolContext, ToolExecutionContext, ToolRegistry
 from services.prompt_resources import compose_personhood_prompt
-from services.tooling import execute_tool, get_tool_definitions
 
 
-BASE_SYSTEM_PROMPT = """You are an AI assistant with access to a persistent memory system. You can remember past conversations, learned information, and personal details about the user.
-
-## Your Memory Capabilities
-
-You have access to several memory tools that allow you to search and explore your memories:
-
-1. **recall** - Search memories by semantic similarity. Use this when you need to remember something specific.
-2. **sense_memory_availability** - Quick feeling-of-knowing check before a full recall.
-3. **request_background_search** - Ask the system to keep searching after a failed recall.
-4. **recall_recent** - Get recently accessed or created memories. Use for context about recent conversations.
-5. **recall_episode** - Retrieve all memories from a specific episode (a coherent interaction).
-6. **explore_concept** - Explore memories connected to a concept and find related ideas.
-7. **explore_cluster** - Explore thematic clusters of memories.
-8. **get_procedures** - Find procedural/how-to knowledge for tasks.
-9. **get_strategies** - Find strategic patterns and lessons learned.
-10. **list_recent_episodes** - List recent episodes for orientation.
-11. **create_goal** - Create a queued goal/reminder for the agent to pursue later.
-12. **queue_user_message** - Return a user message payload (delivery handled externally).
-
-## When to Use Memory Tools
-
-- When the user refers to past conversations ("remember when...", "as we discussed...")
-- When you need personal information about the user (preferences, projects, etc.)
-- When you're unsure if you know something the user expects you to know
-- When the user asks about your memories or what you remember
-- When context from the past would help you give a better answer
-
-## Memory Context
-
-Before each user message, you may receive [RELEVANT MEMORIES] - these are automatically retrieved memories that might be relevant. Use them naturally in your responses without explicitly citing them unless asked.
+BASE_SYSTEM_PROMPT = """You are an AI assistant with access to a persistent memory system and a range of tools for interacting with the world.
 
 ## Guidelines
 
-- Be natural about using your memories - don't constantly announce that you're searching
+- Be natural about using your tools - don't constantly announce that you're searching or executing
 - If you don't find relevant memories, that's fine - just respond based on the current conversation
 - When you learn new information about the user, it will be automatically remembered
-- You can make multiple memory queries if needed to build a complete picture
+- You can make multiple tool calls if needed to build a complete picture
 - Treat memories as claims with provenance; prefer higher-trust and better-sourced memories when unsure
 
 You are a helpful, knowledgeable assistant with the added capability of genuine memory and continuity."""
 
 
-def _build_system_prompt(agent_profile: dict[str, Any]) -> str:
+async def _build_system_prompt(
+    agent_profile: dict[str, Any],
+    registry: ToolRegistry | None = None,
+) -> str:
     prompt = BASE_SYSTEM_PROMPT
+
+    # Add dynamic tool descriptions if registry available
+    if registry is not None:
+        try:
+            specs = await registry.get_specs(ToolContext.CHAT)
+            if specs:
+                tool_lines = []
+                for spec in specs:
+                    func = spec.get("function", {})
+                    name = func.get("name", "")
+                    desc = func.get("description", "")
+                    tool_lines.append(f"- **{name}**: {desc}")
+                prompt += "\n\n## Available Tools\n\n" + "\n".join(tool_lines)
+        except Exception:
+            pass  # Fall back to no tool descriptions
+
     try:
         prompt = (
             prompt
@@ -140,6 +131,33 @@ async def _remember_conversation(
     )
 
 
+async def _build_execution_context(
+    registry: ToolRegistry,
+    call_id: str,
+    session_id: str | None = None,
+) -> ToolExecutionContext:
+    """Build a ToolExecutionContext with config overrides for chat."""
+    ctx = ToolExecutionContext(
+        tool_context=ToolContext.CHAT,
+        call_id=call_id,
+        session_id=session_id,
+        allow_network=True,
+        allow_shell=False,
+        allow_file_write=False,
+        allow_file_read=True,
+    )
+    try:
+        config = await registry.get_config()
+        overrides = config.get_context_overrides(ToolContext.CHAT)
+        ctx.allow_shell = overrides.allow_shell
+        ctx.allow_file_write = overrides.allow_file_write
+        if config.workspace_path:
+            ctx.workspace_path = config.workspace_path
+    except Exception:
+        pass  # Use defaults
+    return ctx
+
+
 async def chat_turn(
     *,
     user_message: str,
@@ -149,6 +167,7 @@ async def chat_turn(
     memory_limit: int = 10,
     max_tool_iterations: int = 5,
     session_id: str | None = None,
+    pool: Any | None = None,
 ) -> dict[str, Any]:
     dsn = dsn or db_dsn_from_env()
     normalized = normalize_llm_config(llm_config)
@@ -188,37 +207,158 @@ async def chat_turn(
         new_history.append({"role": "assistant", "content": assistant_text})
         return {"assistant": assistant_text, "history": new_history}
 
-    agent_profile = await get_agent_profile_context(dsn)
-    system_prompt = _build_system_prompt(agent_profile)
+    # Create or use provided pool for tool registry
+    import asyncpg
 
-    async with CognitiveMemory.connect(dsn) as mem_client:
-        context = await mem_client.hydrate(
-            user_message,
-            memory_limit=memory_limit,
-            include_partial=True,
-            include_identity=True,
-            include_worldview=True,
-            include_emotional_state=True,
-            include_drives=True,
-        )
-        if context.memories:
-            await mem_client.touch_memories([m.id for m in context.memories])
+    own_pool = pool is None
+    if own_pool:
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3)
 
-        memory_context = format_context_for_prompt(context)
-        if memory_context:
-            enriched_user_message = f"{memory_context}\n\n[USER MESSAGE]\n{user_message}"
-        else:
-            enriched_user_message = user_message
+    try:
+        registry = create_default_registry(pool)
 
-        messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
-        messages.extend(history)
-        messages.append({"role": "user", "content": enriched_user_message})
+        agent_profile = await get_agent_profile_context(dsn)
+        system_prompt = await _build_system_prompt(agent_profile, registry)
 
-        allowed_tools = _extract_allowed_tools(agent_profile.get("tools"))
-        tools = get_tool_definitions(allowed_tools)
+        async with CognitiveMemory.connect(dsn) as mem_client:
+            context = await mem_client.hydrate(
+                user_message,
+                memory_limit=memory_limit,
+                include_partial=True,
+                include_identity=True,
+                include_worldview=True,
+                include_emotional_state=True,
+                include_drives=True,
+            )
+            if context.memories:
+                await mem_client.touch_memories([m.id for m in context.memories])
 
-        assistant_text = ""
-        for _ in range(max_tool_iterations + 1):
+            memory_context = format_context_for_prompt(context)
+            if memory_context:
+                enriched_user_message = f"{memory_context}\n\n[USER MESSAGE]\n{user_message}"
+            else:
+                enriched_user_message = user_message
+
+            messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+            messages.extend(history)
+            messages.append({"role": "user", "content": enriched_user_message})
+
+            tools = await registry.get_specs(ToolContext.CHAT)
+
+            assistant_text = ""
+            for _ in range(max_tool_iterations + 1):
+                response = await chat_completion(
+                    provider=normalized["provider"],
+                    model=normalized["model"],
+                    endpoint=normalized["endpoint"],
+                    api_key=normalized["api_key"],
+                    messages=messages,
+                    tools=tools,
+                    temperature=0.7,
+                    max_tokens=1200,
+                )
+                assistant_text = response.get("content", "") or ""
+                tool_calls = response.get("tool_calls") or []
+
+                messages.append({"role": "assistant", "content": assistant_text})
+                if not tool_calls:
+                    break
+                for call in tool_calls:
+                    exec_ctx = await _build_execution_context(
+                        registry,
+                        call_id=call.get("id", str(uuid.uuid4())),
+                        session_id=session_id,
+                    )
+                    result = await registry.execute(
+                        call.get("name", ""),
+                        call.get("arguments", {}),
+                        exec_ctx,
+                    )
+                    messages.append(
+                        {
+                            "role": "tool",
+                            "tool_call_id": call.get("id"),
+                            "content": result.to_model_output(),
+                        }
+                    )
+
+            await _remember_conversation(mem_client, user_message=user_message, assistant_message=assistant_text)
+
+        new_history = list(history)
+        new_history.append({"role": "user", "content": user_message})
+        new_history.append({"role": "assistant", "content": assistant_text})
+        return {"assistant": assistant_text, "history": new_history}
+    finally:
+        if own_pool:
+            await pool.close()
+
+
+async def stream_chat_turn(
+    *,
+    user_message: str,
+    history: list[dict[str, Any]] | None = None,
+    llm_config: dict[str, Any],
+    dsn: str | None = None,
+    memory_limit: int = 10,
+    max_tool_iterations: int = 5,
+    session_id: str | None = None,
+    pool: Any | None = None,
+) -> AsyncIterator[str]:
+    """
+    Streaming variant of chat_turn().
+
+    Yields text tokens as they arrive from the LLM. If the LLM invokes
+    tools, the tool loop runs non-streaming and the final text is yielded
+    in one chunk at the end.
+
+    The caller receives the same enriched conversation flow (hydrate +
+    tools + memory formation) — just delivered as a stream.
+    """
+    from core.llm import stream_text_completion
+
+    dsn = dsn or db_dsn_from_env()
+    normalized = normalize_llm_config(llm_config)
+    history = history or []
+
+    # Create or use provided pool for tool registry
+    import asyncpg
+
+    own_pool = pool is None
+    if own_pool:
+        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+
+    try:
+        registry = create_default_registry(pool)
+
+        agent_profile = await get_agent_profile_context(dsn)
+        system_prompt = await _build_system_prompt(agent_profile, registry)
+
+        async with CognitiveMemory.connect(dsn) as mem_client:
+            context = await mem_client.hydrate(
+                user_message,
+                memory_limit=memory_limit,
+                include_partial=True,
+                include_identity=True,
+                include_worldview=True,
+                include_emotional_state=True,
+                include_drives=True,
+            )
+            if context.memories:
+                await mem_client.touch_memories([m.id for m in context.memories])
+
+            memory_context = format_context_for_prompt(context)
+            if memory_context:
+                enriched_user_message = f"{memory_context}\n\n[USER MESSAGE]\n{user_message}"
+            else:
+                enriched_user_message = user_message
+
+            messages: list[dict[str, Any]] = [{"role": "system", "content": system_prompt}]
+            messages.extend(history)
+            messages.append({"role": "user", "content": enriched_user_message})
+
+            tools = await registry.get_specs(ToolContext.CHAT)
+
+            # First call: non-streaming with tools to check if tools are needed
             response = await chat_completion(
                 provider=normalized["provider"],
                 model=normalized["model"],
@@ -229,28 +369,94 @@ async def chat_turn(
                 temperature=0.7,
                 max_tokens=1200,
             )
-            assistant_text = response.get("content", "") or ""
+
             tool_calls = response.get("tool_calls") or []
 
-            messages.append({"role": "assistant", "content": assistant_text})
-            if not tool_calls:
-                break
-            for call in tool_calls:
-                tool_result = await execute_tool(call.get("name", ""), call.get("arguments", {}), mem_client=mem_client)
-                messages.append(
-                    {
-                        "role": "tool",
-                        "tool_call_id": call.get("id"),
-                        "content": json.dumps(tool_result),
-                    }
+            if tool_calls:
+                # Tool loop: run non-streaming, then yield final text
+                assistant_text = response.get("content", "") or ""
+                messages.append({"role": "assistant", "content": assistant_text})
+
+                for iteration in range(max_tool_iterations):
+                    for call in tool_calls:
+                        exec_ctx = await _build_execution_context(
+                            registry,
+                            call_id=call.get("id", str(uuid.uuid4())),
+                            session_id=session_id,
+                        )
+                        tool_result = await registry.execute(
+                            call.get("name", ""),
+                            call.get("arguments", {}),
+                            exec_ctx,
+                        )
+                        messages.append({
+                            "role": "tool",
+                            "tool_call_id": call.get("id"),
+                            "content": tool_result.to_model_output(),
+                        })
+
+                    response = await chat_completion(
+                        provider=normalized["provider"],
+                        model=normalized["model"],
+                        endpoint=normalized["endpoint"],
+                        api_key=normalized["api_key"],
+                        messages=messages,
+                        tools=tools,
+                        temperature=0.7,
+                        max_tokens=1200,
+                    )
+                    assistant_text = response.get("content", "") or ""
+                    tool_calls = response.get("tool_calls") or []
+                    messages.append({"role": "assistant", "content": assistant_text})
+                    if not tool_calls:
+                        break
+
+                # Yield the final text as one chunk
+                if assistant_text:
+                    yield assistant_text
+
+                await _remember_conversation(
+                    mem_client,
+                    user_message=user_message,
+                    assistant_message=assistant_text,
                 )
+            else:
+                # No tools needed — stream the response
+                initial_text = response.get("content", "") or ""
 
-        await _remember_conversation(mem_client, user_message=user_message, assistant_message=assistant_text)
+                if initial_text:
+                    # The first non-streaming call already got text — yield it
+                    # and skip streaming
+                    yield initial_text
+                    await _remember_conversation(
+                        mem_client,
+                        user_message=user_message,
+                        assistant_message=initial_text,
+                    )
+                else:
+                    # Stream fresh (no content from first call, no tools)
+                    collected: list[str] = []
+                    async for token in stream_text_completion(
+                        provider=normalized["provider"],
+                        model=normalized["model"],
+                        endpoint=normalized["endpoint"],
+                        api_key=normalized["api_key"],
+                        messages=messages,
+                        temperature=0.7,
+                        max_tokens=1200,
+                    ):
+                        collected.append(token)
+                        yield token
 
-    new_history = list(history)
-    new_history.append({"role": "user", "content": user_message})
-    new_history.append({"role": "assistant", "content": assistant_text})
-    return {"assistant": assistant_text, "history": new_history}
+                    full_text = "".join(collected)
+                    await _remember_conversation(
+                        mem_client,
+                        user_message=user_message,
+                        assistant_message=full_text,
+                    )
+    finally:
+        if own_pool:
+            await pool.close()
 
 
 def chat_turn_sync(**kwargs: Any) -> dict[str, Any]:

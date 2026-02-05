@@ -57,6 +57,15 @@ from .config import (
     save_tools_config,
 )
 
+from .hooks import (
+    FunctionHookHandler,
+    HookContext,
+    HookEvent,
+    HookHandler,
+    HookOutcome,
+    HookRegistry,
+)
+
 from .policy import (
     PolicyCheckResult,
     ToolPolicy,
@@ -71,6 +80,7 @@ from .registry import (
     ToolRegistry,
     ToolRegistryBuilder,
     create_default_registry,
+    create_full_registry,
 )
 
 from .memory import create_memory_tools
@@ -118,11 +128,33 @@ from .messaging import (
     SlackSendHandler,
     TelegramSendHandler,
 )
+from .code_execution import (
+    create_code_execution_tools,
+    CodeExecutionHandler,
+    cleanup_session_repl,
+)
+from .browser import (
+    create_browser_tools,
+    BrowserHandler,
+    cleanup_browser_session,
+)
 from .ingest import (
     create_ingest_tools,
     FastIngestHandler,
     SlowIngestHandler,
     HybridIngestHandler,
+)
+from .workflow import (
+    create_workflow_tools,
+    WorkflowHandler,
+    WorkflowPlan,
+    WorkflowStep,
+    WorkflowStepResult,
+)
+from .dynamic import (
+    create_dynamic_tools,
+    CreateToolHandler,
+    load_dynamic_tools,
 )
 
 __all__ = [
@@ -142,6 +174,13 @@ __all__ = [
     "ToolsConfig",
     "load_tools_config",
     "save_tools_config",
+    # Hooks
+    "FunctionHookHandler",
+    "HookContext",
+    "HookEvent",
+    "HookHandler",
+    "HookOutcome",
+    "HookRegistry",
     # Policy
     "PolicyCheckResult",
     "ToolPolicy",
@@ -154,6 +193,7 @@ __all__ = [
     "ToolRegistry",
     "ToolRegistryBuilder",
     "create_default_registry",
+    "create_full_registry",
     # Tool factories
     "create_memory_tools",
     "create_web_tools",
@@ -197,9 +237,27 @@ __all__ = [
     "DiscordSendHandler",
     "SlackSendHandler",
     "TelegramSendHandler",
+    # Code execution tools
+    "create_code_execution_tools",
+    "CodeExecutionHandler",
+    "cleanup_session_repl",
+    # Browser tools
+    "create_browser_tools",
+    "BrowserHandler",
+    "cleanup_browser_session",
     # Ingest tools
     "create_ingest_tools",
     "FastIngestHandler",
     "SlowIngestHandler",
     "HybridIngestHandler",
+    # Workflow tools
+    "create_workflow_tools",
+    "WorkflowHandler",
+    "WorkflowPlan",
+    "WorkflowStep",
+    "WorkflowStepResult",
+    # Dynamic tools
+    "create_dynamic_tools",
+    "CreateToolHandler",
+    "load_dynamic_tools",
 ]
