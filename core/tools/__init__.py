@@ -160,6 +160,10 @@ from .goals import (
     create_goal_tools,
     ManageGoalsHandler,
 )
+from .backlog import (
+    create_backlog_tools,
+    ManageBacklogHandler,
+)
 
 __all__ = [
     # Base classes
@@ -267,4 +271,7 @@ __all__ = [
     # Goal tools
     "create_goal_tools",
     "ManageGoalsHandler",
+    # Backlog tools
+    "create_backlog_tools",
+    "ManageBacklogHandler",
 ]

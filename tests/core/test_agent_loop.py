@@ -1118,3 +1118,515 @@ class TestIntegrationWithRegistry:
 
         # recall should be available in chat context
         assert "recall" in tool_names
+
+
+# ============================================================================
+# Unit: continuation nudge (Gap 5)
+# ============================================================================
+
+
+class TestContinuationNudge:
+    @patch("core.agent_loop.chat_completion")
+    async def test_no_continuation_by_default(self, mock_llm):
+        """max_continuations=0 (default) exits immediately when no tool calls."""
+        mock_llm.return_value = _text_response("Done.")
+        config = _make_config()
+        agent = AgentLoop(config)
+        result = await agent.run("Hi")
+
+        assert result.stopped_reason == "completed"
+        assert result.continuations_used == 0
+        assert result.iterations == 1
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_nudge_injects_prompt_and_continues(self, mock_llm):
+        """Continuation nudge injects prompt as user message and re-enters loop."""
+        mock_llm.side_effect = [
+            _text_response("I'm done."),   # First: no tool calls → nudge
+            _text_response("Verified."),    # Second: after nudge, responds again
+        ]
+
+        config = _make_config(
+            continuation_prompt="Did you verify your work?",
+            max_continuations=1,
+        )
+        agent = AgentLoop(config)
+        result = await agent.run("Do something")
+
+        assert result.text == "Verified."
+        assert result.continuations_used == 1
+        assert result.iterations == 2
+        # The nudge prompt should be in the messages
+        user_msgs = [m for m in result.messages if m.get("role") == "user"]
+        assert any("verify" in m["content"].lower() for m in user_msgs)
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_nudge_leads_to_tool_calls(self, mock_llm):
+        """After nudge, LLM may decide to call tools (self-correction)."""
+        tool_result = ToolResult.success_result("test passed")
+        tool_result.energy_spent = 1
+        registry = _mock_registry(execute_results={"run_test": tool_result})
+
+        mock_llm.side_effect = [
+            _text_response("I think I'm done."),  # No tools → nudge
+            _tool_response("Let me verify.", [_tool_call("run_test", {})]),  # After nudge: tool
+            _text_response("Tests pass, all good."),  # Final response
+        ]
+
+        config = _make_config(
+            registry=registry,
+            continuation_prompt="Check your work.",
+            max_continuations=1,
+        )
+        agent = AgentLoop(config)
+        result = await agent.run("Build feature")
+
+        assert result.text == "Tests pass, all good."
+        assert result.continuations_used == 1
+        assert len(result.tool_calls_made) == 1
+        assert result.tool_calls_made[0]["name"] == "run_test"
+        assert result.iterations == 3
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_max_continuations_respected(self, mock_llm):
+        """Stops nudging after max_continuations even if LLM keeps producing text-only."""
+        mock_llm.side_effect = [
+            _text_response("Attempt 1."),  # nudge 1
+            _text_response("Attempt 2."),  # nudge 2
+            _text_response("Attempt 3."),  # no more nudges, exits
+        ]
+
+        config = _make_config(
+            continuation_prompt="Try again.",
+            max_continuations=2,
+        )
+        agent = AgentLoop(config)
+        result = await agent.run("Do something")
+
+        assert result.continuations_used == 2
+        assert result.iterations == 3
+        assert result.text == "Attempt 3."
+        assert result.stopped_reason == "completed"
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_energy_budget_enforced_after_nudge(self, mock_llm):
+        """Energy check still fires after continuation nudge."""
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 8
+        registry = _mock_registry(execute_results={"tool": tool_result})
+
+        mock_llm.side_effect = [
+            _tool_response("Go", [_tool_call("tool", {})]),  # Spends 8 energy
+            _text_response("Maybe done."),  # nudge fires
+            # After nudge, energy check at top of loop: 8 >= 10 → no, continues
+            # But if another tool call spends more... let's just test text response
+            _text_response("Confirmed."),
+        ]
+
+        config = _make_config(
+            registry=registry,
+            energy_budget=10,
+            continuation_prompt="Verify.",
+            max_continuations=1,
+        )
+        agent = AgentLoop(config)
+        result = await agent.run("Test")
+
+        assert result.continuations_used == 1
+        # Energy was 8, budget was 10, so loop continued after nudge
+        assert result.stopped_reason == "completed"
+        assert result.energy_spent == 8
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_continuation_event_emitted(self, mock_llm):
+        """CONTINUATION event is emitted when nudge fires."""
+        events: list[AgentEventData] = []
+
+        async def _capture(e: AgentEventData) -> None:
+            events.append(e)
+
+        mock_llm.side_effect = [
+            _text_response("Done."),
+            _text_response("Verified."),
+        ]
+
+        config = _make_config(
+            continuation_prompt="Check.",
+            max_continuations=1,
+            on_event=_capture,
+        )
+        agent = AgentLoop(config)
+        await agent.run("Test")
+
+        cont_events = [e for e in events if e.event == AgentEvent.CONTINUATION]
+        assert len(cont_events) == 1
+        assert cont_events[0].data["continuation_number"] == 1
+        assert cont_events[0].data["max_continuations"] == 1
+
+
+# ============================================================================
+# Unit: runtime ContextOverrides (Gap 4)
+# ============================================================================
+
+
+class TestRuntimeContextOverrides:
+    @patch("core.agent_loop.chat_completion")
+    async def test_runtime_overrides_enable_shell(self, mock_llm):
+        """Runtime context_overrides grants allow_shell."""
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 0
+        registry = _mock_registry(execute_results={"tool": tool_result})
+
+        captured_ctx = None
+
+        async def _capture_execute(name, args, ctx):
+            nonlocal captured_ctx
+            captured_ctx = ctx
+            return tool_result
+
+        registry.execute = AsyncMock(side_effect=_capture_execute)
+
+        mock_llm.side_effect = [
+            _tool_response("Go", [_tool_call("tool", {})]),
+            _text_response("Done."),
+        ]
+
+        config = _make_config(
+            registry=registry,
+            context_overrides=ContextOverrides(allow_shell=True),
+        )
+        agent = AgentLoop(config)
+        await agent.run("Test")
+
+        assert captured_ctx is not None
+        assert captured_ctx.allow_shell is True
+        assert captured_ctx.allow_file_write is False  # Not granted
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_runtime_overrides_enable_file_write(self, mock_llm):
+        """Runtime context_overrides grants allow_file_write."""
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 0
+        registry = _mock_registry(execute_results={"tool": tool_result})
+
+        captured_ctx = None
+
+        async def _capture_execute(name, args, ctx):
+            nonlocal captured_ctx
+            captured_ctx = ctx
+            return tool_result
+
+        registry.execute = AsyncMock(side_effect=_capture_execute)
+
+        mock_llm.side_effect = [
+            _tool_response("Go", [_tool_call("tool", {})]),
+            _text_response("Done."),
+        ]
+
+        config = _make_config(
+            registry=registry,
+            context_overrides=ContextOverrides(allow_file_write=True),
+        )
+        agent = AgentLoop(config)
+        await agent.run("Test")
+
+        assert captured_ctx is not None
+        assert captured_ctx.allow_file_write is True
+        assert captured_ctx.allow_shell is False  # Not granted
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_no_runtime_overrides_means_db_only(self, mock_llm):
+        """context_overrides=None means only DB config applies (default behavior)."""
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 0
+        registry = _mock_registry(execute_results={"tool": tool_result})
+
+        captured_ctx = None
+
+        async def _capture_execute(name, args, ctx):
+            nonlocal captured_ctx
+            captured_ctx = ctx
+            return tool_result
+
+        registry.execute = AsyncMock(side_effect=_capture_execute)
+
+        mock_llm.side_effect = [
+            _tool_response("Go", [_tool_call("tool", {})]),
+            _text_response("Done."),
+        ]
+
+        # No context_overrides (default None)
+        config = _make_config(registry=registry)
+        agent = AgentLoop(config)
+        await agent.run("Test")
+
+        assert captured_ctx is not None
+        # Default ToolsConfig has no overrides → both False
+        assert captured_ctx.allow_shell is False
+        assert captured_ctx.allow_file_write is False
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_runtime_overrides_additive_cannot_revoke(self, mock_llm):
+        """Runtime overrides are additive — they can't revoke DB-granted permissions."""
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 0
+
+        # DB config grants shell
+        tools_config = ToolsConfig(
+            context_overrides={
+                ToolContext.CHAT: ContextOverrides(allow_shell=True),
+            },
+        )
+        registry = _mock_registry(
+            execute_results={"tool": tool_result},
+            config=tools_config,
+        )
+
+        captured_ctx = None
+
+        async def _capture_execute(name, args, ctx):
+            nonlocal captured_ctx
+            captured_ctx = ctx
+            return tool_result
+
+        registry.execute = AsyncMock(side_effect=_capture_execute)
+
+        mock_llm.side_effect = [
+            _tool_response("Go", [_tool_call("tool", {})]),
+            _text_response("Done."),
+        ]
+
+        # Runtime overrides: allow_shell=False (trying to revoke)
+        config = _make_config(
+            registry=registry,
+            context_overrides=ContextOverrides(allow_shell=False),
+        )
+        agent = AgentLoop(config)
+        await agent.run("Test")
+
+        assert captured_ctx is not None
+        # DB granted allow_shell=True, runtime can't revoke it
+        assert captured_ctx.allow_shell is True
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_allow_all_enables_both(self, mock_llm):
+        """allow_all=True grants both allow_shell and allow_file_write."""
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 0
+        registry = _mock_registry(execute_results={"tool": tool_result})
+
+        captured_ctx = None
+
+        async def _capture_execute(name, args, ctx):
+            nonlocal captured_ctx
+            captured_ctx = ctx
+            return tool_result
+
+        registry.execute = AsyncMock(side_effect=_capture_execute)
+
+        mock_llm.side_effect = [
+            _tool_response("Go", [_tool_call("tool", {})]),
+            _text_response("Done."),
+        ]
+
+        config = _make_config(
+            registry=registry,
+            context_overrides=ContextOverrides(allow_all=True),
+        )
+        agent = AgentLoop(config)
+        await agent.run("Test")
+
+        assert captured_ctx is not None
+        assert captured_ctx.allow_shell is True
+        assert captured_ctx.allow_file_write is True
+
+
+# ============================================================================
+# Unit: planning phases (Gap 1)
+# ============================================================================
+
+
+class TestPlanningPhases:
+    @patch("core.agent_loop.chat_completion")
+    async def test_no_planning_by_default(self, mock_llm):
+        """enable_planning=False (default) goes straight to execute loop."""
+        mock_llm.return_value = _text_response("Done.")
+        config = _make_config()
+        agent = AgentLoop(config)
+        result = await agent.run("Hi")
+
+        assert result.stopped_reason == "completed"
+        assert result.plan_text == ""
+        assert result.phases_completed == []
+        assert result.iterations == 1
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_plan_phase_produces_plan_text(self, mock_llm):
+        """Plan phase calls LLM with tools=None and stores plan_text."""
+        mock_llm.side_effect = [
+            _text_response("Plan: 1. Search 2. Summarize"),  # Plan phase (no tools)
+            _text_response("Executing the plan."),            # Execute phase
+            _text_response("All looks good."),                # Verify phase
+        ]
+
+        config = _make_config(enable_planning=True)
+        agent = AgentLoop(config)
+        result = await agent.run("Do research")
+
+        assert result.plan_text == "Plan: 1. Search 2. Summarize"
+        assert "plan" in result.phases_completed
+        assert "execute" in result.phases_completed
+        assert "verify" in result.phases_completed
+
+        # Plan phase should have been called with tools=None
+        first_call = mock_llm.call_args_list[0]
+        assert first_call.kwargs.get("tools") is None
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_verify_phase_catches_incomplete_work(self, mock_llm):
+        """Verify phase LLM can call tools (corrections happen here)."""
+        tool_result = ToolResult.success_result("test output: 1 failure")
+        tool_result.energy_spent = 1
+        fix_result = ToolResult.success_result("fixed")
+        fix_result.energy_spent = 1
+        registry = _mock_registry(execute_results={"run_test": tool_result, "fix_code": fix_result})
+
+        mock_llm.side_effect = [
+            _text_response("Plan: run tests then fix."),                      # Plan
+            _text_response("Done writing code."),                              # Execute: text only
+            # Verify phase:
+            _tool_response("Let me check.", [_tool_call("run_test", {})]),     # Verify: calls tool
+            _tool_response("Fixing.", [_tool_call("fix_code", {})]),           # Verify: calls fix
+            _text_response("All tests pass now."),                             # Verify: done
+        ]
+
+        config = _make_config(registry=registry, enable_planning=True)
+        agent = AgentLoop(config)
+        result = await agent.run("Write feature")
+
+        assert result.text == "All tests pass now."
+        assert len(result.tool_calls_made) == 2
+        assert result.phases_completed == ["plan", "execute", "verify"]
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_verify_text_only_completes(self, mock_llm):
+        """If verify phase LLM produces text only, loop completes normally."""
+        mock_llm.side_effect = [
+            _text_response("Plan: just say hello."),   # Plan
+            _text_response("Hello!"),                   # Execute
+            _text_response("Looks correct."),           # Verify: text only
+        ]
+
+        config = _make_config(enable_planning=True)
+        agent = AgentLoop(config)
+        result = await agent.run("Test")
+
+        assert result.text == "Looks correct."
+        assert result.stopped_reason == "completed"
+        assert result.phases_completed == ["plan", "execute", "verify"]
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_plan_phase_error_returns_error(self, mock_llm):
+        """LLM error during plan phase returns stopped_reason='error'."""
+        mock_llm.side_effect = RuntimeError("API rate limit")
+
+        config = _make_config(enable_planning=True)
+        agent = AgentLoop(config)
+        result = await agent.run("Test")
+
+        assert result.stopped_reason == "error"
+        assert "plan" in result.phases_completed
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_execute_energy_exhaustion_skips_verify(self, mock_llm):
+        """If execute phase runs out of energy, verify is skipped."""
+        tool_result = ToolResult.success_result("ok")
+        tool_result.energy_spent = 10
+        registry = _mock_registry(execute_results={"tool": tool_result})
+
+        mock_llm.side_effect = [
+            _text_response("Plan: use expensive tool."),               # Plan
+            _tool_response("Go", [_tool_call("tool", {})]),            # Execute: spends 10
+            # Energy check: 10 >= 10 -> energy exhausted, skip verify
+        ]
+
+        config = _make_config(
+            registry=registry,
+            energy_budget=10,
+            enable_planning=True,
+        )
+        agent = AgentLoop(config)
+        result = await agent.run("Test")
+
+        assert result.stopped_reason == "energy"
+        assert "plan" in result.phases_completed
+        assert "execute" in result.phases_completed
+        assert "verify" not in result.phases_completed
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_phase_change_events_emitted(self, mock_llm):
+        """PHASE_CHANGE events are emitted for each phase."""
+        events: list[AgentEventData] = []
+
+        async def _capture(e: AgentEventData) -> None:
+            events.append(e)
+
+        mock_llm.side_effect = [
+            _text_response("My plan."),
+            _text_response("Executed."),
+            _text_response("Verified."),
+        ]
+
+        config = _make_config(enable_planning=True, on_event=_capture)
+        agent = AgentLoop(config)
+        await agent.run("Test")
+
+        phase_events = [e for e in events if e.event == AgentEvent.PHASE_CHANGE]
+        phases = [e.data["phase"] for e in phase_events]
+        assert phases == ["plan", "execute", "verify"]
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_custom_planning_and_verify_prompts(self, mock_llm):
+        """Custom planning_prompt and verify_prompt are used."""
+        mock_llm.side_effect = [
+            _text_response("Custom plan."),
+            _text_response("Executed."),
+            _text_response("Custom verify."),
+        ]
+
+        config = _make_config(
+            enable_planning=True,
+            planning_prompt="Make a detailed plan for this task.",
+            verify_prompt="Did everything work correctly?",
+        )
+        agent = AgentLoop(config)
+        result = await agent.run("Do it")
+
+        # Check that custom prompts ended up in messages
+        user_msgs = [m["content"] for m in result.messages if m.get("role") == "user"]
+        assert "Make a detailed plan for this task." in user_msgs
+        assert "Did everything work correctly?" in user_msgs
+
+    @patch("core.agent_loop.chat_completion")
+    async def test_execute_with_tools_then_verify(self, mock_llm):
+        """Full flow: plan -> execute with tools -> verify."""
+        tool_result = ToolResult.success_result("file written")
+        tool_result.energy_spent = 2
+        registry = _mock_registry(execute_results={"write_file": tool_result})
+
+        mock_llm.side_effect = [
+            _text_response("Plan: write config file."),                              # Plan
+            _tool_response("Writing.", [_tool_call("write_file", {"path": "/x"})]),  # Execute: tool
+            _text_response("File written."),                                          # Execute: done
+            _text_response("File exists, looks good."),                               # Verify
+        ]
+
+        config = _make_config(registry=registry, enable_planning=True)
+        agent = AgentLoop(config)
+        result = await agent.run("Create config")
+
+        assert result.text == "File exists, looks good."
+        assert len(result.tool_calls_made) == 1
+        assert result.plan_text == "Plan: write config file."
+        assert result.phases_completed == ["plan", "execute", "verify"]
+        assert result.energy_spent == 2

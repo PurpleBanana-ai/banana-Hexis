@@ -11,6 +11,7 @@ PROMPT_RESOURCE_PATH = Path(__file__).resolve().parent / "prompts" / "personhood
 CONSENT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "consent.md"
 HEARTBEAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "heartbeat_system.md"
 HEARTBEAT_AGENTIC_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "heartbeat_agentic.md"
+HEARTBEAT_TASK_MODE_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "heartbeat_task_mode.md"
 TERMINATION_CONFIRM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_confirm.md"
 TERMINATION_REVIEW_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_review.md"
 SUBCONSCIOUS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "subconscious.md"
@@ -113,6 +114,16 @@ def load_heartbeat_agentic_prompt() -> str:
     return (
         "You are an autonomous agent in a heartbeat cycle. "
         "Use the tools provided to take actions within your energy budget."
+    )
+
+
+def load_heartbeat_task_mode_prompt() -> str:
+    if HEARTBEAT_TASK_MODE_PROMPT_PATH.exists():
+        return HEARTBEAT_TASK_MODE_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "You have pending tasks. Pick the highest-priority actionable task and make progress. "
+        "Use shell, filesystem, and code execution tools to complete real work. "
+        "Update task status and checkpoint as you go."
     )
 
 

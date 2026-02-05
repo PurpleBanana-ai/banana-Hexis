@@ -27,6 +27,7 @@ from core.tools.base import ToolContext, ToolExecutionContext
 
 if TYPE_CHECKING:
     import asyncpg
+    from core.tools.config import ContextOverrides
     from core.tools.registry import ToolRegistry
 
 logger = logging.getLogger(__name__)
@@ -48,6 +49,8 @@ class AgentEvent(str, Enum):
     ENERGY_EXHAUSTED = "energy_exhausted"
     LOOP_END = "loop_end"
     ERROR = "error"
+    PHASE_CHANGE = "phase_change"
+    CONTINUATION = "continuation"
 
 
 @dataclass
@@ -93,6 +96,18 @@ class AgentLoopConfig:
     on_event: Callable[[AgentEventData], Awaitable[None]] | None = None
     on_approval: Callable[[str, dict[str, Any]], Awaitable[bool]] | None = None
 
+    # Planning phases (Gap 1)
+    enable_planning: bool = False
+    planning_prompt: str | None = None
+    verify_prompt: str | None = None
+
+    # Runtime permission overrides (Gap 4)
+    context_overrides: "ContextOverrides | None" = None
+
+    # Continuation nudge (Gap 5)
+    continuation_prompt: str | None = None
+    max_continuations: int = 0
+
 
 # ---------------------------------------------------------------------------
 # Result
@@ -110,6 +125,9 @@ class AgentLoopResult:
     energy_spent: int
     timed_out: bool = False
     stopped_reason: str = "completed"
+    plan_text: str = ""
+    phases_completed: list[str] = field(default_factory=list)
+    continuations_used: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -144,6 +162,9 @@ class AgentLoop:
         self._tool_calls_made: list[dict[str, Any]] = []
         self._last_text: str = ""
         self._streaming: bool = False
+        self._continuations_used: int = 0
+        self._plan_text: str = ""
+        self._phases_completed: list[str] = []
 
     # ------------------------------------------------------------------
     # Public API
@@ -253,9 +274,62 @@ class AgentLoop:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]],
     ) -> AgentLoopResult:
-        """Core agentic loop: LLM -> tool calls -> results -> LLM."""
+        """Dispatcher: routes to planned or direct execution loop."""
+        if not self.config.enable_planning:
+            return await self._execute_loop(messages, tools)
+        return await self._planned_loop(messages, tools)
+
+    async def _llm_call(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]] | None = None,
+    ) -> dict[str, Any]:
+        """
+        Dispatch a single LLM call (streaming or non-streaming).
+
+        Returns the raw response dict with 'content' and 'tool_calls'.
+        Raises on LLM failure (caller is responsible for error handling).
+        """
         cfg = self.config
         llm = cfg.llm_config
+
+        if self._streaming:
+            async def _on_text_delta(token: str) -> None:
+                await self._emit(AgentEvent.TEXT_DELTA, {
+                    "text": token,
+                    "iteration": self._iteration_count,
+                })
+
+            return await stream_chat_completion(
+                provider=llm["provider"],
+                model=llm["model"],
+                endpoint=llm.get("endpoint"),
+                api_key=llm.get("api_key"),
+                messages=messages,
+                tools=tools if tools else None,
+                temperature=cfg.temperature,
+                max_tokens=cfg.max_tokens,
+                on_text_delta=_on_text_delta,
+            )
+        else:
+            return await chat_completion(
+                provider=llm["provider"],
+                model=llm["model"],
+                endpoint=llm.get("endpoint"),
+                api_key=llm.get("api_key"),
+                messages=messages,
+                tools=tools if tools else None,
+                temperature=cfg.temperature,
+                max_tokens=cfg.max_tokens,
+            )
+
+    async def _execute_loop(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> AgentLoopResult:
+        """Core agentic loop: LLM -> tool calls -> results -> LLM."""
+        cfg = self.config
 
         while True:
             # Check iteration limit
@@ -274,36 +348,7 @@ class AgentLoop:
 
             # LLM call
             try:
-                if self._streaming:
-                    # Token-level streaming: emit TEXT_DELTA per token
-                    async def _on_text_delta(token: str) -> None:
-                        await self._emit(AgentEvent.TEXT_DELTA, {
-                            "text": token,
-                            "iteration": self._iteration_count,
-                        })
-
-                    response = await stream_chat_completion(
-                        provider=llm["provider"],
-                        model=llm["model"],
-                        endpoint=llm.get("endpoint"),
-                        api_key=llm.get("api_key"),
-                        messages=messages,
-                        tools=tools if tools else None,
-                        temperature=cfg.temperature,
-                        max_tokens=cfg.max_tokens,
-                        on_text_delta=_on_text_delta,
-                    )
-                else:
-                    response = await chat_completion(
-                        provider=llm["provider"],
-                        model=llm["model"],
-                        endpoint=llm.get("endpoint"),
-                        api_key=llm.get("api_key"),
-                        messages=messages,
-                        tools=tools if tools else None,
-                        temperature=cfg.temperature,
-                        max_tokens=cfg.max_tokens,
-                    )
+                response = await self._llm_call(messages, tools)
             except Exception as e:
                 logger.error("LLM call failed at iteration %d: %s", self._iteration_count, e)
                 await self._emit(AgentEvent.ERROR, {"error": str(e), "iteration": self._iteration_count})
@@ -328,6 +373,20 @@ class AgentLoop:
             messages.append(assistant_msg)
 
             if not tool_calls:
+                if (
+                    self.config.continuation_prompt is not None
+                    and self._continuations_used < self.config.max_continuations
+                ):
+                    self._continuations_used += 1
+                    await self._emit(AgentEvent.CONTINUATION, {
+                        "continuation_number": self._continuations_used,
+                        "max_continuations": self.config.max_continuations,
+                    })
+                    messages.append({
+                        "role": "user",
+                        "content": self.config.continuation_prompt,
+                    })
+                    continue
                 return self._make_result(messages, "completed")
 
             # Process tool calls
@@ -403,6 +462,78 @@ class AgentLoop:
         return self._make_result(messages, "completed")  # pragma: no cover
 
     # ------------------------------------------------------------------
+    # Planned loop (Gap 1: plan → execute → verify)
+    # ------------------------------------------------------------------
+
+    _DEFAULT_PLANNING_PROMPT = (
+        "Before acting, think through your approach. What are the steps needed? "
+        "What could go wrong? How will you verify success? Produce a brief plan."
+    )
+    _DEFAULT_VERIFY_PROMPT = (
+        "Review what you just did. Did you achieve the goal? If something needs "
+        "fixing, take action now. If everything looks good, summarize what was accomplished."
+    )
+
+    async def _planned_loop(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+    ) -> AgentLoopResult:
+        """
+        Three-phase agentic loop: Plan → Execute → Verify.
+
+        - Plan: LLM thinks without tools, producing a plan
+        - Execute: Normal tool-use loop (_execute_loop)
+        - Verify: LLM reviews results, may call tools for corrections
+        """
+        # Phase 1: Plan
+        await self._emit(AgentEvent.PHASE_CHANGE, {"phase": "plan"})
+        self._phases_completed.append("plan")
+
+        planning_prompt = self.config.planning_prompt or self._DEFAULT_PLANNING_PROMPT
+        messages.append({"role": "user", "content": planning_prompt})
+        self._iteration_count += 1
+
+        try:
+            response = await self._llm_call(messages, tools=None)
+        except Exception as e:
+            logger.error("Plan phase LLM call failed: %s", e)
+            await self._emit(AgentEvent.ERROR, {"error": str(e), "phase": "plan"})
+            return self._make_result(messages, "error")
+
+        plan_text = response.get("content", "") or ""
+        if plan_text:
+            self._last_text = plan_text
+            self._plan_text = plan_text
+            if not self._streaming:
+                await self._emit(AgentEvent.TEXT_DELTA, {"text": plan_text, "iteration": self._iteration_count})
+
+        messages.append({"role": "assistant", "content": plan_text})
+
+        # Phase 2: Execute
+        await self._emit(AgentEvent.PHASE_CHANGE, {"phase": "execute"})
+        self._phases_completed.append("execute")
+
+        exec_result = await self._execute_loop(messages, tools)
+
+        # If execute didn't complete normally, skip verify
+        if exec_result.stopped_reason != "completed":
+            return exec_result
+
+        # Phase 3: Verify
+        await self._emit(AgentEvent.PHASE_CHANGE, {"phase": "verify"})
+        self._phases_completed.append("verify")
+
+        verify_prompt = self.config.verify_prompt or self._DEFAULT_VERIFY_PROMPT
+        messages.append({"role": "user", "content": verify_prompt})
+
+        # Reset continuation counter for verify phase
+        self._continuations_used = 0
+
+        verify_result = await self._execute_loop(messages, tools)
+        return verify_result
+
+    # ------------------------------------------------------------------
     # Helpers
     # ------------------------------------------------------------------
 
@@ -436,6 +567,18 @@ class AgentLoop:
         except Exception:
             pass
 
+        # Apply runtime overrides from AgentLoopConfig (additive only — can
+        # grant permissions but never revoke what the DB config granted)
+        if cfg.context_overrides is not None:
+            rt = cfg.context_overrides
+            if rt.allow_shell:
+                ctx.allow_shell = True
+            if rt.allow_file_write:
+                ctx.allow_file_write = True
+            if rt.allow_all:
+                ctx.allow_shell = True
+                ctx.allow_file_write = True
+
         return ctx
 
     async def _emit(self, event: AgentEvent, data: dict[str, Any] | None = None) -> None:
@@ -459,6 +602,9 @@ class AgentLoop:
             energy_spent=self._energy_spent,
             timed_out=False,
             stopped_reason=stopped_reason,
+            plan_text=self._plan_text,
+            phases_completed=list(self._phases_completed),
+            continuations_used=self._continuations_used,
         )
 
 

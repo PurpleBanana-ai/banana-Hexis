@@ -23,6 +23,7 @@ def build_heartbeat_decision_prompt(context: dict[str, Any]) -> str:
     energy = context.get("energy", {})
     allowed_actions = context.get("allowed_actions", [])
     action_costs = context.get("action_costs", {})
+    backlog = context.get("backlog", {})
     hb_number = context.get("heartbeat_number", 0)
 
     prompt = f"""## Heartbeat #{hb_number}
@@ -97,6 +98,9 @@ Issues:
 ## Energy
 Available: {energy.get('current', 0)}
 Max: {energy.get('max', 20)}
+
+## Backlog
+{_format_backlog(backlog)}
 
 ## Allowed Actions
 {_format_allowed_actions(allowed_actions)}
@@ -347,6 +351,36 @@ def _format_transformations(items: Any) -> str:
             f"  - [{subcategory}] {label[:60]}{ref_txt}{evidence_txt}{requirement_txt}{sample_txt}"
         )
     return "\n".join(lines) if lines else "  (none)"
+
+
+def _format_backlog(backlog: Any) -> str:
+    if not isinstance(backlog, dict):
+        return "  (no backlog)"
+    counts = backlog.get("counts", {})
+    actionable = backlog.get("actionable", [])
+    if not counts and not actionable:
+        return "  (no pending tasks)"
+
+    lines: list[str] = []
+    if counts:
+        count_parts = [f"{status}: {count}" for status, count in counts.items()]
+        lines.append(f"  Counts: {', '.join(count_parts)}")
+
+    if actionable:
+        lines.append("  Actionable tasks:")
+        for item in actionable[:10]:
+            if not isinstance(item, dict):
+                continue
+            title = item.get("title", "Untitled")
+            priority = item.get("priority", "normal")
+            owner = item.get("owner", "agent")
+            status = item.get("status", "todo")
+            checkpoint = " [has checkpoint]" if item.get("has_checkpoint") else ""
+            lines.append(f"    - [{priority}] {title} (owner: {owner}, status: {status}){checkpoint}")
+    else:
+        lines.append("  (no actionable tasks)")
+
+    return "\n".join(lines)
 
 
 def _format_costs(costs: dict[str, Any]) -> str:

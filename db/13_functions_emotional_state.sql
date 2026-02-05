@@ -854,7 +854,8 @@ BEGIN
             FROM drives
             WHERE current_level >= urgency_threshold * 0.8
         ),
-        'emotional_state', get_current_affective_state()
+        'emotional_state', get_current_affective_state(),
+        'backlog', get_backlog_snapshot()
     );
 END;
 $$ LANGUAGE plpgsql;
