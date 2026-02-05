@@ -30,12 +30,14 @@ async def apply_heartbeat_decision(
     heartbeat_id: str,
     decision: dict[str, Any],
     start_index: int,
+    pre_executed_actions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     raw = await conn.fetchval(
-        "SELECT apply_heartbeat_decision($1::uuid, $2::jsonb, $3::int)",
+        "SELECT apply_heartbeat_decision($1::uuid, $2::jsonb, $3::int, $4::jsonb)",
         heartbeat_id,
         json.dumps(decision),
         start_index,
+        json.dumps(pre_executed_actions or []),
     )
     return _coerce_json(raw)
 

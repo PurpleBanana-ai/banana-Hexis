@@ -13,6 +13,10 @@ HEARTBEAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "heartbeat
 TERMINATION_CONFIRM_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_confirm.md"
 TERMINATION_REVIEW_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "termination_review.md"
 SUBCONSCIOUS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "subconscious.md"
+RLM_HEARTBEAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_heartbeat_system.md"
+RLM_CHAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_chat_system.md"
+RLM_SLOW_INGEST_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_slow_ingest_system.md"
+RLM_RECONSOLIDATION_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_reconsolidation_system.md"
 
 
 @dataclass(frozen=True)
@@ -129,7 +133,41 @@ def load_subconscious_prompt() -> str:
     )
 
 
-PromptKind = Literal["heartbeat", "reflect", "conversation"]
+@lru_cache(maxsize=1)
+def load_rlm_heartbeat_prompt() -> str:
+    if RLM_HEARTBEAT_PROMPT_PATH.exists():
+        return RLM_HEARTBEAT_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "RLM heartbeat system prompt missing. Use memory syscalls and FINAL() to respond."
+    )
+
+
+@lru_cache(maxsize=1)
+def load_rlm_chat_prompt() -> str:
+    if RLM_CHAT_PROMPT_PATH.exists():
+        return RLM_CHAT_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "RLM chat system prompt missing. Use memory syscalls and FINAL() to respond."
+    )
+
+
+@lru_cache(maxsize=1)
+def load_rlm_slow_ingest_prompt() -> str:
+    if RLM_SLOW_INGEST_PROMPT_PATH.exists():
+        return RLM_SLOW_INGEST_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "RLM slow ingest system prompt missing. Use memory syscalls and FINAL() to respond with JSON assessment."
+    )
+
+
+@lru_cache(maxsize=1)
+def load_reconsolidation_prompt() -> str:
+    if RLM_RECONSOLIDATION_PROMPT_PATH.exists():
+        return RLM_RECONSOLIDATION_PROMPT_PATH.read_text(encoding="utf-8")
+    return "Reconsolidation prompt missing. Respond with JSON verdicts for each memory."
+
+
+PromptKind = Literal["heartbeat", "reflect", "conversation", "ingest"]
 
 
 def compose_personhood_prompt(kind: PromptKind) -> str:
@@ -147,6 +185,8 @@ def compose_personhood_prompt(kind: PromptKind) -> str:
         keys = ["core_identity", "self_model_maintenance", "value_system", "narrative_identity", "relational_system"]
     elif kind == "conversation":
         keys = ["core_identity", "relational_system", "affective_system", "conversational_presence"]
+    elif kind == "ingest":
+        keys = ["core_identity", "affective_system", "value_system"]
     else:
         raise ValueError(f"Unknown kind: {kind}")
 

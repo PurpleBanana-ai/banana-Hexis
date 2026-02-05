@@ -153,6 +153,10 @@ CREATE OR REPLACE FUNCTION get_config_int(p_key TEXT)
 RETURNS INT AS $$
     SELECT (value #>> '{}')::int FROM config WHERE key = p_key;
 $$ LANGUAGE sql STABLE;
+CREATE OR REPLACE FUNCTION get_config_bool(p_key TEXT)
+RETURNS BOOLEAN AS $$
+    SELECT COALESCE((value #>> '{}')::boolean, FALSE) FROM config WHERE key = p_key;
+$$ LANGUAGE sql STABLE;
 CREATE OR REPLACE FUNCTION get_agent_consent_status()
 RETURNS TEXT AS $$
 DECLARE

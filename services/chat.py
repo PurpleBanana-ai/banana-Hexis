@@ -148,10 +148,45 @@ async def chat_turn(
     dsn: str | None = None,
     memory_limit: int = 10,
     max_tool_iterations: int = 5,
+    session_id: str | None = None,
 ) -> dict[str, Any]:
     dsn = dsn or db_dsn_from_env()
     normalized = normalize_llm_config(llm_config)
     history = history or []
+
+    # Check if RLM is enabled for chat
+    try:
+        import asyncpg
+        _conn = await asyncpg.connect(dsn)
+        try:
+            use_rlm_raw = await _conn.fetchval("SELECT get_config_bool('chat.use_rlm')")
+            use_rlm = bool(use_rlm_raw)
+        finally:
+            await _conn.close()
+    except Exception:
+        use_rlm = False
+
+    if use_rlm:
+        from services.hexis_rlm import run_chat_turn
+        result = await run_chat_turn(
+            user_message=user_message,
+            history=history,
+            llm_config=normalized,
+            dsn=dsn,
+            session_id=session_id,
+        )
+        assistant_text = result["response"]
+        # Still form memory from the turn
+        async with CognitiveMemory.connect(dsn) as mem_client:
+            await _remember_conversation(
+                mem_client,
+                user_message=user_message,
+                assistant_message=assistant_text,
+            )
+        new_history = list(history)
+        new_history.append({"role": "user", "content": user_message})
+        new_history.append({"role": "assistant", "content": assistant_text})
+        return {"assistant": assistant_text, "history": new_history}
 
     agent_profile = await get_agent_profile_context(dsn)
     system_prompt = _build_system_prompt(agent_profile)

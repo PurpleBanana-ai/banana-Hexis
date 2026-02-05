@@ -500,6 +500,7 @@ class MemoryToolHandler:
                 user=self.db_config.get('user', 'postgres'),
                 password=self.db_config.get('password', 'password')
             )
+            self.conn.autocommit = True
     
     def close(self):
         """Close database connection."""
@@ -1270,6 +1271,8 @@ def cross_join_query(
     - SQL: optionally filters candidates by joining against `table` with simple equality predicates.
     - Neighborhood: optionally attaches cached neighbors from `memory_neighborhoods`.
     """
+    if not HAS_PSYCOPG2:
+        raise RuntimeError("psycopg2 is required for cross_join_query")
     if not query_text:
         return []
 

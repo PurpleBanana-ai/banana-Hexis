@@ -322,12 +322,30 @@ Hexis ingestion is tiered and emotionally aware. It creates an encounter memory,
 hexis ingest --input ./documents --mode auto
 ```
 
-Modes:
+#### Standard Modes
 - `deep` (section-by-section appraisal + extraction)
 - `standard` (single appraisal + chunked extraction)
 - `shallow` (summary-only extraction)
 - `archive` (store access only; no extraction)
 - `auto` (size-based default)
+
+#### Conscious Ingestion Modes
+
+These modes use the RLM (Recursive Language Model) loop to consciously read and evaluate content against the agent's existing knowledge and worldview:
+
+- `fast` (energy: 2) -- Quick chunking + fact extraction + basic graph linking. Maps to the standard pipeline. No deep reasoning.
+- `slow` (energy: 5) -- Runs a mini-RLM loop per chunk. The agent consciously reads each chunk: searches related memories, compares against worldview, forms emotional reactions, writes analysis, and decides whether to **accept**, **contest**, or **question** each piece of knowledge. Contested content is stored with a `contested` flag and `CONTESTED_BECAUSE` graph edges linking to the beliefs that caused rejection.
+- `hybrid` (energy: 3) -- Fast first pass to score all chunks, then slow-processes only high-signal chunks (importance > 0.7, worldview-contradicting, or goal-related). Best balance of thoroughness and efficiency.
+
+```bash
+# Conscious slow reading of an important document
+hexis ingest --file philosophy.md --mode slow
+
+# Hybrid: fast scan, deep-read only what matters
+hexis ingest --input ./research/ --mode hybrid
+```
+
+The agent can also choose these modes autonomously during heartbeats via the `fast_ingest`, `slow_ingest`, and `hybrid_ingest` tools.
 
 Useful flags:
 - `--min-importance 0.6` (floor importance)
@@ -659,6 +677,7 @@ Hexis includes a modular, user-configurable tools system that gives the agent ex
 | **Calendar** | `calendar_events`, `calendar_create` | Google Calendar integration |
 | **Email** | `email_send`, `email_send_sendgrid` | SMTP and SendGrid email sending |
 | **Messaging** | `discord_send`, `slack_send`, `telegram_send` | Discord, Slack, and Telegram messaging |
+| **Ingest** | `fast_ingest`, `slow_ingest`, `hybrid_ingest` | Fast, slow (conscious RLM reading), and hybrid content ingestion |
 
 ### Context-Specific Permissions
 
@@ -717,7 +736,9 @@ Each tool has an energy cost that's deducted from the agent's energy budget:
 | `web_search`, `web_fetch`, `web_summarize`, `calendar_events` | 2 |
 | `shell`, `write_file`, `calendar_create` | 3 |
 | `email_send`, `email_send_sendgrid` | 4 |
-| `discord_send`, `slack_send`, `telegram_send` | 5 |
+| `fast_ingest` | 2 |
+| `hybrid_ingest` | 3 |
+| `discord_send`, `slack_send`, `telegram_send`, `slow_ingest` | 5 |
 
 The heartbeat context has a default max energy of 5 per tool call. Override costs with:
 

@@ -23,9 +23,10 @@ logger = logging.getLogger(__name__)
 
 
 class ExternalCallProcessor:
-    def __init__(self, *, max_retries: int = 3, tool_registry: "ToolRegistry | None" = None):
+    def __init__(self, *, max_retries: int = 3, tool_registry: "ToolRegistry | None" = None, dsn: str | None = None):
         self.max_retries = max_retries
         self._tool_registry = tool_registry
+        self._dsn = dsn
 
     def set_tool_registry(self, registry: "ToolRegistry") -> None:
         """Set the tool registry for processing tool_use calls."""
@@ -109,6 +110,8 @@ class ExternalCallProcessor:
 
     async def _process_think_call(self, conn, call_input: dict[str, Any]) -> dict[str, Any]:
         kind = (call_input.get("kind") or "").strip() or "heartbeat_decision"
+        if kind == "heartbeat_decision_rlm":
+            return await self._process_heartbeat_decision_rlm_call(conn, call_input)
         if kind == "heartbeat_decision":
             return await self._process_heartbeat_decision_call(conn, call_input)
         if kind == "brainstorm_goals":
@@ -163,6 +166,36 @@ class ExternalCallProcessor:
             "heartbeat_id": heartbeat_id,
             "raw_response": raw,
         }
+
+    async def _process_heartbeat_decision_rlm_call(self, conn, call_input: dict[str, Any]) -> dict[str, Any]:
+        """Process heartbeat decision using the RLM loop with direct tool access."""
+        from services.hexis_rlm import run_heartbeat_decision
+        import asyncio
+
+        context = call_input.get("context", {})
+        heartbeat_id = call_input.get("heartbeat_id")
+        loop = asyncio.get_event_loop()
+
+        llm_config = await load_llm_config(conn, "llm.heartbeat")
+
+        if not self._dsn:
+            from core.agent_api import db_dsn_from_env
+            self._dsn = db_dsn_from_env()
+
+        try:
+            result = await run_heartbeat_decision(
+                heartbeat_id=heartbeat_id,
+                turn_snapshot=context,
+                llm_config=llm_config,
+                dsn=self._dsn,
+                tool_registry=self._tool_registry,
+                loop=loop,
+            )
+        except Exception as e:
+            logger.exception("RLM heartbeat decision failed, falling back to legacy")
+            return await self._process_heartbeat_decision_call(conn, call_input)
+
+        return result
 
     async def _process_brainstorm_goals_call(self, conn, call_input: dict[str, Any]) -> dict[str, Any]:
         heartbeat_id = call_input.get("heartbeat_id")

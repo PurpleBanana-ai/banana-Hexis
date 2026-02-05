@@ -782,6 +782,83 @@ BEGIN
     );
 END;
 $$ LANGUAGE plpgsql;
+
+-- Snapshot variant for RLM: uses stub-only recent memories and contradictions
+CREATE OR REPLACE FUNCTION gather_turn_snapshot()
+RETURNS JSONB AS $$
+DECLARE
+    state_record RECORD;
+    action_costs JSONB;
+    contradictions JSONB;
+    allowed_actions JSONB;
+BEGIN
+    SELECT * INTO state_record FROM heartbeat_state WHERE id = 1;
+    allowed_actions := get_config('heartbeat.allowed_actions');
+
+    IF jsonb_typeof(allowed_actions) = 'array' THEN
+        SELECT jsonb_object_agg(
+            regexp_replace(key, '^heartbeat\.cost_', ''),
+            value
+        ) INTO action_costs
+        FROM config
+        WHERE key LIKE 'heartbeat.cost_%'
+          AND regexp_replace(key, '^heartbeat\.cost_', '') IN (
+              SELECT value FROM jsonb_array_elements_text(allowed_actions)
+          );
+    ELSE
+        SELECT jsonb_object_agg(
+            regexp_replace(key, '^heartbeat\.cost_', ''),
+            value
+        ) INTO action_costs
+        FROM config
+        WHERE key LIKE 'heartbeat.cost_%';
+    END IF;
+    action_costs := COALESCE(action_costs, '{}'::jsonb);
+
+    contradictions := get_contradictions_stub(5);
+
+    RETURN jsonb_build_object(
+        'agent', get_agent_profile_context(),
+        'environment', get_environment_snapshot(),
+        'goals', get_goals_snapshot(),
+        'recent_memory_stubs', get_recent_context_stub(5),
+        'identity', get_identity_context(),
+        'worldview', get_worldview_context(),
+        'self_model', get_self_model_context(10),
+        'narrative', get_narrative_context(),
+        'relationships', get_relationships_context(6),
+        'contradictions', contradictions,
+        'contradictions_count', COALESCE(jsonb_array_length(contradictions), 0),
+        'emotional_patterns', get_emotional_patterns_context(5),
+        'active_transformations', get_active_transformations_context(5),
+        'transformations_ready', check_transformation_readiness(),
+        'energy', jsonb_build_object(
+            'current', state_record.current_energy,
+            'max', get_config_float('heartbeat.max_energy')
+        ),
+        'allowed_actions', allowed_actions,
+        'action_costs', action_costs,
+        'heartbeat_number', state_record.heartbeat_count,
+        'urgent_drives', (
+            SELECT COALESCE(
+                jsonb_agg(
+                    jsonb_build_object(
+                        'name', name,
+                        'level', current_level,
+                        'urgency_ratio', current_level / NULLIF(urgency_threshold, 0)
+                    )
+                    ORDER BY current_level DESC
+                ),
+                '[]'::jsonb
+            )
+            FROM drives
+            WHERE current_level >= urgency_threshold * 0.8
+        ),
+        'emotional_state', get_current_affective_state()
+    );
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE OR REPLACE FUNCTION complete_heartbeat(
     p_heartbeat_id UUID,
     p_reasoning TEXT,

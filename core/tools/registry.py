@@ -342,11 +342,46 @@ class ToolRegistry:
 
             return results
 
+        config = await self.get_config()
+        budgeting = (
+            context.tool_context == ToolContext.HEARTBEAT
+            and context.energy_available is not None
+        )
+        denied_reasons: dict[int, str] = {}
+        energy_budget: dict[int, int] = {}
+
+        if budgeting:
+            remaining = int(context.energy_available or 0)
+            max_per_tool = config.get_context_overrides(ToolContext.HEARTBEAT).max_energy_per_tool
+
+            for idx, (tool_name, _) in enumerate(calls):
+                handler = self.get(tool_name)
+                cost = 0
+                if handler:
+                    spec = handler.spec
+                    if config.is_tool_enabled_for_context(spec.name, spec.category, context.tool_context) and context.tool_context in spec.allowed_contexts:
+                        cost = config.get_energy_cost(tool_name, spec.energy_cost)
+
+                energy_budget[idx] = cost
+                if max_per_tool is not None and cost > max_per_tool:
+                    denied_reasons[idx] = (
+                        f"Tool '{tool_name}' cost ({cost}) exceeds max per tool ({max_per_tool})"
+                    )
+                    continue
+                if cost > remaining:
+                    denied_reasons[idx] = f"Insufficient energy: need {cost}, have {remaining}"
+                    continue
+                remaining -= cost
+
+            context.energy_available = remaining
+
         # Parallel execution: separate parallel-safe from sequential
         parallel_calls = []
         sequential_calls = []
 
         for i, (tool_name, arguments) in enumerate(calls):
+            if i in denied_reasons:
+                continue
             handler = self.get(tool_name)
             if handler and handler.spec.supports_parallel:
                 parallel_calls.append((i, tool_name, arguments))
@@ -355,15 +390,26 @@ class ToolRegistry:
 
         results: list[tuple[int, ToolResult]] = []
 
+        # Add pre-denied results (energy budget)
+        for i in sorted(denied_reasons.keys()):
+            result = ToolResult.error_result(
+                denied_reasons[i],
+                ToolErrorType.INSUFFICIENT_ENERGY,
+            )
+            results.append((i, result))
+
         # Run parallel calls concurrently
         if parallel_calls:
             async def run_one(idx: int, name: str, args: dict) -> tuple[int, ToolResult]:
+                energy_available = context.energy_available
+                if budgeting:
+                    energy_available = energy_budget.get(idx, 0)
                 call_context = ToolExecutionContext(
                     tool_context=context.tool_context,
                     call_id=str(uuid.uuid4()),
                     heartbeat_id=context.heartbeat_id,
                     session_id=context.session_id,
-                    energy_available=context.energy_available,
+                    energy_available=energy_available,
                     workspace_path=context.workspace_path,
                     allow_network=context.allow_network,
                     allow_shell=context.allow_shell,
@@ -380,12 +426,15 @@ class ToolRegistry:
 
         # Run sequential calls in order
         for idx, tool_name, arguments in sequential_calls:
+            energy_available = context.energy_available
+            if budgeting:
+                energy_available = energy_budget.get(idx, 0)
             call_context = ToolExecutionContext(
                 tool_context=context.tool_context,
                 call_id=str(uuid.uuid4()),
                 heartbeat_id=context.heartbeat_id,
                 session_id=context.session_id,
-                energy_available=context.energy_available,
+                energy_available=energy_available,
                 workspace_path=context.workspace_path,
                 allow_network=context.allow_network,
                 allow_shell=context.allow_shell,
@@ -471,6 +520,8 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     from .email import create_email_tools
     from .messaging import create_messaging_tools
 
+    from .ingest import create_ingest_tools
+
     builder = ToolRegistryBuilder(pool)
     builder.add_all(create_memory_tools())
     builder.add_all(create_web_tools())
@@ -479,5 +530,6 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     builder.add_all(create_calendar_tools())
     builder.add_all(create_email_tools())
     builder.add_all(create_messaging_tools())
+    builder.add_all(create_ingest_tools())
 
     return builder.build()

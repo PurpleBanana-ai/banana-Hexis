@@ -1,0 +1,191 @@
+import json
+import sys
+import types
+from types import SimpleNamespace
+
+import pytest
+
+from core.tools.base import ToolExecutionContext, ToolContext, ToolErrorType
+from core.tools.registry import ToolRegistry
+from core.tools.config import ToolsConfig
+from core.tools.policy import PolicyCheckResult
+from core.tools.base import ToolHandler, ToolResult, ToolSpec, ToolCategory
+from core.tools.web import WebFetchHandler, WebSummarizeHandler
+import core.memory_tools as memory_tools
+
+
+class DummyHandler(ToolHandler):
+    def __init__(self, name: str, cost: int, supports_parallel: bool = True):
+        self._spec = ToolSpec(
+            name=name,
+            description="dummy",
+            parameters={"type": "object", "properties": {}},
+            category=ToolCategory.MEMORY,
+            energy_cost=cost,
+            is_read_only=True,
+            supports_parallel=supports_parallel,
+        )
+
+    @property
+    def spec(self) -> ToolSpec:
+        return self._spec
+
+    async def execute(self, arguments, context):
+        return ToolResult.success_result({"ok": True})
+
+
+@pytest.mark.core
+def test_is_path_allowed_blocks_prefix_escape(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = ToolExecutionContext(tool_context=ToolContext.CHAT, call_id="x", workspace_path=str(workspace))
+
+    assert ctx.is_path_allowed(str(workspace / "file.txt")) is True
+
+    sneaky = tmp_path / "workspace_evil" / "file.txt"
+    sneaky.parent.mkdir()
+    assert ctx.is_path_allowed(str(sneaky)) is False
+
+
+@pytest.mark.core
+def test_is_path_allowed_blocks_symlink_escape(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "secret.txt").write_text("secret")
+
+    link = workspace / "link"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks not supported on this platform")
+
+    ctx = ToolExecutionContext(tool_context=ToolContext.CHAT, call_id="x", workspace_path=str(workspace))
+    assert ctx.is_path_allowed(str(link / "secret.txt")) is False
+
+
+@pytest.mark.core
+def test_is_path_allowed_allows_nonexistent_within_workspace(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    ctx = ToolExecutionContext(tool_context=ToolContext.CHAT, call_id="x", workspace_path=str(workspace))
+
+    assert ctx.is_path_allowed(str(workspace / "new.txt")) is True
+
+
+@pytest.mark.core
+def test_web_url_private_ip_validation():
+    handler = WebFetchHandler()
+    errs = handler.validate({"url": "http://172.16.0.1/test"})
+    assert any("internal" in e.lower() for e in errs)
+
+    errs = handler.validate({"url": "http://127.0.0.1/test"})
+    assert any("localhost" in e.lower() or "internal" in e.lower() for e in errs)
+
+    errs = handler.validate({"url": "http://172.0.0.1/test"})
+    assert not any("internal" in e.lower() for e in errs)
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.core
+async def test_execute_batch_parallel_energy_budget(monkeypatch):
+    registry = ToolRegistry(pool=object())
+    registry.register(DummyHandler("tool_a", cost=3))
+    registry.register(DummyHandler("tool_b", cost=3))
+
+    async def _allow(*args, **kwargs):
+        return PolicyCheckResult.allow()
+
+    async def _config():
+        return ToolsConfig()
+
+    monkeypatch.setattr(registry._policy, "check_all", _allow)
+    monkeypatch.setattr(registry, "get_config", _config)
+
+    context = ToolExecutionContext(
+        tool_context=ToolContext.HEARTBEAT,
+        call_id="x",
+        energy_available=3,
+    )
+
+    results = await registry.execute_batch(
+        [("tool_a", {}), ("tool_b", {})],
+        context,
+        parallel=True,
+    )
+
+    assert results[0].success is True
+    assert results[1].success is False
+    assert results[1].error_type == ToolErrorType.INSUFFICIENT_ENERGY
+
+
+@pytest.mark.core
+def test_cross_join_query_requires_psycopg2(monkeypatch):
+    monkeypatch.setattr(memory_tools, "HAS_PSYCOPG2", False)
+    with pytest.raises(RuntimeError):
+        memory_tools.cross_join_query({}, query_text="hello")
+
+
+@pytest.mark.core
+def test_memory_tool_handler_enables_autocommit(monkeypatch):
+    class DummyConn:
+        def __init__(self):
+            self.closed = False
+            self.autocommit = False
+
+    def fake_connect(*args, **kwargs):
+        return DummyConn()
+
+    monkeypatch.setattr(memory_tools, "HAS_PSYCOPG2", True)
+    monkeypatch.setattr(memory_tools, "psycopg2", SimpleNamespace(connect=fake_connect))
+
+    handler = memory_tools.MemoryToolHandler({"host": "localhost"})
+    handler.connect()
+    assert handler.conn.autocommit is True
+
+
+@pytest.mark.asyncio(loop_scope="session")
+@pytest.mark.core
+async def test_web_summarize_releases_connections(monkeypatch):
+    class DummyConn:
+        async def fetchval(self, *args, **kwargs):
+            return "call_id"
+
+        async def fetchrow(self, *args, **kwargs):
+            return {"status": "completed", "output": json.dumps({"text": "summary"}), "error": None}
+
+    class DummyAcquire:
+        def __init__(self, pool):
+            self.pool = pool
+
+        async def __aenter__(self):
+            self.pool.acquire_calls += 1
+            return DummyConn()
+
+        async def __aexit__(self, exc_type, exc, tb):
+            return False
+
+    class DummyPool:
+        def __init__(self):
+            self.acquire_calls = 0
+
+        def acquire(self):
+            return DummyAcquire(self)
+
+    dummy_trafilatura = types.SimpleNamespace(
+        fetch_url=lambda url: "<html></html>",
+        extract=lambda downloaded, include_tables=True: "content",
+        extract_metadata=lambda downloaded: types.SimpleNamespace(title="Title"),
+    )
+    monkeypatch.setitem(sys.modules, "trafilatura", dummy_trafilatura)
+
+    registry = SimpleNamespace(pool=DummyPool())
+    context = ToolExecutionContext(tool_context=ToolContext.CHAT, call_id="x")
+    context.registry = registry
+
+    handler = WebSummarizeHandler()
+    result = await handler.execute({"url": "http://example.com"}, context)
+
+    assert result.success is True
+    assert registry.pool.acquire_calls >= 2

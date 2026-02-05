@@ -1359,7 +1359,8 @@ $$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION apply_heartbeat_decision(
     p_heartbeat_id UUID,
     p_decision JSONB,
-    p_start_index INT DEFAULT 0
+    p_start_index INT DEFAULT 0,
+    p_pre_executed_actions JSONB DEFAULT '[]'::jsonb
 )
 RETURNS JSONB AS $$
 DECLARE
@@ -1375,6 +1376,8 @@ DECLARE
     halt_reason TEXT;
     memory_id UUID;
     outbox_messages JSONB := '[]'::jsonb;
+    repl_energy FLOAT := 0;
+    elem JSONB;
 BEGIN
     IF p_decision IS NULL OR jsonb_typeof(p_decision) <> 'object' THEN
         RETURN jsonb_build_object('error', 'invalid_decision');
@@ -1428,7 +1431,21 @@ BEGIN
         existing_actions := '[]'::jsonb;
     END IF;
 
-    existing_actions := existing_actions || new_actions;
+    -- Prepend any pre-executed actions (from RLM REPL tool calls) then append new actions
+    IF p_pre_executed_actions IS NOT NULL
+       AND jsonb_typeof(p_pre_executed_actions) = 'array'
+       AND jsonb_array_length(p_pre_executed_actions) > 0 THEN
+        existing_actions := p_pre_executed_actions || existing_actions || new_actions;
+        -- Deduct energy already spent by REPL tool calls
+        FOR elem IN SELECT * FROM jsonb_array_elements(p_pre_executed_actions) LOOP
+            repl_energy := repl_energy + COALESCE((elem->'result'->>'energy_spent')::float, 0);
+        END LOOP;
+        IF repl_energy > 0 THEN
+            PERFORM update_energy(-repl_energy);
+        END IF;
+    ELSE
+        existing_actions := existing_actions || new_actions;
+    END IF;
     UPDATE heartbeat_state
     SET active_actions = existing_actions,
         active_reasoning = reasoning,

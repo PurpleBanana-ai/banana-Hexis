@@ -48,6 +48,9 @@ class IngestionMode(str, Enum):
     STANDARD = "standard"
     SHALLOW = "shallow"
     ARCHIVE = "archive"
+    FAST = "fast"
+    SLOW = "slow"
+    HYBRID = "hybrid"
 
 
 @dataclass
@@ -214,6 +217,11 @@ def _normalize_mode(mode: IngestionMode | str | None) -> IngestionMode:
 
 
 def _select_mode(config: Config, words: int) -> IngestionMode:
+    if config.mode in (IngestionMode.FAST, IngestionMode.SLOW, IngestionMode.HYBRID):
+        # FAST maps to STANDARD pipeline; SLOW and HYBRID pass through
+        if config.mode == IngestionMode.FAST:
+            return IngestionMode.STANDARD
+        return config.mode
     if config.mode != IngestionMode.AUTO:
         return config.mode
     if words <= config.deep_max_words:
@@ -1267,6 +1275,11 @@ class IngestionPipeline:
 
             return 1 if encounter_id else 0
 
+        # Slow/hybrid mode: delegate to RLM-based ingestion
+        if mode in (IngestionMode.SLOW, IngestionMode.HYBRID):
+            count = self._run_rlm_ingest(mode, doc, sections, metrics, llm_calls_start)
+            return count
+
         # Appraise (overall for standard/shallow; per section for deep)
         base_context = self._build_appraisal_context(doc)
         overall_appraisal = None
@@ -1675,6 +1688,92 @@ class IngestionPipeline:
     def _skip_section(self, title: str) -> bool:
         lowered = title.strip().lower()
         return any(skip in lowered for skip in self.config.skip_sections)
+
+    def _run_rlm_ingest(
+        self,
+        mode: IngestionMode,
+        doc: DocumentInfo,
+        sections: list[Section],
+        metrics: IngestionMetrics,
+        llm_calls_start: int,
+    ) -> int:
+        """Run slow or hybrid ingestion via RLM loop.
+
+        This is a sync wrapper that calls the async slow_ingest_rlm functions.
+        Used by ingest_file() when mode is SLOW or HYBRID.
+        """
+        import asyncio as _asyncio
+
+        from services.slow_ingest_rlm import run_hybrid_ingest, run_slow_ingest
+
+        dsn = (
+            f"postgresql://{self.config.db_user}:{self.config.db_password}"
+            f"@{self.config.db_host}:{self.config.db_port}/{self.config.db_name}"
+        )
+        llm_cfg = {
+            "endpoint": self.config.llm_endpoint,
+            "model": self.config.llm_model,
+            "api_key": self.config.llm_api_key,
+        }
+
+        runner = run_slow_ingest if mode == IngestionMode.SLOW else run_hybrid_ingest
+
+        try:
+            loop = _asyncio.get_event_loop()
+            if loop.is_running():
+                import concurrent.futures
+                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                    result = pool.submit(
+                        _asyncio.run,
+                        runner(
+                            pipeline=self,
+                            doc=doc,
+                            sections=sections,
+                            llm_config=llm_cfg,
+                            dsn=dsn,
+                        ),
+                    ).result()
+            else:
+                result = loop.run_until_complete(
+                    runner(
+                        pipeline=self,
+                        doc=doc,
+                        sections=sections,
+                        llm_config=llm_cfg,
+                        dsn=dsn,
+                    )
+                )
+        except RuntimeError:
+            result = _asyncio.run(
+                runner(
+                    pipeline=self,
+                    doc=doc,
+                    sections=sections,
+                    llm_config=llm_cfg,
+                    dsn=dsn,
+                )
+            )
+
+        count = result.get("memories_created", 0)
+        self.stats["files_processed"] += 1
+        self.stats["memories_created"] += count
+
+        metrics.memory_count = count
+        metrics.mode = mode.value
+        metrics.llm_calls = self.llm.call_count - llm_calls_start
+        metrics.duration_seconds = time.time() - metrics.start_time
+        self.store.store_metrics(metrics)
+
+        if self.config.verbose:
+            _emit(self.config, f"  RLM {mode.value} ingest: {count} memories created")
+            if mode == IngestionMode.HYBRID:
+                _emit(
+                    self.config,
+                    f"  Slow chunks: {result.get('slow_chunks', 0)} | "
+                    f"Fast chunks: {result.get('fast_chunks', 0)}",
+                )
+
+        return count
 
     def check_and_process_archived(self, query: str, threshold: float = 0.75) -> list[str]:
         """

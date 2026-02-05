@@ -89,6 +89,50 @@ BEGIN
     LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
+CREATE OR REPLACE FUNCTION recall_memories_stub(
+    p_query_text TEXT,
+    p_limit INT DEFAULT 10,
+    p_memory_types memory_type[] DEFAULT NULL,
+    p_min_importance FLOAT DEFAULT 0.0,
+    p_preview_chars INT DEFAULT 256
+) RETURNS TABLE (
+    memory_id UUID,
+    preview TEXT,
+    memory_type memory_type,
+    score FLOAT,
+    source TEXT,
+    importance FLOAT,
+    trust_level FLOAT,
+    source_attribution JSONB,
+    created_at TIMESTAMPTZ,
+    emotional_valence FLOAT,
+    content_length INT
+) AS $$
+BEGIN
+    RETURN QUERY
+    WITH hits AS (
+        SELECT * FROM fast_recall(p_query_text, p_limit * 2)
+    )
+    SELECT
+        h.memory_id,
+        LEFT(h.content, p_preview_chars) AS preview,
+        h.memory_type,
+        h.score,
+        h.source,
+        m.importance,
+        m.trust_level,
+        m.source_attribution,
+        m.created_at,
+        (m.metadata->>'emotional_valence')::float AS emotional_valence,
+        length(h.content) AS content_length
+    FROM hits h
+    JOIN memories m ON m.id = h.memory_id
+    WHERE (p_memory_types IS NULL OR h.memory_type = ANY(p_memory_types))
+      AND m.importance >= COALESCE(p_min_importance, 0.0)
+    ORDER BY h.score DESC
+    LIMIT p_limit;
+END;
+$$ LANGUAGE plpgsql STABLE;
 CREATE OR REPLACE FUNCTION touch_memories(p_ids UUID[])
 RETURNS INT AS $$
 DECLARE
@@ -148,6 +192,37 @@ BEGIN
         m.type,
         m.content,
         m.importance
+    FROM memories m
+    WHERE m.id = ANY(p_ids);
+END;
+$$ LANGUAGE plpgsql STABLE;
+CREATE OR REPLACE FUNCTION get_memories_by_ids(
+    p_ids UUID[],
+    p_max_chars INT DEFAULT 2000
+) RETURNS TABLE (
+    id UUID,
+    type memory_type,
+    content TEXT,
+    importance FLOAT,
+    trust_level FLOAT,
+    source_attribution JSONB,
+    created_at TIMESTAMPTZ,
+    emotional_valence FLOAT
+) AS $$
+BEGIN
+    IF p_ids IS NULL OR array_length(p_ids, 1) IS NULL THEN
+        RETURN;
+    END IF;
+    RETURN QUERY
+    SELECT
+        m.id,
+        m.type,
+        LEFT(m.content, p_max_chars) AS content,
+        m.importance,
+        m.trust_level,
+        m.source_attribution,
+        m.created_at,
+        (m.metadata->>'emotional_valence')::float
     FROM memories m
     WHERE m.id = ANY(p_ids);
 END;

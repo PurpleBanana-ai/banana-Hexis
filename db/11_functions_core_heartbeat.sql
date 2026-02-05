@@ -42,13 +42,20 @@ BEGIN
         active_reasoning = NULL,
         updated_at = CURRENT_TIMESTAMP
     WHERE id = 1;
-    context := gather_turn_context();
+    IF COALESCE(get_config_bool('heartbeat.use_rlm'), FALSE) THEN
+        context := gather_turn_snapshot();
+    ELSE
+        context := gather_turn_context();
+    END IF;
     decision_max_tokens := COALESCE(get_config_int('heartbeat.max_decision_tokens'), 2048);
     external_calls := jsonb_build_array(
         build_external_call(
             'think',
             jsonb_build_object(
-                'kind', 'heartbeat_decision',
+                'kind', CASE
+                    WHEN COALESCE(get_config_bool('heartbeat.use_rlm'), FALSE) THEN 'heartbeat_decision_rlm'
+                    ELSE 'heartbeat_decision'
+                END,
                 'context', context,
                 'heartbeat_id', heartbeat_id,
                 'max_tokens', decision_max_tokens

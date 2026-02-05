@@ -167,6 +167,31 @@ BEGIN
     ), '[]'::jsonb);
 END;
 $$ LANGUAGE plpgsql;
+CREATE OR REPLACE FUNCTION get_recent_context_stub(
+    p_limit INT DEFAULT 5,
+    p_preview_chars INT DEFAULT 256
+) RETURNS JSONB AS $$
+BEGIN
+    RETURN COALESCE((
+        SELECT jsonb_agg(sub.obj)
+        FROM (
+            SELECT jsonb_build_object(
+                'id', m.id,
+                'preview', LEFT(m.content, p_preview_chars),
+                'created_at', m.created_at,
+                'emotional_valence', (m.metadata->>'emotional_valence')::float,
+                'trust_level', m.trust_level,
+                'source_attribution', m.source_attribution,
+                'content_length', length(m.content)
+            ) as obj
+            FROM memories m
+            WHERE m.type = 'episodic' AND m.status = 'active'
+            ORDER BY m.created_at DESC
+            LIMIT p_limit
+        ) sub
+    ), '[]'::jsonb);
+END;
+$$ LANGUAGE plpgsql;
 CREATE OR REPLACE FUNCTION get_identity_context()
 RETURNS JSONB AS $$
 DECLARE
@@ -477,6 +502,44 @@ BEGIN
         JOIN memories ma ON ma.id = p.a_uuid
         JOIN memories mb ON mb.id = p.b_uuid
     $sql$, lim);
+
+    EXECUTE sql INTO out_json;
+    RETURN COALESCE(out_json, '[]'::jsonb);
+EXCEPTION
+    WHEN OTHERS THEN
+        RETURN '[]'::jsonb;
+END;
+$$ LANGUAGE plpgsql STABLE;
+CREATE OR REPLACE FUNCTION get_contradictions_stub(
+    p_limit INT DEFAULT 5,
+    p_preview_chars INT DEFAULT 256
+) RETURNS JSONB AS $$
+DECLARE
+    lim INT := GREATEST(0, LEAST(50, COALESCE(p_limit, 5)));
+    sql TEXT;
+    out_json JSONB;
+BEGIN
+    sql := format($sql$
+        WITH pairs AS (
+            SELECT
+                replace(a_id::text, '"', '')::uuid as a_uuid,
+                replace(b_id::text, '"', '')::uuid as b_uuid
+            FROM ag_catalog.cypher('memory_graph', $q$
+                MATCH (a:MemoryNode)-[:CONTRADICTS]-(b:MemoryNode)
+                RETURN a.memory_id, b.memory_id
+                LIMIT %s
+            $q$) as (a_id ag_catalog.agtype, b_id ag_catalog.agtype)
+        )
+        SELECT COALESCE(jsonb_agg(jsonb_build_object(
+            'memory_a', p.a_uuid,
+            'memory_b', p.b_uuid,
+            'preview_a', LEFT(ma.content, %s),
+            'preview_b', LEFT(mb.content, %s)
+        )), '[]'::jsonb)
+        FROM pairs p
+        JOIN memories ma ON ma.id = p.a_uuid
+        JOIN memories mb ON mb.id = p.b_uuid
+    $sql$, lim, p_preview_chars, p_preview_chars);
 
     EXECUTE sql INTO out_json;
     RETURN COALESCE(out_json, '[]'::jsonb);

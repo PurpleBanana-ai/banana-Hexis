@@ -71,6 +71,8 @@ DECLARE
         $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_evidence_for_end ON memory_graph."EVIDENCE_FOR" USING BTREE (end_id)$idx$,
         $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_episode_follows_start ON memory_graph."EPISODE_FOLLOWS" USING BTREE (start_id)$idx$,
         $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_episode_follows_end ON memory_graph."EPISODE_FOLLOWS" USING BTREE (end_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_contested_because_start ON memory_graph."CONTESTED_BECAUSE" USING BTREE (start_id)$idx$,
+        $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_contested_because_end ON memory_graph."CONTESTED_BECAUSE" USING BTREE (end_id)$idx$,
         $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_causes_start ON memory_graph."CAUSES" USING BTREE (start_id)$idx$,
         $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_causes_end ON memory_graph."CAUSES" USING BTREE (end_id)$idx$,
         $idx$CREATE INDEX IF NOT EXISTS idx_memory_graph_derived_from_start ON memory_graph."DERIVED_FROM" USING BTREE (start_id)$idx$,
@@ -110,6 +112,7 @@ BEGIN
     BEGIN PERFORM create_elabel('memory_graph', 'BLOCKS'); EXCEPTION WHEN duplicate_object THEN NULL; END;
     BEGIN PERFORM create_elabel('memory_graph', 'EVIDENCE_FOR'); EXCEPTION WHEN duplicate_object THEN NULL; END;
     BEGIN PERFORM create_elabel('memory_graph', 'EPISODE_FOLLOWS'); EXCEPTION WHEN duplicate_object THEN NULL; END;
+    BEGIN PERFORM create_elabel('memory_graph', 'CONTESTED_BECAUSE'); EXCEPTION WHEN duplicate_object THEN NULL; END;
     BEGIN PERFORM create_elabel('memory_graph', 'CAUSES'); EXCEPTION WHEN duplicate_object THEN NULL; END;
     BEGIN PERFORM create_elabel('memory_graph', 'DERIVED_FROM'); EXCEPTION WHEN duplicate_object THEN NULL; END;
     BEGIN PERFORM create_elabel('memory_graph', 'TEMPORAL_NEXT'); EXCEPTION WHEN duplicate_object THEN NULL; END;
@@ -159,7 +162,8 @@ BEGIN
             'CLUSTER_OVERLAPS',
             'CLUSTER_SIMILAR',
             'IN_EPISODE',
-            'EPISODE_FOLLOWS'
+            'EPISODE_FOLLOWS',
+            'CONTESTED_BECAUSE'
         );
     EXCEPTION WHEN duplicate_object THEN NULL;
     END;
@@ -412,7 +416,7 @@ INSERT INTO config (key, value, description) VALUES
     ('heartbeat.max_energy', '20'::jsonb, 'Maximum energy cap'),
     ('heartbeat.heartbeat_interval_minutes', '60'::jsonb, 'Minutes between heartbeats'),
     ('heartbeat.max_decision_tokens', '2048'::jsonb, 'Max tokens for heartbeat decision'),
-    ('heartbeat.allowed_actions', '["observe","review_goals","remember","recall","connect","reprioritize","reflect","contemplate","meditate","study","debate_internally","maintain","mark_turning_point","begin_chapter","close_chapter","acknowledge_relationship","update_trust","reflect_on_relationship","resolve_contradiction","accept_tension","brainstorm_goals","inquire_shallow","synthesize","reach_out_user","inquire_deep","reach_out_public","pause_heartbeat","terminate","rest"]'::jsonb, 'Allowed heartbeat actions'),
+    ('heartbeat.allowed_actions', '["observe","review_goals","remember","recall","connect","reprioritize","reflect","contemplate","meditate","study","debate_internally","maintain","mark_turning_point","begin_chapter","close_chapter","acknowledge_relationship","update_trust","reflect_on_relationship","resolve_contradiction","accept_tension","brainstorm_goals","inquire_shallow","synthesize","reach_out_user","inquire_deep","reach_out_public","fast_ingest","slow_ingest","hybrid_ingest","pause_heartbeat","terminate","rest"]'::jsonb, 'Allowed heartbeat actions'),
     ('heartbeat.max_active_goals', '3'::jsonb, 'Maximum concurrent active goals'),
     ('heartbeat.goal_stale_days', '7'::jsonb, 'Days before a goal is flagged as stale'),
     ('heartbeat.user_contact_cooldown_hours', '4'::jsonb, 'Minimum hours between unsolicited user contact'),
@@ -447,7 +451,10 @@ INSERT INTO config (key, value, description) VALUES
     ('heartbeat.cost_synthesize', '3'::jsonb, 'Generate artifact, form conclusion'),
     ('heartbeat.cost_pause_heartbeat', '0'::jsonb, 'Pause heartbeat cycle (temporary)'),
     ('heartbeat.cost_rest', '0'::jsonb, 'Bank remaining energy'),
-    ('heartbeat.cost_terminate', '0'::jsonb, 'Terminate agent')
+    ('heartbeat.cost_terminate', '0'::jsonb, 'Terminate agent'),
+    ('heartbeat.cost_fast_ingest', '2'::jsonb, 'Fast ingestion - chunk and extract facts'),
+    ('heartbeat.cost_slow_ingest', '5'::jsonb, 'Slow ingestion - conscious RLM reading per chunk'),
+    ('heartbeat.cost_hybrid_ingest', '3'::jsonb, 'Hybrid ingestion - fast pass then slow on high-signal chunks')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config (key, value, description) VALUES
     ('agent.tools', '["recall","sense_memory_availability","request_background_search","recall_recent","recall_episode","explore_concept","explore_cluster","get_procedures","get_strategies","list_recent_episodes","create_goal","schedule_task","list_scheduled_tasks","update_scheduled_task","delete_scheduled_task","queue_user_message"]'::jsonb, 'Allowed tool names for agent tool use')
@@ -465,6 +472,19 @@ INSERT INTO config (key, value, description) VALUES
     ('memory.recall_min_trust_level', '0'::jsonb, 'Minimum trust_level to include in recall (0 disables filtering)'),
     ('memory.worldview_support_threshold', '0.8'::jsonb, 'Similarity threshold for SUPPORTS alignment edges'),
     ('memory.worldview_contradict_threshold', '-0.5'::jsonb, 'Similarity threshold for CONTRADICTS alignment edges')
+ON CONFLICT (key) DO NOTHING;
+INSERT INTO config (key, value, description) VALUES
+    ('heartbeat.use_rlm', 'true'::jsonb, 'Enable RLM loop for heartbeat decisions'),
+    ('chat.use_rlm', 'true'::jsonb, 'Enable RLM loop for chat'),
+    ('rlm.heartbeat.max_iterations', '10'::jsonb, 'Max RLM iterations for heartbeat'),
+    ('rlm.chat.max_iterations', '15'::jsonb, 'Max RLM iterations for chat'),
+    ('rlm.max_depth', '1'::jsonb, 'Max recursion depth for sub-calls'),
+    ('rlm.sub_model', 'null'::jsonb, 'Model for sub-calls (null = same as root)'),
+    ('rlm.workspace.max_loaded_memories', '25'::jsonb, 'Max full memories in workspace'),
+    ('rlm.workspace.max_loaded_chars', '20000'::jsonb, 'Max chars of loaded memory content'),
+    ('rlm.workspace.max_notes_chars', '8000'::jsonb, 'Max chars in notes buffer'),
+    ('rlm.workspace.max_per_memory_chars', '2000'::jsonb, 'Max chars per fetched memory'),
+    ('rlm.heartbeat.timeout_seconds', '300'::jsonb, 'Overall timeout for RLM heartbeat')
 ON CONFLICT (key) DO NOTHING;
 INSERT INTO config (key, value, description) VALUES
     ('transformation.personality', '{
@@ -641,6 +661,32 @@ CREATE TABLE scheduled_tasks (
 
 
 
+
+-- ============================================================================
+-- RECONSOLIDATION TASKS
+-- ============================================================================
+CREATE TABLE IF NOT EXISTS reconsolidation_tasks (
+    id UUID PRIMARY KEY DEFAULT gen_random_uuid(),
+    belief_id UUID NOT NULL REFERENCES memories(id),
+    old_content TEXT NOT NULL,
+    new_content TEXT NOT NULL,
+    transformation_type TEXT NOT NULL DEFAULT 'shift',
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK (status IN ('pending', 'in_progress', 'completed', 'failed')),
+    total_candidates INT DEFAULT 0,
+    processed_count INT DEFAULT 0,
+    accepted_count INT DEFAULT 0,
+    newly_contested_count INT DEFAULT 0,
+    still_contested_count INT DEFAULT 0,
+    error_message TEXT,
+    summary_memory_id UUID REFERENCES memories(id),
+    created_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP,
+    started_at TIMESTAMPTZ,
+    completed_at TIMESTAMPTZ,
+    updated_at TIMESTAMPTZ DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_reconsolidation_tasks_status
+    ON reconsolidation_tasks (status) WHERE status IN ('pending', 'in_progress');
 
 -- ============================================================================
 -- GOAL FUNCTIONS

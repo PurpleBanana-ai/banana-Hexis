@@ -1,0 +1,200 @@
+"""Tests for services.hexis_rlm -- RLM heartbeat integration."""
+
+import json
+import re
+
+import pytest
+
+from services.hexis_rlm import (
+    find_code_blocks,
+    find_final_answer,
+    format_execution_result,
+    format_iteration,
+)
+from services.rlm_repl import HexisLocalREPL, REPLResult
+
+
+class TestParsing:
+    """Unit tests for vendored parsing utilities."""
+
+    def test_find_code_blocks_single(self):
+        text = "Here is code:\n```repl\nprint('hello')\n```\nDone."
+        blocks = find_code_blocks(text)
+        assert len(blocks) == 1
+        assert "print('hello')" in blocks[0]
+
+    def test_find_code_blocks_multiple(self):
+        text = "```repl\nx = 1\n```\ntext\n```repl\ny = 2\n```"
+        blocks = find_code_blocks(text)
+        assert len(blocks) == 2
+
+    def test_find_code_blocks_none(self):
+        text = "No code here. ```python\nfoo\n```"
+        blocks = find_code_blocks(text)
+        assert blocks == []
+
+    def test_find_final_direct(self):
+        text = "I'm done reasoning.\nFINAL({\"reasoning\": \"test\", \"actions\": []})"
+        answer = find_final_answer(text)
+        assert answer is not None
+        parsed = json.loads(answer)
+        assert parsed["reasoning"] == "test"
+
+    def test_find_final_var(self):
+        repl = HexisLocalREPL()
+        repl.setup(context_payload=None)
+        try:
+            repl.execute_code("my_answer = 'the result'")
+            text = "FINAL_VAR(my_answer)"
+            answer = find_final_answer(text, repl)
+            assert answer == "the result"
+        finally:
+            repl.cleanup()
+
+    def test_find_final_none(self):
+        text = "Still thinking..."
+        assert find_final_answer(text) is None
+
+    def test_format_execution_result_stdout(self):
+        result = REPLResult(stdout="hello\n", stderr="", execution_time=0.1, local_vars={"x": "int"})
+        formatted = format_execution_result(result)
+        assert "hello" in formatted
+        assert "x" in formatted
+
+    def test_format_execution_result_stderr(self):
+        result = REPLResult(stdout="", stderr="ZeroDivisionError: division by zero", execution_time=0.1, local_vars={})
+        formatted = format_execution_result(result)
+        assert "ZeroDivisionError" in formatted
+
+    def test_format_iteration_basic(self):
+        code = "x = 1\nprint(x)"
+        result = REPLResult(stdout="1\n", stderr="", execution_time=0.05, local_vars={"x": "int"})
+        messages = format_iteration("I'll run some code:\n```repl\nx = 1\nprint(x)\n```", [code], [result])
+        assert len(messages) == 2
+        assert messages[0]["role"] == "assistant"
+        assert messages[1]["role"] == "user"
+        assert "REPL output" in messages[1]["content"]
+
+
+class TestMemoryEnv:
+    """Unit tests for RLM memory environment."""
+
+    def test_workspace_budgets_enforce_count(self):
+        from unittest.mock import MagicMock
+        from services.rlm_memory_env import RLMMemoryEnv, RLMWorkspace, WorkspaceBudgets
+        from core.memory_repo import MemoryRepo
+
+        mock_repo = MagicMock(spec=MemoryRepo)
+        # Return 30 memories to exceed the budget of 5
+        mock_repo.fetch_by_ids.return_value = [
+            {"id": str(i), "content": f"memory {i}", "type": "semantic"}
+            for i in range(30)
+        ]
+
+        budgets = WorkspaceBudgets(max_loaded_memories=5, max_loaded_chars=100_000)
+        workspace = RLMWorkspace(budgets=budgets)
+        env = RLMMemoryEnv(mock_repo, workspace)
+
+        env.memory_fetch([str(i) for i in range(30)])
+
+        # After budget enforcement, should have at most max_loaded_memories
+        assert len(workspace.loaded_memories) <= budgets.max_loaded_memories
+        # Notes should have been populated by auto-summarize
+        assert workspace.metrics.summarize_events >= 1
+
+    def test_workspace_drop(self):
+        from services.rlm_memory_env import RLMMemoryEnv, RLMWorkspace
+        from unittest.mock import MagicMock
+        from core.memory_repo import MemoryRepo
+
+        mock_repo = MagicMock(spec=MemoryRepo)
+        workspace = RLMWorkspace()
+        workspace.loaded_memories = [
+            {"id": "a", "content": "mem a"},
+            {"id": "b", "content": "mem b"},
+        ]
+        env = RLMMemoryEnv(mock_repo, workspace)
+
+        env.workspace_drop("loaded_memories", keep_ids=["a"])
+        assert len(workspace.loaded_memories) == 1
+        assert workspace.loaded_memories[0]["id"] == "a"
+
+    def test_workspace_status(self):
+        from services.rlm_memory_env import RLMMemoryEnv, RLMWorkspace
+        from unittest.mock import MagicMock
+        from core.memory_repo import MemoryRepo
+
+        mock_repo = MagicMock(spec=MemoryRepo)
+        workspace = RLMWorkspace()
+        workspace.loaded_memories = [{"id": "a", "content": "hello"}]
+        workspace.notes = "some notes"
+        workspace.memory_stubs = [{"id": "a"}]
+        env = RLMMemoryEnv(mock_repo, workspace)
+
+        status = env.workspace_status()
+        assert status["loaded_memories_count"] == 1
+        assert status["notes_chars"] == len("some notes")
+        assert status["stubs_count"] == 1
+
+
+class TestReplToolBridge:
+    """Unit tests for the sync-to-async tool bridge."""
+
+    def test_tool_call_record_to_action_taken(self):
+        from core.tools.repl_bridge import ToolCallRecord
+        from core.tools.base import ToolResult
+
+        result = ToolResult.success_result({"memories": 3})
+        result.energy_spent = 2
+        record = ToolCallRecord(tool_name="recall", arguments={"query": "test"}, result=result)
+        record.end_time = record.start_time + 1.5
+
+        action = record.to_action_taken()
+        assert action["action"] == "recall"
+        assert action["source"] == "rlm_repl"
+        assert action["result"]["success"] is True
+        assert action["result"]["energy_spent"] == 2
+
+    def test_call_records_to_actions_taken(self):
+        from core.tools.repl_bridge import ToolCallRecord, call_records_to_actions_taken
+        from core.tools.base import ToolResult
+
+        r1 = ToolResult.success_result({"ok": True})
+        r1.energy_spent = 1
+        r2 = ToolResult.success_result({"ok": True})
+        r2.energy_spent = 3
+
+        records = [
+            ToolCallRecord(tool_name="recall", arguments={}, result=r1),
+            ToolCallRecord(tool_name="reflect", arguments={}, result=r2),
+            ToolCallRecord(tool_name="failed", arguments={}, result=None),  # No result
+        ]
+
+        actions = call_records_to_actions_taken(records)
+        # Should skip the one without result
+        assert len(actions) == 2
+        assert actions[0]["action"] == "recall"
+        assert actions[1]["action"] == "reflect"
+
+
+class TestLegacyPathUnchanged:
+    """Verify that legacy heartbeat path is not affected when RLM is off."""
+
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_start_heartbeat_default_kind(self, db_pool):
+        """With heartbeat.use_rlm=false, start_heartbeat produces kind=heartbeat_decision."""
+        async with db_pool.acquire() as conn:
+            # Ensure RLM is off
+            await conn.execute("SELECT set_config('heartbeat.use_rlm', 'false'::jsonb)")
+            result = await conn.fetchval("SELECT run_heartbeat()")
+            if result is None:
+                pytest.skip("Heartbeat not ready (possibly not configured)")
+
+            data = json.loads(result) if isinstance(result, str) else result
+            if not isinstance(data, dict):
+                pytest.skip("Unexpected heartbeat result format")
+
+            calls = data.get("external_calls", [])
+            if calls:
+                call_input = calls[0].get("input", {})
+                assert call_input.get("kind") == "heartbeat_decision"

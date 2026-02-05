@@ -30,6 +30,7 @@ class ToolCategory(str, Enum):
     CALENDAR = "calendar"  # Calendar integrations
     EMAIL = "email"  # Email sending
     MESSAGING = "messaging"  # Discord, Slack, Telegram
+    INGEST = "ingest"  # Content ingestion (fast, slow, hybrid)
     EXTERNAL = "external"  # MCP and custom tools
 
 
@@ -222,8 +223,12 @@ class ToolExecutionContext:
             return True  # No restriction
 
         resolved = self.resolve_path(path)
-        workspace = os.path.normpath(self.workspace_path)
-        return resolved.startswith(workspace)
+        workspace = os.path.realpath(os.path.abspath(self.workspace_path))
+        target = os.path.realpath(os.path.abspath(resolved))
+        try:
+            return os.path.commonpath([target, workspace]) == workspace
+        except ValueError:
+            return False
 
 
 class ToolHandler(ABC):

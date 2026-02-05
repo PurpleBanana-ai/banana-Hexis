@@ -227,7 +227,70 @@ class ConversationManager:
             {"role": "system", "content": SYSTEM_PROMPT}
         ]
         self.current_episode_id = None
+
+        # Check if RLM is enabled for chat
+        self._use_rlm = self._load_rlm_config()
     
+    def _load_rlm_config(self) -> bool:
+        """Check if RLM is enabled for chat via DB config."""
+        try:
+            import psycopg2
+            dsn = self._build_dsn()
+            conn = psycopg2.connect(dsn)
+            conn.autocommit = True
+            with conn.cursor() as cur:
+                cur.execute("SELECT get_config_bool('chat.use_rlm')")
+                result = cur.fetchone()
+                conn.close()
+                return bool(result[0]) if result else False
+        except Exception:
+            return False
+
+    def _build_dsn(self) -> str:
+        """Build a DSN string from db_config dict."""
+        cfg = self.db_config
+        return (
+            f"postgresql://{cfg.get('user', 'postgres')}:{cfg.get('password', 'password')}"
+            f"@{cfg.get('host', 'localhost')}:{cfg.get('port', 43815)}"
+            f"/{cfg.get('dbname', 'hexis_memory')}"
+        )
+
+    def _process_message_rlm(self, user_message: str) -> str:
+        """Process a message through the RLM chat loop."""
+        from core.sync_utils import run_sync
+        from services.hexis_rlm import run_chat_turn
+        from core.llm import normalize_llm_config
+
+        llm_config = normalize_llm_config({
+            "provider": self.config.provider,
+            "model": self.config.model,
+            "endpoint": self.config.endpoint,
+            "api_key": self.config.api_key,
+        })
+        dsn = self._build_dsn()
+
+        result = run_sync(run_chat_turn(
+            user_message=user_message,
+            history=self.messages[1:],  # Exclude system prompt
+            llm_config=llm_config,
+            dsn=dsn,
+        ))
+
+        response = result["response"]
+
+        # Still form memories
+        if self.config.auto_form_memories:
+            if self.memory_formation.should_form_memory(user_message, response):
+                memory_id = self.memory_formation.form_memory(user_message, response)
+                if memory_id and self.config.verbose:
+                    print(f"\n[Memory formed: {memory_id[:8]}...]")
+
+        # Update conversation history
+        self.messages.append({"role": "user", "content": user_message})
+        self.messages.append({"role": "assistant", "content": response})
+
+        return response
+
     def process_message(self, user_message: str) -> str:
         """
         Process a user message through the full memory-augmented pipeline.
@@ -240,6 +303,10 @@ class ConversationManager:
         
         Returns the assistant's response.
         """
+        # Route to RLM path if enabled
+        if self._use_rlm:
+            return self._process_message_rlm(user_message)
+
         # Step 1: Enrich the message with relevant memories
         enrichment = self.enricher.enrich(user_message)
         

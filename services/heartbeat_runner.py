@@ -25,6 +25,7 @@ async def execute_heartbeat_decision(
     heartbeat_id: str,
     decision: dict[str, Any],
     call_processor: ExternalCallProcessor,
+    pre_executed_actions: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     start_index = 0
     outbox_messages: list[Any] = []
@@ -34,7 +35,10 @@ async def execute_heartbeat_decision(
             heartbeat_id=heartbeat_id,
             decision=decision,
             start_index=start_index,
+            pre_executed_actions=pre_executed_actions,
         )
+        # Only pass pre_executed_actions on the first iteration
+        pre_executed_actions = None
 
         outbox_messages.extend(_coerce_list(batch.get("outbox_messages")))
 

@@ -168,7 +168,81 @@ The heartbeat is the agent's conscious cognitive loop:
 
 ## Debugging Tips
 
-- **Schema changes not taking effect?** Run `docker compose down -v && docker compose up -d`
+- **Schema changes not taking effect?** SQL files are baked into the Docker image -- see "Bouncing the Database" below
 - **Heartbeat not running?** Check `agent.is_configured` via `hexis status` or run `hexis init`
 - **Memory not found?** Check if embeddings service is running (`docker compose ps`)
 - **Test failures?** Ensure Docker services are up before running pytest; after a fresh `down -v`, wait for Postgres to accept connections. Use `POSTGRES_HOST=127.0.0.1` with pytest if localhost SSL negotiation flakes.
+
+## Agent Operational Notes
+
+### Python Virtual Environment
+
+Always activate the venv before running any Python, pytest, or hexis CLI commands:
+
+```bash
+source /Volumes/SB-XTM5/git/Hexis/.venv/bin/activate
+```
+
+Prefix all shell commands with this activation. Example:
+
+```bash
+source /Volumes/SB-XTM5/git/Hexis/.venv/bin/activate && pytest tests -q
+```
+
+### Bouncing the Database (Applying Schema Changes)
+
+SQL schema files (`db/*.sql`) are **baked into the Docker image at build time** (not bind-mounted). Editing SQL files on disk does NOT automatically take effect in the running container.
+
+To apply schema changes, you must rebuild the image and recreate the volume:
+
+```bash
+source /Volumes/SB-XTM5/git/Hexis/.venv/bin/activate && docker-compose down -v && docker-compose build db && docker-compose up -d
+```
+
+Breaking this down:
+1. `docker-compose down -v` -- stops containers and **removes the data volume** (required for fresh schema init)
+2. `docker-compose build db` -- rebuilds the `db` service image with the updated SQL files
+3. `docker-compose up -d` -- starts containers with the new image
+
+**Important**: The docker-compose service is named `db`, but the container is named `hexis_brain`. Always use the service name (`db`) with docker-compose commands (e.g., `docker-compose build db`), but use the container name with `docker exec` (e.g., `docker exec hexis_brain psql ...`).
+
+### Verifying Schema Changes
+
+After bouncing, verify your changes took effect:
+
+```bash
+# Check if a specific function exists
+docker exec hexis_brain psql -U hexis_user -d hexis_memory -c "\df function_name"
+
+# Check config keys
+docker exec hexis_brain psql -U hexis_user -d hexis_memory -c "SELECT key, value FROM config WHERE key LIKE 'rlm.%'"
+
+# Check table columns
+docker exec hexis_brain psql -U hexis_user -d hexis_memory -c "SELECT column_name FROM information_schema.columns WHERE table_name = 'memories' ORDER BY ordinal_position"
+```
+
+### Docker Port Mapping
+
+The DB port is mapped to `43815` (not the default `5432`):
+
+```
+hexis_brain: 127.0.0.1:43815 -> 5432
+```
+
+Default DB credentials: `hexis_user` / `hexis_password` / `hexis_memory`.
+
+### Test Conventions
+
+- **Loop scope**: All async tests using the `db_pool` fixture must use `loop_scope="session"` (not `"module"`):
+  ```python
+  pytestmark = [pytest.mark.asyncio(loop_scope="session")]
+  ```
+
+- **Seeding test memories**: The `memories` table has a NOT NULL constraint on `embedding`. Use `array_fill` to generate a dummy vector:
+  ```python
+  await conn.fetchval("""
+      INSERT INTO memories (type, content, embedding, importance, trust_level, status)
+      VALUES ('semantic', $1, array_fill(0.1, ARRAY[embedding_dimension()])::vector, 0.8, 0.9, 'active')
+      RETURNING id
+  """, content)
+  ```

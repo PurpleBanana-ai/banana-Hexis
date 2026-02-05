@@ -19,6 +19,7 @@ from core.state import (
 )
 from services.external_calls import ExternalCallProcessor
 from services.heartbeat_runner import execute_heartbeat_decision
+from services.reconsolidation import run_reconsolidation_step
 from services.subconscious import run_subconscious_decider
 
 
@@ -137,6 +138,7 @@ class HeartbeatWorker:
                         heartbeat_id=str(heartbeat_id),
                         decision=result["decision"],
                         call_processor=self.call_processor,
+                        pre_executed_actions=result.get("rlm_repl_actions"),
                     )
                     if isinstance(exec_result, dict):
                         outbox_messages = exec_result.get("outbox_messages")
@@ -249,6 +251,17 @@ class MaintenanceWorker:
             await mark_subconscious_decider_run(conn)
             logger.info(f"Subconscious decider: {result}")
 
+    async def _run_reconsolidation_if_pending(self) -> None:
+        if not self.pool:
+            return
+        async with self.pool.acquire() as conn:
+            has_pending = await conn.fetchval("SELECT has_pending_reconsolidation()")
+            if not has_pending:
+                return
+            result = await run_reconsolidation_step(conn)
+            if not result.get("skipped"):
+                logger.info(f"Reconsolidation step: {result}")
+
     async def run(self) -> None:
         self.running = True
         logger.info("Maintenance worker starting...")
@@ -267,6 +280,7 @@ class MaintenanceWorker:
                     await self._run_scheduled_tasks()
                     await self._run_maintenance_if_due()
                     await self._run_subconscious_if_due()
+                    await self._run_reconsolidation_if_pending()
                 except Exception as exc:
                     logger.error(f"Maintenance loop error: {exc}")
                 await asyncio.sleep(POLL_INTERVAL)

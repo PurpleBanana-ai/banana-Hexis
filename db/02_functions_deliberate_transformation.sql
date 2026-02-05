@@ -395,11 +395,20 @@ BEGIN
         )
     );
 
+    -- Queue reconsolidation sweep for affected memories
+    PERFORM queue_reconsolidation(
+        p_belief_id,
+        belief.content,
+        p_new_content,
+        p_transformation_type
+    );
+
     RETURN jsonb_build_object(
         'success', true,
         'belief_id', p_belief_id,
         'memory_id', mem_id,
-        'transformation_type', p_transformation_type
+        'transformation_type', p_transformation_type,
+        'reconsolidation_queued', true
     );
 END;
 $$ LANGUAGE plpgsql;

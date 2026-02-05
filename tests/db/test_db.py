@@ -7809,6 +7809,7 @@ async def apply_heartbeat_migration(db_pool):
 
 async def test_start_heartbeat_enqueues_decision_call(db_pool, apply_heartbeat_migration):
     async with db_pool.acquire() as conn:
+        await conn.execute("SELECT set_config('heartbeat.use_rlm', 'false'::jsonb)")
         payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
         hb_id = payload.get("heartbeat_id")
         assert hb_id is not None
@@ -8034,6 +8035,7 @@ async def test_worker_end_to_end_heartbeat_with_follow_on_calls(db_pool, apply_h
     async with db_pool.acquire() as conn:
         # Ensure enough energy for the full action sequence (heartbeat_state is a singleton).
         await conn.execute("UPDATE heartbeat_state SET current_energy = 20, is_paused = FALSE WHERE id = 1")
+        await conn.execute("SELECT set_config('heartbeat.use_rlm', 'false'::jsonb)")
         hb_payload = _coerce_json(await conn.fetchval("SELECT start_heartbeat()"))
         hb_id = hb_payload.get("heartbeat_id")
         assert hb_id is not None
@@ -9001,6 +9003,7 @@ async def test_worker_check_and_run_heartbeat_queues_decision_call(db_pool):
         await conn.execute("UPDATE heartbeat_state SET is_paused = FALSE, last_heartbeat_at = NOW() - INTERVAL '10 minutes' WHERE id = 1")
         # Phase 7 (ReduceScopeCreep): use unified config only
         await conn.execute("UPDATE config SET value = '0'::jsonb WHERE key = 'heartbeat.heartbeat_interval_minutes'")
+        await conn.execute("SELECT set_config('heartbeat.use_rlm', 'false'::jsonb)")
 
     try:
         async with db_pool.acquire() as conn:

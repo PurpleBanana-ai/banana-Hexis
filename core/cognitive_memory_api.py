@@ -54,6 +54,7 @@ class RelationshipType(str, Enum):
     INSTANCE_OF = "INSTANCE_OF"
     PARENT_OF = "PARENT_OF"
     ASSOCIATED = "ASSOCIATED"
+    CONTESTED_BECAUSE = "CONTESTED_BECAUSE"
 
 
 @dataclass(frozen=True)

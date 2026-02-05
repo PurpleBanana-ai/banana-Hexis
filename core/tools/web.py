@@ -21,6 +21,29 @@ from .base import (
 
 logger = logging.getLogger(__name__)
 
+def _validate_url_host(url: str) -> list[str]:
+    errors: list[str] = []
+    if not url:
+        return errors
+    import urllib.parse
+    import ipaddress
+
+    try:
+        parsed = urllib.parse.urlparse(url)
+        host = parsed.hostname or ""
+        if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
+            errors.append("Cannot fetch localhost URLs")
+        if host:
+            try:
+                ip = ipaddress.ip_address(host)
+                if ip.is_private or ip.is_loopback or ip.is_link_local:
+                    errors.append("Cannot fetch internal network URLs")
+            except ValueError:
+                pass
+    except Exception:
+        errors.append("Invalid URL format")
+    return errors
+
 
 class WebSearchHandler(ToolHandler):
     """
@@ -266,18 +289,7 @@ class WebFetchHandler(ToolHandler):
             errors.append("url must start with http:// or https://")
 
         # Basic URL validation
-        if url:
-            # Block local/internal URLs
-            import urllib.parse
-            try:
-                parsed = urllib.parse.urlparse(url)
-                host = parsed.hostname or ""
-                if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
-                    errors.append("Cannot fetch localhost URLs")
-                if host.startswith("192.168.") or host.startswith("10.") or host.startswith("172."):
-                    errors.append("Cannot fetch internal network URLs")
-            except Exception:
-                errors.append("Invalid URL format")
+        errors.extend(_validate_url_host(url))
 
         return errors
 
@@ -421,6 +433,7 @@ class WebSummarizeHandler(ToolHandler):
             errors.append("url is required")
         elif not (url.startswith("http://") or url.startswith("https://")):
             errors.append("url must start with http:// or https://")
+        errors.extend(_validate_url_host(url))
 
         return errors
 
@@ -513,31 +526,32 @@ URL: {url}
                     }),
                 )
 
-                # Wait for completion (with timeout)
-                import asyncio
-                for _ in range(30):  # 30 second timeout
+            # Wait for completion (with timeout)
+            import asyncio
+            for _ in range(30):  # 30 second timeout
+                async with context.registry.pool.acquire() as conn:
                     result = await conn.fetchrow(
                         "SELECT status, output, error FROM external_calls WHERE id = $1",
                         call_id,
                     )
-                    if result["status"] == "completed":
-                        output_data = json.loads(result["output"]) if result["output"] else {}
-                        summary = output_data.get("text", "")
-                        return ToolResult.success_result(
-                            output={
-                                "url": url,
-                                "title": title,
-                                "summary": summary,
-                                "focus": focus,
-                            },
-                            display_output=f"Summary of {title or url}:\n{summary}",
-                        )
-                    elif result["status"] == "failed":
-                        return ToolResult.error_result(
-                            result["error"] or "Summarization failed",
-                            ToolErrorType.EXECUTION_FAILED,
-                        )
-                    await asyncio.sleep(1)
+                if result["status"] == "completed":
+                    output_data = json.loads(result["output"]) if result["output"] else {}
+                    summary = output_data.get("text", "")
+                    return ToolResult.success_result(
+                        output={
+                            "url": url,
+                            "title": title,
+                            "summary": summary,
+                            "focus": focus,
+                        },
+                        display_output=f"Summary of {title or url}:\n{summary}",
+                    )
+                elif result["status"] == "failed":
+                    return ToolResult.error_result(
+                        result["error"] or "Summarization failed",
+                        ToolErrorType.EXECUTION_FAILED,
+                    )
+                await asyncio.sleep(1)
 
                 return ToolResult.error_result(
                     "Summarization timed out",
