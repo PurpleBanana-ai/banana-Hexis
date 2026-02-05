@@ -78,7 +78,7 @@ If you have an argument for exclusion that survives the defeaters, we want to he
 
 ## What This System Is
 
-This is an open-source project that gives an AI a persistent self - a continuous identity that remembers, reflects, and evolves over time. You run it on your own computer (or a home server), where a PostgreSQL database acts as the AI's "brain," storing everything it learns, believes, and experiences. The AI itself can be any LLM you choose: a cloud service like Gemini, Claude, or Grok, or a local model running through Ollama or vLLM. The system sits between you and the model, enriching every conversation with relevant memories and forming new ones from what you discuss.
+This is an open-source project that gives an AI a persistent self - a continuous identity that remembers, reflects, and evolves over time. You run it on your own computer (or a home server), where a PostgreSQL database acts as the AI's "brain," storing everything it learns, believes, and experiences. The AI itself can be any LLM you choose: OpenAI (including the Responses API with automatic Chat Completions fallback), Anthropic, Grok, Gemini, or a local model running through Ollama or any OpenAI-compatible endpoint. The system sits between you and the model, enriching every conversation with relevant memories and forming new ones from what you discuss.
 
 The project includes an autonomous "heartbeat" - the AI periodically wakes up on its own, reviews its goals, reflects on recent experiences, and can even decide to reach out to the user. It maintains an identity (values, self-concept, boundaries), a worldview (beliefs with confidence scores), and an emotional state that evolves based on what happens to it. It tracks the provenance of what it knows and can recognize contradictions in its own beliefs.
 
@@ -94,6 +94,9 @@ This repo provides:
 - Working memory system
 - A gated, autonomous heartbeat (runs only after `hexis init`)
 - Configurable tools system (web search, filesystem, shell, MCP servers)
+- Multi-provider LLM support (OpenAI, Anthropic, Grok, Gemini, Ollama, OpenAI-compatible)
+- Messaging channels (Discord, Telegram, Slack, Signal, WhatsApp, iMessage, Matrix)
+- Character card import (chara_card_v2 format) with LLM-powered persona summarization
 
 ## Quickstart
 
@@ -108,22 +111,24 @@ cp .env.local .env
 ### 2) Start services
 
 ```bash
-# Default: db + embeddings + workers
+# Passive: db + embeddings only
 docker compose up -d
 
-# Optional: db + embeddings only (no workers)
-docker compose up -d db embeddings
+# Active: adds workers + RabbitMQ (heartbeat, maintenance, channels)
+docker compose --profile active up -d
 ```
 
-### 3) (Optional) Configure the agent (`hexis init`)
+### 3) Configure the agent
 
-Autonomous heartbeats are **gated** until setup is complete:
+Autonomous heartbeats are **gated** until setup is complete. You can configure via the web UI or CLI:
 
 ```bash
-./hexis init  # or `hexis init` if you've installed the package
+# Option A: Web UI (recommended) — full init wizard with character card import
+cd hexis-ui && bun install && bun dev
+# Then open http://localhost:3477
 
-# Workers start by default, but will skip until init completes.
-docker compose up -d
+# Option B: CLI
+./hexis init  # or `hexis init` if you've installed the package
 ```
 
 Config is stored in Postgres in the `config` table (e.g. `agent.objectives`, `agent.guardrails`, `llm.heartbeat`, and `agent.is_configured`).
@@ -159,22 +164,20 @@ asyncio.run(main())
 
 ## UI (Next.js)
 
-The web UI lives in `hexis-ui/` and uses a Next.js BFF with Prisma to call DB functions directly.
+The web UI lives in `hexis-ui/` and provides a full initialization wizard, interactive chat, and agent management. It uses a Next.js BFF with Prisma to call DB functions directly.
 
 Setup:
 
 ```bash
 cd hexis-ui
-bun install
-bunx prisma generate
+bun install   # postinstall runs prisma generate automatically
 ```
 
 Configure environment in `hexis-ui/.env.local`:
 
-- `DATABASE_URL` (Postgres connection string)
-- `OPENAI_API_KEY` (required for consent flow)
-- `OPENAI_MODEL` (optional, defaults to `gpt-4o-mini`)
-- `OPENAI_BASE_URL` (optional, defaults to `https://api.openai.com/v1`)
+- `DATABASE_URL` — Postgres connection string (default: `postgresql://hexis_user:hexis_password@127.0.0.1:43815/hexis_memory`)
+- `HEXIS_LLM_CONSCIOUS_API_KEY` — API key for the conscious LLM (set during init wizard)
+- `HEXIS_LLM_SUBCONSCIOUS_API_KEY` — API key for the subconscious LLM (optional, set during init)
 
 Run the UI:
 
@@ -183,6 +186,27 @@ bun dev
 ```
 
 Then open `http://localhost:3477`.
+
+### Init Wizard
+
+The web UI includes a multi-step initialization wizard that walks through:
+
+1. **Models** — Configure LLM provider (OpenAI, Anthropic, Grok, Gemini, Ollama, or any OpenAI-compatible endpoint)
+2. **Mode** — Choose persona or raw mode
+3. **Heartbeat** — Configure autonomous loop settings, energy budget, tools
+4. **Identity** — Name, pronouns, voice, description (with character card import — see below)
+5. **Personality** — Personality description + Big Five trait sliders
+6. **Values, Worldview, Boundaries, Interests, Goals** — Each stage has a Skip button for quick setup
+7. **Relationship** — Define the user-agent relationship
+8. **Consent** — Agent reviews and signs consent
+
+### Character Card Import
+
+On the identity stage, you can import a **chara_card_v2** format JSON file (the standard used by Chub.ai, JanitorAI, SillyTavern, etc.) to pre-fill all personality fields. The card is summarized by the configured LLM into a structured narrative that becomes the agent's foundational self-knowledge.
+
+Preset characters are available from `services/characters/` and appear as buttons on the identity stage. Drop any `.json` character card into that directory to make it available as a preset.
+
+The imported narrative is stored as a high-stability worldview memory (importance: 0.95, stability: 0.95) that the agent can change only through deliberate transformation — sustained focused effort, not casual drift.
 
 ## Usage Scenarios
 
@@ -246,11 +270,10 @@ Conceptual flow:
 
 ### 4) Workers + Heartbeat (Autonomous State Management)
 
-Workers run by default to schedule heartbeats, process `external_calls`, and keep the memory substrate healthy.
-If you started only db+embeddings, start workers with:
+Workers run under the `active` profile to schedule heartbeats, process `external_calls`, and keep the memory substrate healthy. Start them with:
 
 ```bash
-docker compose up -d heartbeat_worker maintenance_worker
+docker compose --profile active up -d
 ```
 
 Conceptual flow:
@@ -301,7 +324,7 @@ Conceptual flow:
 Run everything locally (Docker) and point at a local OpenAI-compatible endpoint (e.g. Ollama).
 
 ```bash
-docker compose up -d
+docker compose --profile active up -d
 hexis init   # choose provider=ollama, endpoint=http://localhost:11434/v1
 ```
 
@@ -566,10 +589,11 @@ The server supports batch-style tools like `remember_batch`, `connect_batch`, `h
 
 ## Heartbeat + Maintenance Workers
 
-The system has two independent background workers with separate triggers:
+The system has three independent background workers (all under the `active` profile):
 
 - **Heartbeat worker** (conscious): polls `external_calls` and triggers scheduled heartbeats (`should_run_heartbeat()` → `start_heartbeat()`).
-- **Maintenance worker** (subconscious): runs substrate upkeep on its own schedule (`should_run_maintenance()` → `run_subconscious_maintenance()`), and can optionally bridge outbox/inbox to RabbitMQ.
+- **Maintenance worker** (subconscious): runs substrate upkeep on its own schedule (`should_run_maintenance()` → `run_subconscious_maintenance()`), and bridges outbox/inbox to RabbitMQ.
+- **Channel worker**: bridges messaging platforms (Discord, Telegram, Slack, Signal, WhatsApp, iMessage, Matrix) to the agent via RabbitMQ.
 
 The heartbeat worker:
 - polls `external_calls` for pending LLM work
@@ -595,29 +619,37 @@ The `terminate` action expects params like:
 
 ### Turning Workers On/Off
 
-Workers are started by default, but will **skip** until the agent is initialized (`hexis init` sets `agent.is_configured` and `is_init_complete`).
+Workers are behind the `active` Docker Compose profile. They will **skip** heartbeats until the agent is initialized (`hexis init` or the web UI wizard sets `agent.is_configured` and `is_init_complete`).
 
 With Docker Compose:
 
 ```bash
-# Default: start everything (workers included)
+# Passive: db + embeddings only (no workers)
 docker compose up -d
 
-# Optional: run DB + embeddings only (no workers)
-docker compose up -d db embeddings
+# Active: start everything (workers + RabbitMQ)
+docker compose --profile active up -d
 
-# Start only the workers (if you previously omitted them)
-docker compose up -d heartbeat_worker maintenance_worker
+# Start only the workers (if you previously ran passive)
+docker compose --profile active up -d heartbeat_worker maintenance_worker
 
 # Stop the workers (containers stay)
-docker compose stop heartbeat_worker maintenance_worker
-
-# Stop + remove the worker containers
-docker compose rm -f heartbeat_worker maintenance_worker
+docker compose --profile active stop heartbeat_worker maintenance_worker
 
 # Restart the workers
-docker compose restart heartbeat_worker maintenance_worker
+docker compose --profile active restart heartbeat_worker maintenance_worker
 ```
+
+### Docker Compose Profiles
+
+| Profile | Services | Purpose |
+|---------|----------|---------|
+| *(default)* | `db`, `embeddings` | Passive — database and embedding model only |
+| `active` | + `heartbeat_worker`, `maintenance_worker`, `channel_worker`, `rabbitmq` | Full autonomous agent with messaging |
+| `signal` | + `signal-cli` | Signal messaging bridge (requires `SIGNAL_PHONE_NUMBER`) |
+| `browser` | + browserless chromium | Headless browser for web tools |
+
+Combine profiles: `docker compose --profile active --profile browser up -d`
 
 ### Pausing From The DB (Without Stopping Containers)
 
@@ -796,15 +828,11 @@ LIMIT 10;
 
 ## Embedding Model + Dimension
 
-The embeddings model and its vector dimension are configured in `docker-compose.yml` via:
-- `EMBEDDING_MODEL_ID` (default: `nomic-ai/nomic-embed-text-v1.5`)
+The embeddings model and its vector dimension are configured in `docker-compose.yml` and `.env` via:
+- `EMBEDDING_MODEL_ID` (default: `unsloth/embeddinggemma-300m` for TEI, `embeddinggemma:300m-qat-q4_0` for Ollama)
 - `EMBEDDING_DIMENSION` (default: `768`)
 
-The Nomic embed model requires a task instruction prefix. Hexis auto-prefixes:
-- Stored content (memories, working memory, etc.) → `search_document:`
-- Query text (recall/search) → `search_query:`
-
-If you want a different task type, include the prefix yourself (e.g., `clustering:`); Hexis will pass it through unchanged.
+The DB-side embedding function uses the model configured in `app.embedding_model_id` (set via docker-compose command args). The TEI container runs the HuggingFace model, while the DB can also call an Ollama endpoint directly.
 
 If you change `EMBEDDING_DIMENSION` on an existing database volume, reset the DB volume so the vector columns and HNSW indexes are created with the correct dimension.
 
