@@ -1,8 +1,9 @@
 """
-Tests for task mode in services/heartbeat_agentic.py.
+Tests for heartbeat agentic features in services/heartbeat_agentic.py.
 
-Covers: task mode detection, checkpoint context extraction, energy boost,
-system prompt augmentation, and finalization auto-checkpoint.
+Covers: backlog task detection, checkpoint context extraction, energy boost,
+system prompt augmentation, always-on planning/continuation, permission
+gating, and finalization auto-checkpoint.
 """
 
 from __future__ import annotations
@@ -15,7 +16,7 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 from services.heartbeat_agentic import (
-    _detect_task_mode,
+    _has_backlog_tasks,
     _get_checkpoint_context,
     build_heartbeat_system_prompt,
     finalize_heartbeat,
@@ -83,55 +84,55 @@ def _base_context(**overrides: Any) -> dict[str, Any]:
 
 
 # ============================================================================
-# Unit: _detect_task_mode
+# Unit: _has_backlog_tasks
 # ============================================================================
 
 
 class TestDetectTaskMode:
     def test_no_backlog_returns_false(self):
         ctx = _base_context(backlog={})
-        assert _detect_task_mode(ctx) is False
+        assert _has_backlog_tasks(ctx) is False
 
     def test_empty_counts_returns_false(self):
         ctx = _base_context(backlog={"counts": {"todo": 0, "in_progress": 0}, "actionable": []})
-        assert _detect_task_mode(ctx) is False
+        assert _has_backlog_tasks(ctx) is False
 
     def test_actionable_items_returns_true(self):
         ctx = _base_context(backlog={
             "counts": {"todo": 1},
             "actionable": [{"title": "Deploy config", "priority": "high", "status": "todo"}],
         })
-        assert _detect_task_mode(ctx) is True
+        assert _has_backlog_tasks(ctx) is True
 
     def test_in_progress_count_returns_true(self):
         ctx = _base_context(backlog={
             "counts": {"todo": 0, "in_progress": 1},
             "actionable": [],
         })
-        assert _detect_task_mode(ctx) is True
+        assert _has_backlog_tasks(ctx) is True
 
     def test_non_dict_backlog_returns_false(self):
         ctx = _base_context(backlog="not a dict")
-        assert _detect_task_mode(ctx) is False
+        assert _has_backlog_tasks(ctx) is False
 
     def test_missing_backlog_returns_false(self):
         ctx = _base_context()
         del ctx["backlog"]
-        assert _detect_task_mode(ctx) is False
+        assert _has_backlog_tasks(ctx) is False
 
     def test_only_done_items_returns_false(self):
         ctx = _base_context(backlog={
             "counts": {"done": 5, "todo": 0, "in_progress": 0},
             "actionable": [],
         })
-        assert _detect_task_mode(ctx) is False
+        assert _has_backlog_tasks(ctx) is False
 
     def test_null_counts_with_actionable_returns_true(self):
         ctx = _base_context(backlog={
             "counts": {},
             "actionable": [{"title": "Task", "status": "todo"}],
         })
-        assert _detect_task_mode(ctx) is True
+        assert _has_backlog_tasks(ctx) is True
 
 
 # ============================================================================
@@ -201,41 +202,41 @@ class TestGetCheckpointContext:
 
 
 # ============================================================================
-# Unit: build_heartbeat_system_prompt with task_mode
+# Unit: build_heartbeat_system_prompt with has_backlog_tasks
 # ============================================================================
 
 
-class TestBuildSystemPromptTaskMode:
-    async def test_task_mode_false_no_task_prompt(self):
-        prompt = await build_heartbeat_system_prompt(None, task_mode=False)
+class TestBuildSystemPromptBacklog:
+    async def test_no_backlog_no_task_prompt(self):
+        prompt = await build_heartbeat_system_prompt(None, has_backlog_tasks=False)
         assert "Task Mode" not in prompt
 
-    async def test_task_mode_true_includes_task_prompt(self):
-        prompt = await build_heartbeat_system_prompt(None, task_mode=True)
+    async def test_backlog_includes_task_prompt(self):
+        prompt = await build_heartbeat_system_prompt(None, has_backlog_tasks=True)
         assert "Task Mode" in prompt
         assert "PICK" in prompt
         assert "CHECKPOINT" in prompt
 
-    async def test_task_mode_with_registry(self):
+    async def test_backlog_with_registry(self):
         registry = _mock_registry()
-        prompt = await build_heartbeat_system_prompt(registry, task_mode=True)
+        prompt = await build_heartbeat_system_prompt(registry, has_backlog_tasks=True)
         assert "Task Mode" in prompt
         assert "manage_backlog" in prompt
 
-    async def test_default_is_not_task_mode(self):
+    async def test_default_is_no_backlog(self):
         prompt = await build_heartbeat_system_prompt()
         assert "Task Mode" not in prompt
 
 
 # ============================================================================
-# Unit: run_agentic_heartbeat task mode integration
+# Unit: run_agentic_heartbeat resource scaling
 # ============================================================================
 
 
-class TestRunAgenticHeartbeatTaskMode:
+class TestRunAgenticHeartbeatScaling:
     @patch("services.heartbeat_agentic.AgentLoop")
     @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_task_mode_doubles_energy(self, mock_load_config, mock_agent_class):
+    async def test_backlog_doubles_energy(self, mock_load_config, mock_agent_class):
         mock_load_config.return_value = {
             "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
         }
@@ -259,11 +260,11 @@ class TestRunAgenticHeartbeatTaskMode:
 
         config_arg = mock_agent_class.call_args[0][0]
         assert config_arg.energy_budget == 20  # 10 * 2
-        assert result["task_mode"] is True
+        assert result["has_backlog_tasks"] is True
 
     @patch("services.heartbeat_agentic.AgentLoop")
     @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_no_task_mode_normal_energy(self, mock_load_config, mock_agent_class):
+    async def test_no_backlog_normal_energy(self, mock_load_config, mock_agent_class):
         mock_load_config.return_value = {
             "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
         }
@@ -284,11 +285,11 @@ class TestRunAgenticHeartbeatTaskMode:
 
         config_arg = mock_agent_class.call_args[0][0]
         assert config_arg.energy_budget == 10  # unchanged
-        assert result["task_mode"] is False
+        assert result["has_backlog_tasks"] is False
 
     @patch("services.heartbeat_agentic.AgentLoop")
     @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_task_mode_extends_timeout(self, mock_load_config, mock_agent_class):
+    async def test_backlog_extends_timeout(self, mock_load_config, mock_agent_class):
         mock_load_config.return_value = {
             "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
         }
@@ -314,7 +315,7 @@ class TestRunAgenticHeartbeatTaskMode:
 
     @patch("services.heartbeat_agentic.AgentLoop")
     @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_task_mode_increases_max_tokens(self, mock_load_config, mock_agent_class):
+    async def test_backlog_increases_max_tokens(self, mock_load_config, mock_agent_class):
         mock_load_config.return_value = {
             "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
         }
@@ -399,12 +400,12 @@ class TestFinalizeAutoCheckpoint:
                         "tool_calls_made": [{"name": "shell"}],
                         "energy_spent": 20,
                         "stopped_reason": "timeout",
-                        "task_mode": True,
+                        "has_backlog_tasks": True,
                     },
                 )
 
                 assert result["completed"] is True
-                assert result["task_mode"] is True
+                assert result["has_backlog_tasks"] is True
 
                 # Verify checkpoint was set
                 row = await conn.fetchrow(
@@ -438,7 +439,7 @@ class TestFinalizeAutoCheckpoint:
                         "tool_calls_made": [],
                         "energy_spent": 10,
                         "stopped_reason": "timeout",
-                        "task_mode": True,
+                        "has_backlog_tasks": True,
                     },
                 )
 
@@ -470,7 +471,7 @@ class TestFinalizeAutoCheckpoint:
                         "tool_calls_made": [],
                         "energy_spent": 5,
                         "stopped_reason": "completed",
-                        "task_mode": True,
+                        "has_backlog_tasks": True,
                     },
                 )
 
@@ -481,8 +482,8 @@ class TestFinalizeAutoCheckpoint:
             finally:
                 await conn.execute("DELETE FROM public.backlog WHERE id = $1", item_id)
 
-    async def test_no_auto_checkpoint_without_task_mode(self, db_pool):
-        """No auto-checkpoint when task_mode is False."""
+    async def test_no_auto_checkpoint_without_backlog_tasks(self, db_pool):
+        """No auto-checkpoint when has_backlog_tasks is False."""
         async with db_pool.acquire() as conn:
             item_id = await conn.fetchval(
                 """
@@ -501,7 +502,7 @@ class TestFinalizeAutoCheckpoint:
                         "tool_calls_made": [],
                         "energy_spent": 10,
                         "stopped_reason": "timeout",
-                        "task_mode": False,
+                        "has_backlog_tasks": False,
                     },
                 )
 
@@ -532,7 +533,7 @@ class TestFinalizeAutoCheckpoint:
                         "tool_calls_made": [{"name": "shell"}, {"name": "recall"}],
                         "energy_spent": 40,
                         "stopped_reason": "energy_exhausted",
-                        "task_mode": True,
+                        "has_backlog_tasks": True,
                     },
                 )
 
@@ -563,16 +564,17 @@ class TestTaskModePromptLoader:
 
 
 # ============================================================================
-# Integration: task mode wires planning, overrides, continuation
+# Integration: always-on planning/continuation, gated permissions
 # ============================================================================
 
 
-class TestTaskModeAgentLoopWiring:
-    """Verify that task mode correctly wires the three gap-closing features."""
+class TestHeartbeatAgentLoopWiring:
+    """Verify that planning and continuation are always on, permissions are gated."""
 
     @patch("services.heartbeat_agentic.AgentLoop")
     @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_task_mode_enables_planning(self, mock_load_config, mock_agent_class):
+    async def test_planning_always_enabled(self, mock_load_config, mock_agent_class):
+        """Planning is on even without backlog tasks."""
         mock_load_config.return_value = {
             "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
         }
@@ -583,14 +585,11 @@ class TestTaskModeAgentLoopWiring:
         )
         mock_agent_class.return_value = mock_agent
 
-        ctx = _base_context(backlog={
-            "counts": {"todo": 1},
-            "actionable": [{"title": "Deploy config", "status": "todo"}],
-        })
+        ctx = _base_context(backlog={"counts": {}, "actionable": []})
 
         await run_agentic_heartbeat(
             AsyncMock(), pool=MagicMock(), registry=_mock_registry(),
-            heartbeat_id="hb-gap1", context=ctx,
+            heartbeat_id="hb-always-plan", context=ctx,
         )
 
         config_arg = mock_agent_class.call_args[0][0]
@@ -598,7 +597,33 @@ class TestTaskModeAgentLoopWiring:
 
     @patch("services.heartbeat_agentic.AgentLoop")
     @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_task_mode_enables_context_overrides(self, mock_load_config, mock_agent_class):
+    async def test_continuation_always_enabled(self, mock_load_config, mock_agent_class):
+        """Continuation nudge is on even without backlog tasks."""
+        mock_load_config.return_value = {
+            "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
+        }
+        mock_agent = AsyncMock()
+        mock_agent.run.return_value = MagicMock(
+            text="Done.", tool_calls_made=[], iterations=1,
+            energy_spent=0, timed_out=False, stopped_reason="completed",
+        )
+        mock_agent_class.return_value = mock_agent
+
+        ctx = _base_context(backlog={"counts": {}, "actionable": []})
+
+        await run_agentic_heartbeat(
+            AsyncMock(), pool=MagicMock(), registry=_mock_registry(),
+            heartbeat_id="hb-always-cont", context=ctx,
+        )
+
+        config_arg = mock_agent_class.call_args[0][0]
+        assert config_arg.continuation_prompt is not None
+        assert config_arg.max_continuations >= 1
+
+    @patch("services.heartbeat_agentic.AgentLoop")
+    @patch("services.heartbeat_agentic.load_llm_config")
+    async def test_backlog_grants_permissions(self, mock_load_config, mock_agent_class):
+        """Backlog tasks grant shell + file_write permissions."""
         mock_load_config.return_value = {
             "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
         }
@@ -616,7 +641,7 @@ class TestTaskModeAgentLoopWiring:
 
         await run_agentic_heartbeat(
             AsyncMock(), pool=MagicMock(), registry=_mock_registry(),
-            heartbeat_id="hb-gap4", context=ctx,
+            heartbeat_id="hb-perms", context=ctx,
         )
 
         config_arg = mock_agent_class.call_args[0][0]
@@ -626,35 +651,8 @@ class TestTaskModeAgentLoopWiring:
 
     @patch("services.heartbeat_agentic.AgentLoop")
     @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_task_mode_enables_continuation(self, mock_load_config, mock_agent_class):
-        mock_load_config.return_value = {
-            "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
-        }
-        mock_agent = AsyncMock()
-        mock_agent.run.return_value = MagicMock(
-            text="Done.", tool_calls_made=[], iterations=1,
-            energy_spent=0, timed_out=False, stopped_reason="completed",
-        )
-        mock_agent_class.return_value = mock_agent
-
-        ctx = _base_context(backlog={
-            "counts": {"todo": 1},
-            "actionable": [{"title": "Run tests", "status": "todo"}],
-        })
-
-        await run_agentic_heartbeat(
-            AsyncMock(), pool=MagicMock(), registry=_mock_registry(),
-            heartbeat_id="hb-gap5", context=ctx,
-        )
-
-        config_arg = mock_agent_class.call_args[0][0]
-        assert config_arg.continuation_prompt is not None
-        assert "verify" in config_arg.continuation_prompt.lower()
-        assert config_arg.max_continuations == 2
-
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_non_task_mode_has_defaults(self, mock_load_config, mock_agent_class):
+    async def test_no_backlog_no_permissions(self, mock_load_config, mock_agent_class):
+        """Without backlog tasks, no elevated permissions are granted."""
         mock_load_config.return_value = {
             "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
         }
@@ -669,11 +667,44 @@ class TestTaskModeAgentLoopWiring:
 
         await run_agentic_heartbeat(
             AsyncMock(), pool=MagicMock(), registry=_mock_registry(),
-            heartbeat_id="hb-defaults", context=ctx,
+            heartbeat_id="hb-no-perms", context=ctx,
         )
 
         config_arg = mock_agent_class.call_args[0][0]
-        assert config_arg.enable_planning is False
         assert config_arg.context_overrides is None
-        assert config_arg.continuation_prompt is None
-        assert config_arg.max_continuations == 0
+
+    @patch("services.heartbeat_agentic.AgentLoop")
+    @patch("services.heartbeat_agentic.load_llm_config")
+    async def test_backlog_gets_more_continuations(self, mock_load_config, mock_agent_class):
+        """Backlog tasks get 2 continuations, empty backlog gets 1."""
+        mock_load_config.return_value = {
+            "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
+        }
+        mock_agent = AsyncMock()
+        mock_agent.run.return_value = MagicMock(
+            text="Done.", tool_calls_made=[], iterations=1,
+            energy_spent=0, timed_out=False, stopped_reason="completed",
+        )
+        mock_agent_class.return_value = mock_agent
+
+        # With backlog
+        ctx_tasks = _base_context(backlog={
+            "counts": {"todo": 1},
+            "actionable": [{"title": "Task", "status": "todo"}],
+        })
+        await run_agentic_heartbeat(
+            AsyncMock(), pool=MagicMock(), registry=_mock_registry(),
+            heartbeat_id="hb-cont-tasks", context=ctx_tasks,
+        )
+        config_tasks = mock_agent_class.call_args[0][0]
+
+        # Without backlog
+        ctx_empty = _base_context(backlog={"counts": {}, "actionable": []})
+        await run_agentic_heartbeat(
+            AsyncMock(), pool=MagicMock(), registry=_mock_registry(),
+            heartbeat_id="hb-cont-empty", context=ctx_empty,
+        )
+        config_empty = mock_agent_class.call_args[0][0]
+
+        assert config_tasks.max_continuations == 2
+        assert config_empty.max_continuations == 1

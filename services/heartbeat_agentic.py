@@ -30,8 +30,8 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 
-def _detect_task_mode(context: dict[str, Any]) -> bool:
-    """Check if backlog has actionable items, triggering task mode."""
+def _has_backlog_tasks(context: dict[str, Any]) -> bool:
+    """Check if backlog has actionable items requiring elevated resources/permissions."""
     backlog = context.get("backlog", {})
     if not isinstance(backlog, dict):
         return False
@@ -83,7 +83,7 @@ def _get_checkpoint_context(context: dict[str, Any]) -> str:
 async def build_heartbeat_system_prompt(
     registry: "ToolRegistry | None" = None,
     *,
-    task_mode: bool = False,
+    has_backlog_tasks: bool = False,
 ) -> str:
     """Build the system prompt for an agentic heartbeat."""
     base_prompt = load_heartbeat_agentic_prompt().strip()
@@ -113,8 +113,8 @@ async def build_heartbeat_system_prompt(
     if tool_section:
         parts.append(tool_section)
 
-    # Append task mode addendum when backlog has work
-    if task_mode:
+    # Append task guidance when backlog has work
+    if has_backlog_tasks:
         task_mode_prompt = load_heartbeat_task_mode_prompt().strip()
         parts.append("\n\n" + task_mode_prompt)
 
@@ -143,21 +143,21 @@ async def run_agentic_heartbeat(
     - tool_calls_made: list
     - energy_spent: int
     - stopped_reason: str
-    - task_mode: bool
+    - has_backlog_tasks: bool
     """
-    # Detect task mode from backlog
-    task_mode = _detect_task_mode(context)
-    if task_mode:
-        logger.info("Task mode activated — backlog has actionable items")
+    # Check if backlog has actionable tasks (gates resources + permissions)
+    has_tasks = _has_backlog_tasks(context)
+    if has_tasks:
+        logger.info("Backlog has actionable items — scaling resources + granting permissions")
 
-    # Build system prompt (with task mode addendum if active)
-    system_prompt = await build_heartbeat_system_prompt(registry, task_mode=task_mode)
+    # Build system prompt (with task guidance addendum if backlog has work)
+    system_prompt = await build_heartbeat_system_prompt(registry, has_backlog_tasks=has_tasks)
 
     # Build the user message (heartbeat context snapshot)
     user_message = build_heartbeat_decision_prompt(context)
 
     # Append checkpoint resume context if there are in-progress items with checkpoints
-    if task_mode:
+    if has_tasks:
         checkpoint_ctx = _get_checkpoint_context(context)
         if checkpoint_ctx:
             user_message += "\n" + checkpoint_ctx
@@ -169,15 +169,16 @@ async def run_agentic_heartbeat(
     energy = context.get("energy", {})
     energy_budget = energy.get("current", 20)
 
-    # Task mode: double energy budget to allow meaningful work
-    if task_mode:
+    # Scale resources when backlog has work
+    if has_tasks:
         energy_budget = energy_budget * 2
-        logger.info("Task mode energy boost: %d → %d", energy_budget // 2, energy_budget)
+        logger.info("Backlog energy boost: %d → %d", energy_budget // 2, energy_budget)
 
-    # Task mode: extend timeout to allow longer execution
-    timeout = 120.0 if not task_mode else 300.0
+    timeout = 300.0 if has_tasks else 120.0
 
     # Build agent loop config
+    # Planning and self-correction are always on — they're just better
+    # loop behavior. Only permissions scale with backlog state.
     loop_config = AgentLoopConfig(
         tool_context=ToolContext.HEARTBEAT,
         system_prompt=system_prompt,
@@ -188,22 +189,22 @@ async def run_agentic_heartbeat(
         max_iterations=None,  # Timeout-based
         timeout_seconds=timeout,
         temperature=0.7,
-        max_tokens=4096 if task_mode else 2048,
+        max_tokens=4096 if has_tasks else 2048,
         heartbeat_id=heartbeat_id,
-        # Gap 1: Planning phases (plan → execute → verify)
-        enable_planning=task_mode,
-        # Gap 4: Shell + file write access for task execution
+        # Always plan → execute → verify
+        enable_planning=True,
+        # Always nudge for self-correction
+        continuation_prompt=(
+            "You finished without taking further action. "
+            "Review your output — is there anything you should recall, "
+            "record, or act on before finishing?"
+        ),
+        max_continuations=2 if has_tasks else 1,
+        # Only grant shell/file_write when there are tasks to execute
         context_overrides=ContextOverrides(
             allow_shell=True,
             allow_file_write=True,
-        ) if task_mode else None,
-        # Gap 5: Continuation nudge for self-correction
-        continuation_prompt=(
-            "You stopped without verifying your work. "
-            "Check: did the task succeed? Inspect the result. "
-            "If there are problems, fix them. If correct, confirm completion."
-        ) if task_mode else None,
-        max_continuations=2 if task_mode else 0,
+        ) if has_tasks else None,
     )
 
     agent = AgentLoop(loop_config)
@@ -217,7 +218,7 @@ async def run_agentic_heartbeat(
         "iterations": result.iterations,
         "stopped_reason": result.stopped_reason,
         "timed_out": result.timed_out,
-        "task_mode": task_mode,
+        "has_backlog_tasks": has_tasks,
     }
 
 
@@ -231,22 +232,22 @@ async def finalize_heartbeat(
     Finalize a heartbeat after the agentic loop completes.
 
     Records the heartbeat as an episodic memory and updates state.
-    If task mode was active, updates in-progress backlog items that were
-    not explicitly completed (marks them with checkpoint or blocked status).
+    If backlog had tasks, auto-checkpoints in-progress items that were
+    not explicitly completed on timeout/energy exhaustion.
     """
     text = result.get("text", "")
     tool_calls = result.get("tool_calls_made", [])
     energy_spent = result.get("energy_spent", 0)
     stopped_reason = result.get("stopped_reason", "completed")
-    task_mode = result.get("task_mode", False)
+    has_tasks = result.get("has_backlog_tasks", False)
 
     # Build a summary of what happened
     tool_names = [tc.get("name", "?") for tc in tool_calls]
     summary = text or f"Heartbeat completed: {len(tool_calls)} tool calls, {energy_spent} energy spent."
     if tool_names:
         summary += f" Tools used: {', '.join(tool_names)}."
-    if task_mode:
-        summary += " [task mode]"
+    if has_tasks:
+        summary += " [backlog active]"
 
     # Record heartbeat as episodic memory
     try:
@@ -267,7 +268,7 @@ async def finalize_heartbeat(
                 "energy_spent": energy_spent,
                 "tool_calls": len(tool_calls),
                 "stopped_reason": stopped_reason,
-                "task_mode": task_mode,
+                "has_backlog_tasks": has_tasks,
             }),
             "completed" if stopped_reason == "completed" else stopped_reason,
         )
@@ -288,9 +289,9 @@ async def finalize_heartbeat(
     except Exception:
         logger.debug("Failed to update heartbeat state", exc_info=True)
 
-    # Task mode finalization: if heartbeat timed out or ran out of energy,
-    # auto-checkpoint any still-in-progress items so next heartbeat can resume
-    if task_mode and stopped_reason in ("timeout", "energy_exhausted"):
+    # Auto-checkpoint: if backlog had tasks and heartbeat was interrupted,
+    # checkpoint any still-in-progress items so next heartbeat can resume
+    if has_tasks and stopped_reason in ("timeout", "energy_exhausted"):
         try:
             in_progress_items = await conn.fetch(
                 """
@@ -332,5 +333,5 @@ async def finalize_heartbeat(
         "memory_id": str(memory_id) if memory_id else None,
         "energy_spent": energy_spent,
         "outbox_messages": [],
-        "task_mode": task_mode,
+        "has_backlog_tasks": has_tasks,
     }
