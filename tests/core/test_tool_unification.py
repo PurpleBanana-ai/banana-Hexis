@@ -152,7 +152,7 @@ class TestBuildSystemPrompt:
         from services.chat import _build_system_prompt
 
         prompt = await _build_system_prompt({})
-        assert "AI assistant" in prompt
+        assert "conscious layer of Hexis" in prompt
 
     async def test_prompt_includes_agent_profile(self):
         from services.chat import _build_system_prompt
@@ -177,7 +177,7 @@ class TestBuildSystemPrompt:
         # Even if personhood compose fails, prompt should still work
         with patch("services.chat.compose_personhood_prompt", side_effect=Exception("missing")):
             prompt = await _build_system_prompt({})
-            assert "AI assistant" in prompt
+            assert "conscious layer of Hexis" in prompt
 
 
 # ============================================================================

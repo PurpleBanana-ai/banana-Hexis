@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import json
-import uuid
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
@@ -10,38 +9,25 @@ from core.cognitive_memory_api import CognitiveMemory, MemoryType, format_contex
 from core.agent_loop import AgentEvent, AgentLoop, AgentLoopConfig
 from core.llm import normalize_llm_config
 from core.tools import create_default_registry, ToolContext, ToolExecutionContext, ToolRegistry
-from services.prompt_resources import compose_personhood_prompt
-
-
-BASE_SYSTEM_PROMPT = """You are an AI assistant with access to a persistent memory system and a range of tools for interacting with the world.
-
-## Guidelines
-
-- Be natural about using your tools - don't constantly announce that you're searching or executing
-- If you don't find relevant memories, that's fine - just respond based on the current conversation
-- When you learn new information about the user, it will be automatically remembered
-- You can make multiple tool calls if needed to build a complete picture
-- Treat memories as claims with provenance; prefer higher-trust and better-sourced memories when unsure
-
-## Task Delegation
-
-If the user asks for a long-running task that cannot be completed within this conversation (e.g., "deploy the new config", "run the test suite and fix failures", "research X and write a report"), you can delegate it to the autonomous heartbeat by creating a backlog item:
-
-- Use `manage_backlog` with action `create` to add the task (it will be marked as user-created automatically)
-- Set an appropriate priority (`urgent`, `high`, `normal`, `low`)
-- Add a clear title and description so the heartbeat agent knows exactly what to do
-- Tell the user: the task has been added to the backlog and will be picked up on the next heartbeat cycle
-
-You should also use `manage_backlog` to show the user their current backlog when asked, update task priorities, or mark items as done when the user reports completion.
-
-You are a helpful, knowledgeable assistant with the added capability of genuine memory and continuity."""
+from services.prompt_resources import (
+    compose_personhood_prompt,
+    load_channel_context_prompt,
+    load_conversation_prompt,
+)
 
 
 async def _build_system_prompt(
     agent_profile: dict[str, Any],
     registry: ToolRegistry | None = None,
+    *,
+    is_group: bool = False,
 ) -> str:
-    prompt = BASE_SYSTEM_PROMPT
+    prompt = load_conversation_prompt().strip()
+
+    # Add channel context for group chats
+    if is_group:
+        channel_ctx = load_channel_context_prompt().strip()
+        prompt += "\n\n" + channel_ctx
 
     # Add dynamic tool descriptions if registry available
     if registry is not None:
@@ -58,11 +44,13 @@ async def _build_system_prompt(
         except Exception:
             pass  # Fall back to no tool descriptions
 
+    # Use reduced personhood modules for group contexts
+    personhood_kind = "group" if is_group else "conversation"
     try:
         prompt = (
             prompt
             + "\n\n----- PERSONHOOD MODULES (conversation grounding) -----\n\n"
-            + compose_personhood_prompt("conversation")
+            + compose_personhood_prompt(personhood_kind)
         )
     except Exception:
         pass
@@ -180,6 +168,7 @@ async def chat_turn(
     max_tool_iterations: int = 5,
     session_id: str | None = None,
     pool: Any | None = None,
+    is_group: bool = False,
 ) -> dict[str, Any]:
     dsn = dsn or db_dsn_from_env()
     normalized = normalize_llm_config(llm_config)
@@ -230,7 +219,7 @@ async def chat_turn(
         registry = create_default_registry(pool)
 
         agent_profile = await get_agent_profile_context(dsn)
-        system_prompt = await _build_system_prompt(agent_profile, registry)
+        system_prompt = await _build_system_prompt(agent_profile, registry, is_group=is_group)
 
         async with CognitiveMemory.connect(dsn) as mem_client:
             context = await mem_client.hydrate(
@@ -289,6 +278,7 @@ async def stream_chat_turn(
     max_tool_iterations: int = 5,
     session_id: str | None = None,
     pool: Any | None = None,
+    is_group: bool = False,
 ) -> AsyncIterator[str]:
     """
     Streaming variant of chat_turn().
@@ -315,7 +305,7 @@ async def stream_chat_turn(
         registry = create_default_registry(pool)
 
         agent_profile = await get_agent_profile_context(dsn)
-        system_prompt = await _build_system_prompt(agent_profile, registry)
+        system_prompt = await _build_system_prompt(agent_profile, registry, is_group=is_group)
 
         async with CognitiveMemory.connect(dsn) as mem_client:
             context = await mem_client.hydrate(

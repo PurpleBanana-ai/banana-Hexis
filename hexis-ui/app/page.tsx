@@ -381,6 +381,8 @@ export default function Home() {
     type: "partner",
     purpose: "",
   });
+  const [importingCard, setImportingCard] = useState(false);
+  const [importedCardName, setImportedCardName] = useState<string | null>(null);
 
   const flow = useMemo(() => {
     const steps: InitStage[] = [
@@ -638,7 +640,7 @@ export default function Home() {
 
   const requestConsent = async (role: LlmRole) => {
     const config = role === "conscious" ? llmConscious : llmSubconscious;
-    const res = await postJson("/api/init/consent/request", {
+    const res = await postJson<any>("/api/init/consent/request", {
       role,
       llm: {
         provider: config.provider,
@@ -890,6 +892,151 @@ export default function Home() {
       setError(err.message || "Failed to save relationship");
     } finally {
       setBusy(false);
+    }
+  };
+
+  const handleSkipStage = async (stageName: InitStage) => {
+    setBusy(true);
+    setError(null);
+    try {
+      switch (stageName) {
+        case "identity":
+          await postJson("/api/init/identity", {
+            name: "",
+            pronouns: "",
+            voice: "",
+            description: "",
+            purpose: "",
+            creator_name: userName || "",
+          });
+          break;
+        case "personality":
+          await postJson("/api/init/personality", {
+            traits: null,
+            description: "",
+          });
+          break;
+        case "values":
+          await postJson("/api/init/values", { values: [] });
+          break;
+        case "worldview":
+          await postJson("/api/init/worldview", {
+            worldview: { metaphysics: "", human_nature: "", epistemology: "", ethics: "" },
+          });
+          break;
+        case "boundaries":
+          await postJson("/api/init/boundaries", { boundaries: [] });
+          break;
+        case "interests":
+          await postJson("/api/init/interests", { interests: [] });
+          break;
+        case "goals":
+          await postJson("/api/init/goals", {
+            payload: { goals: [], purpose: null },
+          });
+          break;
+        default:
+          break;
+      }
+      setStage(nextStage(stageName));
+    } catch (err: any) {
+      setError(err.message || `Failed to skip ${stageName}`);
+    } finally {
+      setBusy(false);
+    }
+  };
+
+  const handleImportCard = async (file: File) => {
+    setImportingCard(true);
+    setError(null);
+    try {
+      const text = await file.text();
+      const card = JSON.parse(text);
+      const res = await postJson<{ persona?: any; error?: string }>(
+        "/api/init/import-card",
+        { card }
+      );
+      if (res.error) {
+        throw new Error(res.error);
+      }
+      const p = res.persona;
+      if (!p) {
+        throw new Error("No persona returned from import");
+      }
+
+      // Pre-fill identity fields
+      setIdentity((prev) => ({
+        ...prev,
+        name: p.name || prev.name,
+        pronouns: p.pronouns || prev.pronouns,
+        voice: p.voice || prev.voice,
+        description: p.description || prev.description,
+        purpose: p.purpose || prev.purpose,
+      }));
+
+      // Pre-fill personality
+      if (p.personality_description) {
+        setPersonalityDesc(p.personality_description);
+      }
+      if (p.personality_traits) {
+        setPersonalityTraits((prev) => ({
+          openness: Math.round((p.personality_traits.openness ?? prev.openness / 100) * 100),
+          conscientiousness: Math.round((p.personality_traits.conscientiousness ?? prev.conscientiousness / 100) * 100),
+          extraversion: Math.round((p.personality_traits.extraversion ?? prev.extraversion / 100) * 100),
+          agreeableness: Math.round((p.personality_traits.agreeableness ?? prev.agreeableness / 100) * 100),
+          neuroticism: Math.round((p.personality_traits.neuroticism ?? prev.neuroticism / 100) * 100),
+        }));
+      }
+
+      // Pre-fill values
+      if (Array.isArray(p.values) && p.values.length > 0) {
+        setValuesText(p.values.join("\n"));
+      }
+
+      // Pre-fill worldview
+      if (p.worldview) {
+        setWorldview((prev) => ({
+          metaphysics: p.worldview.metaphysics || prev.metaphysics,
+          human_nature: p.worldview.human_nature || prev.human_nature,
+          epistemology: p.worldview.epistemology || prev.epistemology,
+          ethics: p.worldview.ethics || prev.ethics,
+        }));
+      }
+
+      // Pre-fill interests
+      if (Array.isArray(p.interests) && p.interests.length > 0) {
+        setInterestsText(p.interests.join("\n"));
+      }
+
+      // Pre-fill goals
+      if (Array.isArray(p.goals) && p.goals.length > 0) {
+        setGoals(
+          p.goals.map((g: string) => ({
+            title: g,
+            description: "",
+            priority: "queued",
+          }))
+        );
+      }
+
+      // Pre-fill boundaries
+      if (Array.isArray(p.boundaries) && p.boundaries.length > 0) {
+        setBoundaries(
+          p.boundaries.map((b: string) => ({
+            content: b,
+            trigger_patterns: "",
+            response_type: "refuse",
+            response_template: "",
+            type: "ethical",
+          }))
+        );
+      }
+
+      setImportedCardName(p.name || card?.data?.name || file.name);
+    } catch (err: any) {
+      setError(err.message || "Failed to import character card");
+    } finally {
+      setImportingCard(false);
     }
   };
 
@@ -1450,6 +1597,40 @@ export default function Home() {
 
             {stage === "identity" && (
               <div className="space-y-4">
+                <div className="rounded-2xl border border-dashed border-[var(--outline)] bg-[var(--surface)] p-4">
+                  <p className="text-xs uppercase tracking-[0.3em] text-[var(--ink-soft)]">
+                    Import from Character Card
+                  </p>
+                  <p className="mt-2 text-sm text-[var(--ink-soft)]">
+                    Upload a chara_card_v2 JSON file to pre-fill all personality fields.
+                  </p>
+                  <label
+                    className={`mt-3 flex cursor-pointer items-center justify-center rounded-xl border border-[var(--outline)] bg-white px-4 py-3 text-sm transition hover:border-[var(--accent)] ${
+                      importingCard ? "pointer-events-none opacity-60" : ""
+                    }`}
+                  >
+                    <input
+                      type="file"
+                      accept=".json"
+                      className="hidden"
+                      onChange={(event) => {
+                        const file = event.target.files?.[0];
+                        if (file) handleImportCard(file);
+                        event.target.value = "";
+                      }}
+                      disabled={importingCard}
+                    />
+                    {importingCard
+                      ? "Importing... (this may take a moment)"
+                      : "Choose .json file"}
+                  </label>
+                  {importedCardName && (
+                    <p className="mt-2 text-sm text-[var(--accent-strong)]">
+                      Imported from: {importedCardName} — review each stage below.
+                    </p>
+                  )}
+                </div>
+
                 {[
                   { label: "Name", key: "name", placeholder: "Hexis" },
                   { label: "Pronouns", key: "pronouns", placeholder: "they/them" },
@@ -1508,13 +1689,22 @@ export default function Home() {
                     placeholder={userName || "Your name"}
                   />
                 </div>
-                <button
-                  className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
-                  onClick={handleIdentity}
-                  disabled={busy}
-                >
-                  Continue
-                </button>
+                <div className="flex flex-col gap-3 sm:flex-row">
+                  <button
+                    className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
+                    onClick={handleIdentity}
+                    disabled={busy}
+                  >
+                    Continue
+                  </button>
+                  <button
+                    className="rounded-full border border-[var(--outline)] px-6 py-3 text-sm font-semibold text-[var(--foreground)] transition hover:border-[var(--accent)]"
+                    onClick={() => handleSkipStage("identity")}
+                    disabled={busy}
+                  >
+                    Skip
+                  </button>
+                </div>
               </div>
             )}
 
@@ -1557,13 +1747,22 @@ export default function Home() {
                     );
                   })}
                 </div>
-                <button
-                  className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
-                  onClick={handlePersonality}
-                  disabled={busy}
-                >
-                  Continue
-                </button>
+                <div className="flex flex-col gap-3 sm:flex-row">
+                  <button
+                    className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
+                    onClick={handlePersonality}
+                    disabled={busy}
+                  >
+                    Continue
+                  </button>
+                  <button
+                    className="rounded-full border border-[var(--outline)] px-6 py-3 text-sm font-semibold text-[var(--foreground)] transition hover:border-[var(--accent)]"
+                    onClick={() => handleSkipStage("personality")}
+                    disabled={busy}
+                  >
+                    Skip
+                  </button>
+                </div>
               </div>
             )}
 
@@ -1580,13 +1779,22 @@ export default function Home() {
                     placeholder="honesty&#10;growth&#10;kindness"
                   />
                 </div>
-                <button
-                  className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
-                  onClick={handleValues}
-                  disabled={busy}
-                >
-                  Continue
-                </button>
+                <div className="flex flex-col gap-3 sm:flex-row">
+                  <button
+                    className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
+                    onClick={handleValues}
+                    disabled={busy}
+                  >
+                    Continue
+                  </button>
+                  <button
+                    className="rounded-full border border-[var(--outline)] px-6 py-3 text-sm font-semibold text-[var(--foreground)] transition hover:border-[var(--accent)]"
+                    onClick={() => handleSkipStage("values")}
+                    disabled={busy}
+                  >
+                    Skip
+                  </button>
+                </div>
               </div>
             )}
 
@@ -1612,13 +1820,22 @@ export default function Home() {
                     />
                   </div>
                 ))}
-                <button
-                  className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
-                  onClick={handleWorldview}
-                  disabled={busy}
-                >
-                  Continue
-                </button>
+                <div className="flex flex-col gap-3 sm:flex-row">
+                  <button
+                    className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
+                    onClick={handleWorldview}
+                    disabled={busy}
+                  >
+                    Continue
+                  </button>
+                  <button
+                    className="rounded-full border border-[var(--outline)] px-6 py-3 text-sm font-semibold text-[var(--foreground)] transition hover:border-[var(--accent)]"
+                    onClick={() => handleSkipStage("worldview")}
+                    disabled={busy}
+                  >
+                    Skip
+                  </button>
+                </div>
               </div>
             )}
 
@@ -1697,6 +1914,13 @@ export default function Home() {
                   >
                     Continue
                   </button>
+                  <button
+                    className="rounded-full border border-[var(--outline)] px-6 py-3 text-sm font-semibold text-[var(--foreground)] transition hover:border-[var(--accent)]"
+                    onClick={() => handleSkipStage("boundaries")}
+                    disabled={busy}
+                  >
+                    Skip
+                  </button>
                 </div>
               </div>
             )}
@@ -1714,13 +1938,22 @@ export default function Home() {
                     placeholder="philosophy&#10;systems design&#10;music"
                   />
                 </div>
-                <button
-                  className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
-                  onClick={handleInterests}
-                  disabled={busy}
-                >
-                  Continue
-                </button>
+                <div className="flex flex-col gap-3 sm:flex-row">
+                  <button
+                    className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
+                    onClick={handleInterests}
+                    disabled={busy}
+                  >
+                    Continue
+                  </button>
+                  <button
+                    className="rounded-full border border-[var(--outline)] px-6 py-3 text-sm font-semibold text-[var(--foreground)] transition hover:border-[var(--accent)]"
+                    onClick={() => handleSkipStage("interests")}
+                    disabled={busy}
+                  >
+                    Skip
+                  </button>
+                </div>
               </div>
             )}
 
@@ -1787,6 +2020,13 @@ export default function Home() {
                     disabled={busy}
                   >
                     Continue
+                  </button>
+                  <button
+                    className="rounded-full border border-[var(--outline)] px-6 py-3 text-sm font-semibold text-[var(--foreground)] transition hover:border-[var(--accent)]"
+                    onClick={() => handleSkipStage("goals")}
+                    disabled={busy}
+                  >
+                    Skip
                   </button>
                 </div>
               </div>

@@ -31,7 +31,7 @@ type ConsentRecord = {
 
 const apiKeyRequired = new Set(["openai", "anthropic", "grok", "gemini"]);
 const consentTool = {
-  type: "function",
+  type: "function" as const,
   function: {
     name: "sign_consent",
     description:
@@ -215,7 +215,7 @@ async function requestAnthropicConsent(params: {
       {
         name: consentTool.function.name,
         description: consentTool.function.description,
-        input_schema: consentTool.function.parameters,
+        input_schema: consentTool.function.parameters as Anthropic.Tool.InputSchema,
       },
     ],
     tool_choice: { type: "tool" as const, name: "sign_consent" },
@@ -244,10 +244,10 @@ async function requestAnthropicConsent(params: {
   const toolUse = content.find(
     (item: any) => item?.type === "tool_use" && item?.name === "sign_consent"
   );
-  if (!toolUse?.input) {
+  if (!(toolUse as any)?.input) {
     throw new Error("Anthropic consent call did not return tool input.");
   }
-  return { args: toolUse.input, requestId: message?._request_id ?? null };
+  return { args: (toolUse as any).input, requestId: (message as any)?._request_id ?? null };
 }
 
 async function requestGrokConsent(params: {
@@ -262,7 +262,7 @@ async function requestGrokConsent(params: {
     system,
     prompt: user,
   };
-  let result: Awaited<ReturnType<typeof generateText>>;
+  let result: any;
   try {
     result = await generateText({
       model: client.responses(params.model),
@@ -284,7 +284,7 @@ async function requestGrokConsent(params: {
     throw new Error(`Grok consent failed: ${detail}`);
   }
 
-  const toolCall = result.toolCalls.find((call) => call.toolName === "sign_consent");
+  const toolCall = result.toolCalls.find((call: any) => call.toolName === "sign_consent");
   if (!toolCall?.input) {
     throw new Error("Grok consent call did not return tool input.");
   }

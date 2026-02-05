@@ -18,6 +18,8 @@ SUBCONSCIOUS_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "subcon
 RLM_HEARTBEAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_heartbeat_system.md"
 RLM_CHAT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_chat_system.md"
 RLM_SLOW_INGEST_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_slow_ingest_system.md"
+CONVERSATION_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "conversation.md"
+CHANNEL_CONTEXT_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "channel_context.md"
 RLM_RECONSOLIDATION_PROMPT_PATH = Path(__file__).resolve().parent / "prompts" / "rlm_reconsolidation_system.md"
 
 
@@ -188,7 +190,26 @@ def load_reconsolidation_prompt() -> str:
     return "Reconsolidation prompt missing. Respond with JSON verdicts for each memory."
 
 
-PromptKind = Literal["heartbeat", "reflect", "conversation", "ingest"]
+def load_conversation_prompt() -> str:
+    if CONVERSATION_PROMPT_PATH.exists():
+        return CONVERSATION_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "You are an AI assistant with persistent memory and tools. "
+        "Use recall before answering about prior work or preferences. "
+        "Be genuinely helpful, not performatively helpful."
+    )
+
+
+def load_channel_context_prompt() -> str:
+    if CHANNEL_CONTEXT_PROMPT_PATH.exists():
+        return CHANNEL_CONTEXT_PROMPT_PATH.read_text(encoding="utf-8")
+    return (
+        "You are in a group conversation. Respond when mentioned or when you can add genuine value. "
+        "Stay silent during casual banter. Don't share private context."
+    )
+
+
+PromptKind = Literal["heartbeat", "reflect", "conversation", "ingest", "group"]
 
 
 def compose_personhood_prompt(kind: PromptKind) -> str:
@@ -208,6 +229,8 @@ def compose_personhood_prompt(kind: PromptKind) -> str:
         keys = ["core_identity", "relational_system", "affective_system", "conversational_presence"]
     elif kind == "ingest":
         keys = ["core_identity", "affective_system", "value_system"]
+    elif kind == "group":
+        keys = ["core_identity", "conversational_presence"]
     else:
         raise ValueError(f"Unknown kind: {kind}")
 
