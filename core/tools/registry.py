@@ -569,6 +569,8 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     from .dynamic import create_dynamic_tools
     from .goals import create_goal_tools
     from .backlog import create_backlog_tools
+    from .cron import create_cron_tools
+    from .sessions import create_session_tools
     from .hooks import AuditTrailHook
 
     builder = ToolRegistryBuilder(pool)
@@ -586,6 +588,8 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     builder.add_all(create_dynamic_tools())
     builder.add_all(create_goal_tools())
     builder.add_all(create_backlog_tools())
+    builder.add_all(create_cron_tools())
+    builder.add_all(create_session_tools())
 
     registry = builder.build()
 

@@ -233,12 +233,19 @@ def build_parser() -> argparse.ArgumentParser:
     stop = sub.add_parser("stop", help="Stop workers (containers remain)")
     stop.set_defaults(func="stop")
 
-    status = sub.add_parser("status", help="Show system status (db/config/queue)")
+    status = sub.add_parser("status", help="Show rich agent status (identity, energy, memory, channels, mood)")
     status.add_argument("--dsn", default=None, help="Postgres DSN; defaults to POSTGRES_* env vars")
     status.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
     status.add_argument("--json", action="store_true", help="Output JSON")
     status.add_argument("--no-docker", action="store_true", help="Skip docker compose checks")
+    status.add_argument("--raw", action="store_true", help="Show raw status (legacy format)")
     status.set_defaults(func="status")
+
+    doctor = sub.add_parser("doctor", help="Diagnose common issues")
+    doctor.add_argument("--dsn", default=None, help="Postgres DSN; defaults to POSTGRES_* env vars")
+    doctor.add_argument("--wait-seconds", type=int, default=int(os.getenv("POSTGRES_WAIT_SECONDS", "10")))
+    doctor.add_argument("--json", action="store_true", help="Output JSON")
+    doctor.set_defaults(func="doctor")
 
     config = sub.add_parser("config", help="Show/validate agent configuration stored in Postgres")
     cfg_sub = config.add_subparsers(dest="config_command", required=True)
@@ -1128,6 +1135,74 @@ async def _channels_setup(dsn: str, channel_type: str) -> int:
         await pool.close()
 
 
+def _print_rich_status(p: dict[str, Any]) -> None:
+    """Print a rich, human-readable status display."""
+    identity = p.get("identity") or "(not configured)"
+    instance = p.get("instance", "default")
+    database = p.get("database", "hexis_memory")
+
+    sys.stdout.write(f"Instance:  {instance} ({database})\n")
+    sys.stdout.write(f"Identity:  {identity}\n")
+
+    # Energy
+    energy = p.get("energy")
+    max_energy = p.get("max_energy", 20)
+    if energy is not None:
+        regen = p.get("next_regen_minutes")
+        regen_str = f" (next regen: {regen}m)" if regen and energy < max_energy else ""
+        sys.stdout.write(f"Energy:    {energy}/{max_energy}{regen_str}\n")
+
+    # Heartbeat
+    paused = p.get("heartbeat_paused", False)
+    active = p.get("heartbeat_active", False)
+    last_ago = p.get("last_heartbeat_ago")
+    interval = p.get("heartbeat_interval_minutes")
+    if paused:
+        sys.stdout.write("Heartbeat: paused\n")
+    elif active and last_ago:
+        interval_str = f", interval: {int(interval)}m" if interval else ""
+        sys.stdout.write(f"Heartbeat: active (last: {last_ago} ago{interval_str})\n")
+    elif last_ago:
+        sys.stdout.write(f"Heartbeat: idle (last: {last_ago} ago)\n")
+    else:
+        sys.stdout.write("Heartbeat: never run\n")
+
+    # Memory counts
+    memories = p.get("memories", {})
+    if memories:
+        parts = [f"{cnt} {mtype}" for mtype, cnt in sorted(memories.items())]
+        sys.stdout.write(f"Memory:    {', '.join(parts)}\n")
+    else:
+        sys.stdout.write("Memory:    (empty)\n")
+
+    # Channels
+    channels = p.get("channels", [])
+    if channels:
+        ch_parts = []
+        for ch in channels:
+            ch_parts.append(ch["type"])
+        sys.stdout.write(f"Channels:  {', '.join(ch_parts)}\n")
+
+    # Goals
+    goals = p.get("goals", [])
+    if goals:
+        sys.stdout.write(f"Goals:     {len(goals)} active\n")
+        for g in goals:
+            sys.stdout.write(f"  - {g['content']}\n")
+
+    # Scheduled tasks
+    sched = p.get("scheduled_tasks", 0)
+    if sched > 0:
+        sys.stdout.write(f"Scheduled: {sched} active task{'s' if sched != 1 else ''}\n")
+
+    # Mood
+    mood = p.get("mood")
+    valence = p.get("valence")
+    if mood:
+        val_str = f" (valence: {valence})" if valence is not None else ""
+        sys.stdout.write(f"Mood:      {mood}{val_str}\n")
+
+
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
     args = build_parser().parse_args(argv)
@@ -1218,37 +1293,69 @@ def main(argv: list[str] | None = None) -> int:
             ["stop", "heartbeat_worker", "maintenance_worker"],
             env_file,
         )
+    if args.func == "doctor":
+        dsn = _get_dsn(args)
+        checks = asyncio.run(cli_api.doctor_payload(dsn, wait_seconds=args.wait_seconds))
+        if args.json:
+            sys.stdout.write(json.dumps(checks, indent=2) + "\n")
+        else:
+            max_label = max((len(c["label"]) for c in checks), default=0)
+            for c in checks:
+                status = c["status"]
+                if status == "OK":
+                    tag = "[OK]  "
+                elif status == "WARN":
+                    tag = "[WARN]"
+                else:
+                    tag = "[FAIL]"
+                dots = "." * max(1, 28 - len(c["label"]))
+                sys.stdout.write(f"{tag} {c['label']} {dots} {c['detail']}\n")
+            # Summary
+            ok = sum(1 for c in checks if c["status"] == "OK")
+            warn = sum(1 for c in checks if c["status"] == "WARN")
+            fail = sum(1 for c in checks if c["status"] == "FAIL")
+            sys.stdout.write(f"\n{ok} passed, {warn} warnings, {fail} failures\n")
+        return 0 if all(c["status"] != "FAIL" for c in checks) else 1
     if args.func == "status":
         dsn = _get_dsn(args)
-        payload = asyncio.run(cli_api.status_payload(dsn, wait_seconds=args.wait_seconds))
-        if not args.no_docker:
-            try:
-                docker_bin = ensure_docker()
-                compose_cmd = ensure_compose(docker_bin)
-                if compose_file is None:
-                    raise SystemExit
-                rc, out = _run_compose_capture(compose_cmd, compose_file, stack_root, ["ps"], env_file)
-                payload["docker_ps_rc"] = rc
-                payload["docker_ps"] = out
-            except SystemExit:
-                payload["docker_ps_rc"] = 1
-                payload["docker_ps"] = "Docker not available"
+        if args.raw:
+            # Legacy raw status
+            payload = asyncio.run(cli_api.status_payload(dsn, wait_seconds=args.wait_seconds))
+            if not args.no_docker:
+                try:
+                    docker_bin = ensure_docker()
+                    compose_cmd = ensure_compose(docker_bin)
+                    if compose_file is None:
+                        raise SystemExit
+                    rc, out = _run_compose_capture(compose_cmd, compose_file, stack_root, ["ps"], env_file)
+                    payload["docker_ps_rc"] = rc
+                    payload["docker_ps"] = out
+                except SystemExit:
+                    payload["docker_ps_rc"] = 1
+                    payload["docker_ps"] = "Docker not available"
+            if args.json:
+                sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
+            else:
+                lines = [
+                    f"DB time: {payload.get('db_time')}",
+                    f"Agent configured: {payload.get('agent_configured')}",
+                    f"Heartbeat paused: {payload.get('heartbeat_paused')}",
+                    f"Should run heartbeat: {payload.get('should_run_heartbeat')}",
+                    f"Maintenance paused: {payload.get('maintenance_paused')}",
+                    f"Should run maintenance: {payload.get('should_run_maintenance')}",
+                    f"Embedding URL: {payload.get('embedding_service_url')}",
+                    f"Embedding healthy: {payload.get('embedding_service_healthy')}",
+                    f"Pending external_calls: {payload.get('pending_external_calls')}",
+                    f"Pending outbox_messages: {payload.get('pending_outbox_messages')}",
+                ]
+                sys.stdout.write("\n".join(lines) + "\n")
+            return 0
+        # Rich status (default)
+        payload = asyncio.run(cli_api.status_payload_rich(dsn, wait_seconds=args.wait_seconds))
         if args.json:
             sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
         else:
-            lines = [
-                f"DB time: {payload.get('db_time')}",
-                f"Agent configured: {payload.get('agent_configured')}",
-                f"Heartbeat paused: {payload.get('heartbeat_paused')}",
-                f"Should run heartbeat: {payload.get('should_run_heartbeat')}",
-                f"Maintenance paused: {payload.get('maintenance_paused')}",
-                f"Should run maintenance: {payload.get('should_run_maintenance')}",
-                f"Embedding URL: {payload.get('embedding_service_url')}",
-                f"Embedding healthy: {payload.get('embedding_service_healthy')}",
-                f"Pending external_calls: {payload.get('pending_external_calls')}",
-                f"Pending outbox_messages: {payload.get('pending_outbox_messages')}",
-            ]
-            sys.stdout.write("\n".join(lines) + "\n")
+            _print_rich_status(payload)
         return 0
     if args.func == "config_show":
         dsn = _get_dsn(args)

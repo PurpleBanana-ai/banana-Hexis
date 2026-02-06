@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import json
 import logging
+from datetime import datetime, timezone
 from typing import Any, TYPE_CHECKING
 
 from .base import ChannelMessage, chunk_text
@@ -159,15 +160,126 @@ async def _get_or_create_session(
     return str(session_id), []
 
 
+async def _flush_trimmed_to_memory(
+    dsn: str,
+    trimmed_messages: list[dict[str, Any]],
+    session_id: str,
+) -> int:
+    """
+    Pre-compaction memory flush: extract important information from messages
+    about to be trimmed and store as memories.
+
+    Groups user/assistant pairs and creates episodic memories for each.
+    Only stores pairs that seem worth remembering (long, contain learning signals).
+    Runs silently -- no output to the user.
+
+    Returns the number of memories stored.
+    """
+    if not trimmed_messages:
+        return 0
+
+    # Pair up user/assistant turns
+    pairs: list[tuple[str, str]] = []
+    i = 0
+    while i < len(trimmed_messages):
+        msg = trimmed_messages[i]
+        user_text = ""
+        assistant_text = ""
+
+        if msg.get("role") == "user":
+            user_text = msg.get("content", "")
+            if i + 1 < len(trimmed_messages) and trimmed_messages[i + 1].get("role") == "assistant":
+                assistant_text = trimmed_messages[i + 1].get("content", "")
+                i += 2
+            else:
+                i += 1
+        elif msg.get("role") == "assistant":
+            assistant_text = msg.get("content", "")
+            i += 1
+        else:
+            i += 1
+            continue
+
+        if user_text or assistant_text:
+            pairs.append((user_text, assistant_text))
+
+    if not pairs:
+        return 0
+
+    stored = 0
+    try:
+        from core.cognitive_memory_api import CognitiveMemory, MemoryType
+
+        async with CognitiveMemory.connect(dsn) as mem:
+            for user_text, assistant_text in pairs:
+                # Estimate importance -- only store if worth remembering
+                combined = (user_text + " " + assistant_text).lower()
+                importance = 0.3  # baseline for compaction-saved memories
+
+                learning_signals = [
+                    "remember", "don't forget", "important", "note that",
+                    "my name is", "i prefer", "i like", "i don't like",
+                    "always", "never", "make sure", "keep in mind",
+                ]
+                if any(signal in combined for signal in learning_signals):
+                    importance = max(importance, 0.7)
+                if len(user_text) > 200 or len(assistant_text) > 500:
+                    importance = max(importance, 0.5)
+
+                # Skip very short, likely unimportant exchanges
+                if importance < 0.4 and len(user_text) + len(assistant_text) < 100:
+                    continue
+
+                content = f"User: {user_text}\n\nAssistant: {assistant_text}"
+                await mem.remember(
+                    content,
+                    type=MemoryType.EPISODIC,
+                    importance=importance,
+                    emotional_valence=0.0,
+                    context={"type": "conversation", "source": "compaction_flush"},
+                    source_attribution={
+                        "kind": "compaction_flush",
+                        "ref": session_id,
+                        "label": "pre-compaction memory flush",
+                        "observed_at": datetime.now(timezone.utc).isoformat(),
+                        "trust": 0.85,
+                    },
+                    trust_level=0.85,
+                )
+                stored += 1
+
+        if stored:
+            logger.info("Pre-compaction flush: stored %d memories from %d pairs (session=%s)", stored, len(pairs), session_id)
+    except Exception:
+        logger.exception("Pre-compaction memory flush failed (session=%s)", session_id)
+
+    return stored
+
+
 async def _update_session(
     conn: asyncpg.Connection,
     session_id: str,
     history: list[dict[str, Any]],
+    *,
+    dsn: str | None = None,
 ) -> None:
-    """Update session history and last_active timestamp."""
-    # Trim history if too long (keep recent turns)
+    """Update session history and last_active timestamp.
+
+    When history exceeds MAX_SESSION_HISTORY, runs a pre-compaction memory
+    flush to preserve important information from the messages being trimmed,
+    then trims to TRIM_TO_HISTORY.
+    """
     if len(history) > MAX_SESSION_HISTORY:
+        # Messages that will be discarded
+        trimmed = history[:-TRIM_TO_HISTORY]
         history = history[-TRIM_TO_HISTORY:]
+
+        # Flush trimmed messages to long-term memory (non-blocking best-effort)
+        if dsn and trimmed:
+            try:
+                await _flush_trimmed_to_memory(dsn, trimmed, session_id)
+            except Exception:
+                logger.exception("Pre-compaction flush error (session=%s)", session_id)
 
     await conn.execute(
         """
@@ -287,8 +399,8 @@ async def process_channel_message(
         new_history = result.get("history", [])
 
         async with pool.acquire() as conn:
-            # Update session with new history
-            await _update_session(conn, session_id, new_history)
+            # Update session with new history (pre-compaction flush if trimming)
+            await _update_session(conn, session_id, new_history, dsn=dsn)
 
             # Log outbound message
             await _log_message(
@@ -400,7 +512,7 @@ async def stream_channel_message(
         new_history.append({"role": "assistant", "content": assistant_text})
 
         async with pool.acquire() as conn:
-            await _update_session(conn, session_id, new_history)
+            await _update_session(conn, session_id, new_history, dsn=dsn)
             await _log_message(
                 conn,
                 session_id,

@@ -96,6 +96,45 @@ export async function POST(request: Request) {
     }
 
     const cardData = body.card ?? body;
+
+    // If the card has pre-encoded hexis profile data, use it directly (skip LLM)
+    const hexisProfile = cardData?.data?.extensions?.hexis;
+    if (hexisProfile && hexisProfile.personality_traits) {
+      const parsed = hexisProfile;
+
+      // Store the narrative as a foundational worldview memory
+      const narrative = typeof parsed.narrative === "string" ? parsed.narrative : "";
+      if (narrative.length > 10) {
+        const cardName =
+          (cardData?.data?.name ?? cardData?.name ?? "unknown") as string;
+        const metadata = {
+          subcategory: "imported_persona",
+          source: "chara_card_v2",
+          original_name: cardName,
+          change_requires: "deliberate_transformation",
+          evidence_threshold: 0.9,
+        };
+        await prisma.$queryRaw`
+          SELECT create_worldview_memory(
+            ${narrative}::text,
+            'self'::text,
+            0.95::float,
+            0.95::float,
+            0.95::float,
+            'character_card_import'::text,
+            NULL::jsonb,
+            NULL::text,
+            NULL::text,
+            0.0::float,
+            ${toJsonParam(metadata)}::jsonb
+          )
+        `;
+      }
+
+      return Response.json({ persona: parsed });
+    }
+
+    // No pre-encoded profile — fall back to LLM extraction
     const extracted = extractCardData(cardData);
     if (!extracted || extracted.length < 20) {
       return Response.json(

@@ -118,6 +118,23 @@ async def test_cli_status_json_no_docker(db_pool):
     )
     assert p.returncode == 0, p.stderr
     data = json.loads(p.stdout)
+    # Rich status (default) includes instance and memories
+    assert "instance" in data
+    assert "memories" in data
+
+
+async def test_cli_status_raw_json_no_docker(db_pool):
+    """Test legacy raw status format."""
+    env = os.environ.copy()
+    p = subprocess.run(
+        [sys.executable, "-m", "apps.hexis_cli", "status", "--json", "--no-docker", "--raw", "--wait-seconds", "60"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    assert p.returncode == 0, p.stderr
+    data = json.loads(p.stdout)
     assert "agent_configured" in data
     assert "pending_external_calls" in data
 

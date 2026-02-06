@@ -164,6 +164,14 @@ from .backlog import (
     create_backlog_tools,
     ManageBacklogHandler,
 )
+from .cron import (
+    create_cron_tools,
+    ManageScheduleHandler,
+)
+from .sessions import (
+    create_session_tools,
+    ManageSessionsHandler,
+)
 
 __all__ = [
     # Base classes
@@ -274,4 +282,10 @@ __all__ = [
     # Backlog tools
     "create_backlog_tools",
     "ManageBacklogHandler",
+    # Cron/scheduling tools
+    "create_cron_tools",
+    "ManageScheduleHandler",
+    # Sub-agent session tools
+    "create_session_tools",
+    "ManageSessionsHandler",
 ]

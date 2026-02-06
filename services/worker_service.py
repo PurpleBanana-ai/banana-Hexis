@@ -4,6 +4,8 @@ import argparse
 import asyncio
 import logging
 import os
+from datetime import datetime, timezone as tz
+from zoneinfo import ZoneInfo
 import asyncpg
 from dotenv import load_dotenv
 
@@ -253,6 +255,10 @@ class HeartbeatWorker:
                     if not await self._is_agent_ready():
                         await asyncio.sleep(POLL_INTERVAL)
                         continue
+                    if not await self._is_active_hour():
+                        logger.debug("Outside active hours; skipping heartbeat.")
+                        await asyncio.sleep(POLL_INTERVAL * 10)
+                        continue
                     await self._run_heartbeat_if_due()
                 except Exception as exc:
                     logger.error(f"Worker loop error: {exc}")
@@ -281,6 +287,64 @@ class HeartbeatWorker:
                 return bool(await conn.fetchval("SELECT is_agent_configured() AND is_init_complete()"))
         except Exception:
             return False
+
+    async def _is_active_hour(self) -> bool:
+        """Check if the current time is within configured active hours.
+
+        Config keys:
+          heartbeat.active_hours - e.g. "08:00-22:00" (24h format)
+          heartbeat.timezone - e.g. "America/New_York" (default: UTC)
+
+        Returns True (active) if active_hours is not configured.
+        """
+        if not self.pool:
+            return True
+        try:
+            async with self.pool.acquire() as conn:
+                active_hours = await conn.fetchval(
+                    "SELECT get_config_text('heartbeat.active_hours')"
+                )
+                if not active_hours:
+                    return True
+
+                timezone_str = await conn.fetchval(
+                    "SELECT get_config_text('heartbeat.timezone')"
+                ) or "UTC"
+
+                return _check_active_hours(active_hours, timezone_str)
+        except Exception:
+            return True  # Default to active if check fails
+
+
+def _check_active_hours(active_hours: str, timezone_str: str) -> bool:
+    """Parse an active hours string like '08:00-22:00' and check if now is within range."""
+    try:
+        parts = active_hours.strip().split("-")
+        if len(parts) != 2:
+            return True
+
+        start_str, end_str = parts[0].strip(), parts[1].strip()
+        start_h, start_m = int(start_str.split(":")[0]), int(start_str.split(":")[1])
+        end_h, end_m = int(end_str.split(":")[0]), int(end_str.split(":")[1])
+
+        try:
+            zone = ZoneInfo(timezone_str)
+        except Exception:
+            zone = tz.utc
+
+        now = datetime.now(zone)
+        current_minutes = now.hour * 60 + now.minute
+        start_minutes = start_h * 60 + start_m
+        end_minutes = end_h * 60 + end_m
+
+        if start_minutes <= end_minutes:
+            # Normal range: e.g. 08:00-22:00
+            return start_minutes <= current_minutes < end_minutes
+        else:
+            # Overnight range: e.g. 22:00-06:00
+            return current_minutes >= start_minutes or current_minutes < end_minutes
+    except Exception:
+        return True  # Default to active
 
 
 class MaintenanceWorker:
