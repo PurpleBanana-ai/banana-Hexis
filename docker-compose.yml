@@ -2,7 +2,7 @@ services:
   db:
     build:
       context: .
-      dockerfile: Dockerfile
+      dockerfile: ops/Dockerfile.db
     container_name: hexis_brain
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-hexis_memory}
