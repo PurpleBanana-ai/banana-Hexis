@@ -32,12 +32,14 @@ class TestGetSchemaFiles:
         assert names == ["01_first.sql", "02_second.sql", "03_third.sql"]
 
     def test_no_schema_dir_raises(self, tmp_path):
-        with patch("core.schema.get_schema_dir", return_value=tmp_path / "nonexistent"):
-            with pytest.raises(FileNotFoundError, match="Schema directory not found"):
+        with patch("core.schema.get_schema_dir", return_value=tmp_path / "nonexistent"), \
+             patch.dict("sys.modules", {"db": None}):
+            with pytest.raises(FileNotFoundError, match="No schema files found"):
                 get_schema_files()
 
     def test_empty_schema_dir_raises(self, tmp_path):
-        with patch("core.schema.get_schema_dir", return_value=tmp_path):
+        with patch("core.schema.get_schema_dir", return_value=tmp_path), \
+             patch.dict("sys.modules", {"db": None}):
             with pytest.raises(FileNotFoundError, match="No schema files found"):
                 get_schema_files()
 

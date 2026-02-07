@@ -54,7 +54,7 @@ hexis/
 ├── docs/
 │   ├── architecture.md     # Design/architecture consolidation
 │   └── PHILOSOPHY.md       # Philosophical framework
-└── docker-compose.yml      # Local stack (Postgres + embeddings + workers)
+└── docker-compose.yml      # Local stack (Postgres + workers; embeddings via host Ollama)
 ```
 
 ### Key Files
@@ -95,7 +95,7 @@ hexis/
 ## Build, Test, and Development Commands
 
 ```bash
-# Start services (passive - db + embeddings only)
+# Start services (passive - db only; embeddings via host Ollama)
 docker compose up -d
 
 # Start services (active - adds heartbeat_worker + maintenance_worker)
@@ -175,7 +175,7 @@ The heartbeat is the agent's conscious cognitive loop:
 
 - **Schema changes not taking effect?** SQL files are baked into the Docker image -- see "Bouncing the Database" below
 - **Heartbeat not running?** Check `agent.is_configured` via `hexis status` or run `hexis init`
-- **Memory not found?** Check if embeddings service is running (`docker compose ps`)
+- **Memory not found?** Check if Ollama is running and has the embedding model (`ollama list`)
 - **Test failures?** Ensure Docker services are up before running pytest; after a fresh `down -v`, wait for Postgres to accept connections. Use `POSTGRES_HOST=127.0.0.1` with pytest if localhost SSL negotiation flakes.
 
 ## Agent Operational Notes
@@ -228,10 +228,15 @@ docker exec hexis_brain psql -U hexis_user -d hexis_memory -c "SELECT column_nam
 
 ### Docker Port Mapping
 
-The DB port is mapped to `43815` (not the default `5432`):
+Default port mappings (all on `127.0.0.1`):
 
 ```
-hexis_brain: 127.0.0.1:43815 -> 5432
+hexis_brain:       43815 -> 5432   (Postgres)
+hexis_web:         43817 -> 43817  (FastAPI SSE)
+hexis_ui:          3477  -> 3477   (Next.js dashboard)
+hexis_rabbitmq:    45672 -> 5672   (AMQP)
+hexis_rabbitmq:    45673 -> 15672  (RabbitMQ management)
+hexis_browser:     49222 -> 3000   (Chrome CDP)
 ```
 
 Default DB credentials: `hexis_user` / `hexis_password` / `hexis_memory`.

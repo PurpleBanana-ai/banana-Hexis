@@ -28,7 +28,7 @@ type LlmConfig = {
 
 const DEFAULT_PROVIDER = process.env.LLM_PROVIDER || "openai";
 const DEFAULT_MODEL = process.env.LLM_MODEL || "gpt-5.2";
-const PROMPT_ROOT = path.resolve(process.cwd(), "..", "services", "prompts");
+const PROMPT_ROOT = process.env.HEXIS_PROMPTS_DIR || path.resolve(process.cwd(), "..", "services", "prompts");
 const GOAL_PRIORITIES = new Set(["active", "queued", "backburner", "completed", "abandoned"]);
 const GOAL_SOURCES = new Set(["curiosity", "user_request", "identity", "derived", "external"]);
 

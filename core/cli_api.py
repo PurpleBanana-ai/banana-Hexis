@@ -14,6 +14,36 @@ from core.cognitive_memory_api import CognitiveMemory, MemoryType
 logger = logging.getLogger(__name__)
 
 
+def embedding_service_diagnosis(url: str | None) -> tuple[str, list[str]]:
+    """Identify the embedding backend from its URL and return (name, fix_steps)."""
+    url = (url or "").lower()
+    if ":11434" in url:
+        return "Ollama", [
+            "Install Ollama — https://ollama.com/download",
+            "Start it:       ollama serve",
+            "Pull the model:  ollama pull embeddinggemma:300m-qat-q4_0",
+        ]
+    if "embeddings:" in url or "text-embeddings" in url:
+        return "TEI (Text Embeddings Inference)", [
+            "Uncomment the 'embeddings' service in docker-compose.yml",
+            "Then run: docker compose up -d",
+        ]
+    if "api.openai.com" in url:
+        return "OpenAI API", [
+            "Check that OPENAI_API_KEY is set in your .env",
+            "Verify your API key is valid and has embeddings access",
+        ]
+    if "localhost" in url or "127.0.0.1" in url or "host.docker.internal" in url:
+        return "local embedding service", [
+            f"Ensure the service at {url} is running",
+            "Or set EMBEDDING_SERVICE_URL in .env to a different endpoint",
+        ]
+    return "embedding service", [
+        f"Ensure the service at {url} is reachable from the DB container",
+        "Or set EMBEDDING_SERVICE_URL in .env to a different endpoint",
+    ]
+
+
 def _coerce_json_value(val: Any) -> Any:
     if isinstance(val, str):
         s = val.strip()
@@ -235,23 +265,36 @@ async def doctor_payload(
 
         # 2. Embeddings service
         try:
-            emb_url = await conn.fetchval("SELECT get_config_text('embedding.service_url')")
+            emb_url = await conn.fetchval(
+                "SELECT current_setting('app.embedding_service_url', true)"
+            )
+            emb_model = await conn.fetchval(
+                "SELECT current_setting('app.embedding_model_id', true)"
+            )
             healthy = await conn.fetchval("SELECT check_embedding_service_health()")
             if healthy:
-                emb_model = await conn.fetchval("SELECT get_config_text('embedding.model_id')")
                 checks.append({
                     "label": "Embeddings",
                     "status": "OK",
-                    "detail": f"healthy (model: {emb_model})",
+                    "detail": f"healthy — {emb_model} via {emb_url}",
                 })
             else:
+                svc_name, steps = embedding_service_diagnosis(emb_url)
+                fix = "; ".join(steps)
                 checks.append({
                     "label": "Embeddings",
                     "status": "FAIL",
-                    "detail": f"unhealthy ({emb_url})",
+                    "detail": (
+                        f"Your config points to {svc_name} ({emb_url}) "
+                        f"but it is not responding. {fix}"
+                    ),
                 })
         except Exception as exc:
-            checks.append({"label": "Embeddings", "status": "FAIL", "detail": str(exc)})
+            checks.append({
+                "label": "Embeddings",
+                "status": "FAIL",
+                "detail": f"{exc}",
+            })
 
         # 3. RabbitMQ (check config, not connectivity -- avoids dependency)
         try:

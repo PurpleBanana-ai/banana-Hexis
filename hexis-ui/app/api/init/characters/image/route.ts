@@ -3,7 +3,7 @@ import path from "path";
 
 export const runtime = "nodejs";
 
-const CHARACTERS_DIR = path.resolve(process.cwd(), "..", "services", "characters");
+const CHARACTERS_DIR = process.env.HEXIS_CHARACTERS_DIR || path.resolve(process.cwd(), "..", "services", "characters");
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);

@@ -1,8 +1,10 @@
+# Runtime compose file for pip-installed Hexis.
+# Uses pre-built images from GHCR instead of local build: directives.
+# Automatically selected by `hexis up` when not in a source checkout.
+
 services:
   db:
-    build:
-      context: .
-      dockerfile: ops/Dockerfile.db
+    image: ghcr.io/quixiai/hexis-brain:latest
     container_name: hexis_brain
     environment:
       POSTGRES_DB: ${POSTGRES_DB:-hexis_memory}
@@ -10,7 +12,6 @@ services:
       POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-hexis_password}
     volumes:
       - postgres_data:/var/lib/postgresql/data
-      # db/*.sql is baked into the image (see Dockerfile) to avoid bind-mount issues on macOS external drives.
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-hexis_user} -d ${POSTGRES_DB:-hexis_memory}"]
       interval: 10s
@@ -19,7 +20,6 @@ services:
       start_period: 30s
     ports:
       - "${HEXIS_BIND_ADDRESS:-127.0.0.1}:${POSTGRES_PORT:-43815}:5432"
-    # Need to modify search_path for AGE to work seamlessly
     command:
       - postgres
       - -c
@@ -91,9 +91,7 @@ services:
   #     - public
 
   heartbeat_worker:
-    build:
-      context: .
-      dockerfile: ops/Dockerfile.worker
+    image: ghcr.io/quixiai/hexis-worker:latest
     container_name: hexis_heartbeat_worker
     profiles:
       - active
@@ -119,9 +117,7 @@ services:
       - public
 
   maintenance_worker:
-    build:
-      context: .
-      dockerfile: ops/Dockerfile.worker
+    image: ghcr.io/quixiai/hexis-worker:latest
     container_name: hexis_maintenance_worker
     profiles:
       - active
@@ -147,9 +143,7 @@ services:
       - public
 
   web:
-    build:
-      context: .
-      dockerfile: ops/Dockerfile.worker
+    image: ghcr.io/quixiai/hexis-worker:latest
     container_name: hexis_web
     profiles:
       - active
@@ -173,9 +167,7 @@ services:
       - public
 
   channel_worker:
-    build:
-      context: .
-      dockerfile: ops/Dockerfile.channels
+    image: ghcr.io/quixiai/hexis-channels:latest
     container_name: hexis_channel_worker
     profiles:
       - active
@@ -210,6 +202,24 @@ services:
       MATRIX_HOMESERVER: ${MATRIX_HOMESERVER:-}
       MATRIX_ACCESS_TOKEN: ${MATRIX_ACCESS_TOKEN:-}
       MATRIX_USER_ID: ${MATRIX_USER_ID:-}
+    networks:
+      - private
+      - public
+
+  ui:
+    image: ghcr.io/quixiai/hexis-ui:latest
+    container_name: hexis_ui
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "${HEXIS_BIND_ADDRESS:-127.0.0.1}:${HEXIS_UI_PORT:-3477}:3477"
+    environment:
+      DATABASE_URL: postgresql://${POSTGRES_USER:-hexis_user}:${POSTGRES_PASSWORD:-hexis_password}@db:5432/${POSTGRES_DB:-hexis_memory}
+      OPENAI_API_KEY: ${OPENAI_API_KEY:-}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY:-}
+      GEMINI_API_KEY: ${GEMINI_API_KEY:-}
+      XAI_API_KEY: ${XAI_API_KEY:-}
     networks:
       - private
       - public

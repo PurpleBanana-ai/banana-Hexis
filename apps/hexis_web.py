@@ -279,7 +279,7 @@ def main(argv: list[str] | None = None) -> None:
 
     parser = argparse.ArgumentParser(description="Hexis Web API server")
     parser.add_argument("--host", default="127.0.0.1", help="Bind address (default: 127.0.0.1)")
-    parser.add_argument("--port", type=int, default=3478, help="Port (default: 3478)")
+    parser.add_argument("--port", type=int, default=43817, help="Port (default: 43817)")
     args = parser.parse_args(argv)
 
     import uvicorn

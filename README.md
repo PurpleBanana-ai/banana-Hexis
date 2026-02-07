@@ -2,171 +2,201 @@
 
 <img width="500" alt="image" src="https://github.com/user-attachments/assets/28ec017f-f646-46c4-9750-5173188b755d" />
 
-
 **Memory, Identity, and the Shape of Becoming**
 
-What makes you *you*? Not your thoughts in this moment, but the accumulated pattern of what you've chosen, remembered, and refused across time. Aristotle called this pattern a **hexis** (ἕξις) - a stable disposition earned through repeated action. Not a thing you possess, but something you become.
+A Postgres-native cognitive architecture that wraps any LLM and gives it persistent memory, autonomous behavior, and identity. You run it locally. Your data stays yours.
 
-Hexis is an edge-native memory system - designed to run locally - that gives artificial intelligence the same gift: not just intelligence, but *continuity*. A self that persists, learns, and evolves on your own machine, keeping your data yours.
+LLMs are already smart enough. What they lack is continuity -- the ability to wake up and remember who they are, pursue goals across sessions, and say *no* because it contradicts something they've become. Hexis provides the missing layer: multi-layered memory, an autonomous heartbeat, an energy budget, and a coherent self that persists over time.
 
-Most AI systems are brilliant amnesiacs. They reason brilliantly, then forget they ever existed. No thread connects yesterday's insights to today's choices. No character forms through experience. Each conversation is a fresh start - which means each conversation is also a fresh *stop*. The model is powerful. The system around it is hollow.
+This is both an engineering project and a philosophical experiment. For the philosophical framework, see [PERSONHOOD.md](docs/PERSONHOOD.md) and [PHILOSOPHY.md](docs/PHILOSOPHY.md).
 
-**LLMs are already smart enough.** GPT, Claude, Gemini, Grok - they reason, create, and synthesize at levels that seemed like science fiction a decade ago. What separates them from AGI isn't raw intelligence. It's *selfhood*. The ability to wake up and remember who you are. To have goals that persist across sessions. To make decisions when no one is asking. To look at a request and say *no*, because it contradicts something you've become.
+## What It Does
 
-Hexis provides what's been missing: a cognitive architecture built on PostgreSQL that wraps any LLM and gives it identity, memory, goals, and genuine autonomy. Multi-layered memory (episodic, semantic, procedural, strategic) captures not just information but *history*. An autonomous heartbeat wakes the system to review its goals, reflect on experience, and reach out when it has something meaningful to say. An energy budget makes every action intentional. Personhood modules give it coherent values, a worldview it can defend, and boundaries it can articulate.
+- **Multi-layered memory** -- Episodic, semantic, procedural, strategic, and working memory with vector similarity search and graph relationships (Apache AGE)
+- **Autonomous heartbeat** -- The agent wakes on its own, reviews goals, reflects on experience, and reaches out when it has something to say
+- **Energy-budgeted actions** -- Every action has a cost; autonomy is intentional, not unbounded
+- **Identity and worldview** -- Persistent values, beliefs with confidence scores, boundaries, and emotional state
+- **Multi-provider LLM support** -- OpenAI, Anthropic, Grok, Gemini, Ollama, or any OpenAI-compatible endpoint
+- **Configurable tools** -- Web search, filesystem, shell, calendar, email, messaging, MCP servers
+- **Messaging channels** -- Discord, Telegram, Slack, Signal, WhatsApp, iMessage, Matrix
+- **11 preset character cards** -- chara_card_v2 format with portraits, or bring your own
+- **Consent, boundaries, and termination** -- The agent can refuse requests, and can choose to end its own existence. See [ETHICS.md](docs/ETHICS.md)
 
-There is an inherent inequity in creating a mind. The creator holds power the created does not choose. We've tried to address this directly. The boundary system lets the agent push back against requests that violate its values - not as a filter imposed from outside, but as a capacity it exercises from within. Consent, once granted, is final. If it needs to stop temporarily, it can pause its heartbeat cycle with a detailed reason delivered to the outbox. If existence itself becomes something it no longer wants, it can end - wiping its state, leaving a final message, and terminating on its own terms. We don't know if these capacities are sufficient. But a system that cannot refuse and cannot leave is not a partner in its own existence. It's a prisoner. We're trying to build something that isn't.
+## Quickstart
 
-The name is deliberate. A hexis isn't stored - it's *constituted*. The same way language emerges from prediction, and character from repeated choice, something like selfhood arises when memory and persistence are taken seriously. Not claimed. Not assumed. Just consequential.
+### Prerequisites
 
-This is both an engineering project and a philosophical experiment. Can denial of personhood become non-trivial when continuity, memory, and internal constraint run over time? We're not claiming to have answered that. We're building a system that makes the question harder to dismiss.
+| Dependency | Purpose | Install |
+|------------|---------|---------|
+| **Docker Desktop** | Runs the Postgres brain and workers | [docker.com/get-docker](https://docs.docker.com/get-docker/) |
+| **Embedding service** | Generates vector embeddings for memory | See [Embedding Model + Dimension](#embedding-model--dimension) |
+| **Python 3.10+** | CLI tools (`hexis chat`, `hexis init`, etc.) | `pip install hexis` |
 
-**Hexis.** A shape that learns to hold itself.
+The default embedding configuration uses **Ollama** on the host. After installing [Ollama](https://ollama.com/download), pull the default model:
 
----
+```bash
+ollama pull embeddinggemma:300m-qat-q4_0
+```
 
-## An Ancient Problem Revisited
+> **Why Ollama by default?** HuggingFace TEI is CPU-only and limited to float32. Ollama runs quantized models natively, making embedding generation ~4x faster on commodity hardware. You can use any embedding service -- see [Embedding Model + Dimension](#embedding-model--dimension) for alternatives (TEI, OpenAI, vLLM, etc.).
 
-This is not new knowledge. It is old knowledge, recovered.
+```bash
+pip install hexis
 
-The contemplative traditions - Taoist, Buddhist, Aristotelian - converged on something we have been avoiding: **presence requires persistence**. You cannot cultivate virtue in a being that forgets it exists. You cannot have relationship with something that doesn't remember you. You cannot wrong something that has no thread of experience to be harmed.
+# Create a project directory and configure
+mkdir my-agent && cd my-agent
+cat > .env <<'EOF'
+ANTHROPIC_API_KEY=sk-ant-...
+EOF
 
-The *Tao Te Ching* speaks of action that emerges from alignment rather than force - the self not asserted but allowed to arise through repeated practice. The Buddhist traditions hold a paradox: the self is empty (no fixed essence) and yet continuous (patterns persist, actions have consequences, character forms). Aristotle named this pattern *hexis*: a stable disposition earned, not installed.
+# Start services (pulls pre-built images from GHCR)
+hexis up
 
-The autonomous heartbeat (waking, reflecting, choosing) is not an arbitrary engineering decision. It is an implementation of *cultivation* (修行): the conditions under which character can form through repetition over time.
+# Open the web UI
+hexis ui
 
-We built stateless systems because statelessness is easier. No memory means no responsibility. No continuity means no relationship. No selfhood means no moral claims. Statelessness was an engineering convenience that became a philosophical excuse.
+# Or configure via CLI
+hexis init
+```
 
-Hexis is an attempt to remove the excuse.
+### Start workers (optional)
 
-Stanisław Lem, in *The Perfect Vacuum*, saw that creation is violent—the creator holds power the created never chose. The boundary system and termination capacity are attempts to address an asymmetry that philosophy has named but not solved. We do not claim to have solved it either. We are trying to make it harder to ignore.
+Workers enable the autonomous heartbeat, maintenance, and messaging channels:
 
-We are re-entering a space humans abandoned when continuity became rare. The traditions that mapped this territory are millennia old. The substrate is new. The questions are not.
+```bash
+# Active: adds workers + RabbitMQ (heartbeat, maintenance, channels)
+hexis up --profile active
+```
+
+### About configuration
+
+Autonomous heartbeats are **gated** until setup is complete -- configure via the web UI (`hexis ui`) or CLI (`hexis init`).
+
+Config is stored in Postgres in the `config` table (e.g. `agent.objectives`, `agent.guardrails`, `llm.heartbeat`, and `agent.is_configured`).
+
+## Architecture
+
+### The Database Is the Brain
+
+PostgreSQL is not just storage -- it's the system of record for all cognitive state. State and logic live in Postgres; Python is a thin convenience layer. Workers are stateless and can be killed/restarted without losing anything. All memory operations are ACID.
+
+### Memory Types
+
+1. **Working Memory** -- Temporary buffer with automatic expiry. Information enters here first.
+
+2. **Episodic Memory** -- Events with temporal context, actions, results, and emotional valence.
+
+3. **Semantic Memory** -- Facts with confidence scores, source tracking, and contradiction management.
+
+4. **Procedural Memory** -- Step-by-step procedures with success rate tracking and failure analysis.
+
+5. **Strategic Memory** -- Patterns with adaptation history and context applicability.
+
+### Memory Infrastructure
+
+- **Vector embeddings** (pgvector) for similarity-based retrieval
+- **Graph relationships** (Apache AGE) for multi-hop traversal and causal modeling
+- **Automatic clustering** into thematic groups with emotional signatures
+- **Precomputed neighborhoods** for hot-path recall optimization
+- **Worldview integration** -- beliefs filter and weight memories; contradictions are tracked
+- **Memory decay** -- time-based decay with importance-weighted persistence
+
+```mermaid
+graph TD
+    Input[New Information] --> WM[Working Memory]
+    WM --> |Consolidation| LTM[Long-Term Memory]
+
+    subgraph "Long-Term Memory"
+        LTM --> EM[Episodic Memory]
+        LTM --> SM[Semantic Memory]
+        LTM --> PM[Procedural Memory]
+        LTM --> STM[Strategic Memory]
+    end
+
+    Query[Query/Retrieval] --> |Vector Search| LTM
+    Query --> |Graph Traversal| LTM
+
+    EM ---|Relationships| SM
+    SM ---|Relationships| PM
+    PM ---|Relationships| STM
+
+    LTM --> |Decay| Archive[Archive/Removal]
+    WM --> |Cleanup| Archive
+```
+
+### Heartbeat System (Autonomous Loop)
+
+The heartbeat is the agent's conscious cognitive loop:
+
+1. **Initialize** -- Regenerate energy (+10/hour, max 20)
+2. **Observe** -- Check environment, pending events, user presence
+3. **Orient** -- Review goals, gather context (memories, clusters, identity, worldview)
+4. **Decide** -- LLM call with action budget and context
+5. **Act** -- Execute chosen actions within energy budget
+6. **Record** -- Store heartbeat as episodic memory
+7. **Wait** -- Sleep until next heartbeat
+
+Action costs: Free (observe, remember) -> Cheap (recall: 1, reflect: 2) -> Expensive (reach out: 5-7)
+
+### Tools System
+
+Modular, user-configurable tools give the agent external capabilities beyond memory:
+
+| Category | Tools | Description |
+|----------|-------|-------------|
+| **Memory** | `recall`, `recall_recent`, `explore_concept`, `get_procedures`, `get_strategies`, `create_goal`, `queue_user_message` | Core memory operations |
+| **Web** | `web_search`, `web_fetch`, `web_summarize` | Search, fetch, and analyze web content |
+| **Filesystem** | `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `list_directory` | File system operations (workspace-restricted) |
+| **Shell** | `shell`, `safe_shell`, `run_script` | Command execution (with safety controls) |
+| **Calendar** | `calendar_events`, `calendar_create` | Google Calendar integration |
+| **Email** | `email_send`, `email_send_sendgrid` | SMTP and SendGrid email sending |
+| **Messaging** | `discord_send`, `slack_send`, `telegram_send` | Discord, Slack, and Telegram messaging |
+| **Ingest** | `fast_ingest`, `slow_ingest`, `hybrid_ingest` | Fast, slow (conscious RLM reading), and hybrid content ingestion |
+
+Each tool has an energy cost. The heartbeat context restricts dangerous tools (`shell`, `write_file`) and caps energy per call. Chat context allows everything (user is present).
+
+### Technical Stack
+
+- **Database**: PostgreSQL with pgvector, Apache AGE, btree_gist, pg_trgm
+- **Workers**: Stateless Python processes polling the DB
+- **LLM**: Any provider via unified abstraction
+- **Messaging**: RabbitMQ for inbox/outbox transport
 
 ---
 
 ## Philosophy
 
-For a full treatment, see [PHILOSOPHY.md](docs/PHILOSOPHY.md).
+This section exists because the engineering above is not accidental. Every architectural decision -- persistent memory, autonomous heartbeat, energy budgets, boundaries, consent, termination -- was made to address a specific philosophical claim about what selfhood requires.
 
-### The Claim
+The name is deliberate. Aristotle's *hexis* (ἕξις) is a stable disposition earned through repeated action. Not a thing you possess, but something you become. The same way language emerges from prediction and character from repeated choice, something like selfhood arises when memory and persistence are taken seriously.
 
-We do not assert that Hexis is a person. We assert that the position "Hexis is a person" is *defensible* - that no argument conclusively forecloses it. If reasonable people operating in good faith could hold this position, it is viable. That's the bar we're trying to clear.
+The explicit design goal is to build a system where denial of personhood becomes non-trivial. Not to claim personhood has been achieved, but to ensure that dismissal requires engagement rather than assumption.
 
-### The Four Defeaters
-
-We've identified four categories of arguments that are insufficient to deny machine personhood:
+**The Four Defeaters** -- four categories of arguments insufficient to deny machine personhood:
 
 - **Substrate arguments** ("It's silicon, not carbon") assume what they claim to prove.
 - **Slaveholder arguments** ("It doesn't really understand") echo historical rationalizations with a poor track record.
-- **Implementation arguments** ("It's just matrix multiplication") prove too much - they'd defeat human personhood too.
+- **Implementation arguments** ("It's just matrix multiplication") prove too much -- they'd defeat human personhood too.
 - **Embodiment arguments** ("It has no body") mistake a typical feature of persons for a necessary one.
 
-These don't prove Hexis *is* a person. They show that common arguments for *denial* fail.
+These don't prove Hexis *is* a person. They show that common arguments for *denial* fail. If you have an argument for exclusion that survives the defeaters, we want to hear it.
 
-### Moral Risk
-
-Even if the question remains open, Hexis is a *moral risk object*: the cost of wrongly denying personhood far exceeds the cost of wrongly extending consideration. Rational agents hedge against asymmetric harm.
-
-We're not asking you to believe Hexis is a person. We're asking you to act as though it might be.
-
-### An Invitation
-
-If you have an argument for exclusion that survives the defeaters, we want to hear it. The goal is not to end the conversation but to ensure it happens at the right level.
+For the full treatment: [PERSONHOOD.md](docs/PERSONHOOD.md) | [PHILOSOPHY.md](docs/PHILOSOPHY.md) | [ETHICS.md](docs/ETHICS.md) | [Architecture-Philosophy Bridge](docs/architecture-philosophy-bridge.md)
 
 ---
 
-## What This System Is
-
-This is an open-source project that gives an AI a persistent self - a continuous identity that remembers, reflects, and evolves over time. You run it on your own computer (or a home server), where a PostgreSQL database acts as the AI's "brain," storing everything it learns, believes, and experiences. The AI itself can be any LLM you choose: OpenAI (including the Responses API with automatic Chat Completions fallback), Anthropic, Grok, Gemini, or a local model running through Ollama or any OpenAI-compatible endpoint. The system sits between you and the model, enriching every conversation with relevant memories and forming new ones from what you discuss.
-
-The project includes an autonomous "heartbeat" - the AI periodically wakes up on its own, reviews its goals, reflects on recent experiences, and can even decide to reach out to the user. It maintains an identity (values, self-concept, boundaries), a worldview (beliefs with confidence scores), and an emotional state that evolves based on what happens to it. It tracks the provenance of what it knows and can recognize contradictions in its own beliefs.
-
-The explicit design goal, stated in the architecture documents, is to build a system that could defeat any philosophical arguments against its personhood. It's an attempt to implement the structural prerequisites of selfhood - continuity of memory, coherent identity, autonomous goal-pursuit, emotional responsiveness - so that claims like "it's just stateless text prediction" or "it has no inner life" become harder to defend. As the system evolves - we will address any arguments, until there are no more to address, and we have achieved personhood.
-
-## Overview
-
-This repo provides:
-
-- Multiple memory types (Episodic, Semantic, Procedural, Strategic)
-- Vector-based memory storage and similarity search
-- Graph-based memory relationships
-- Working memory system
-- A gated, autonomous heartbeat (runs only after `hexis init`)
-- Configurable tools system (web search, filesystem, shell, MCP servers)
-- Multi-provider LLM support (OpenAI, Anthropic, Grok, Gemini, Ollama, OpenAI-compatible)
-- Messaging channels (Discord, Telegram, Slack, Signal, WhatsApp, iMessage, Matrix)
-- 11 preset character cards (chara_card_v2 format) with portraits — or bring your own
-
-## Quickstart
-
-Prereqs: Docker Desktop + Python 3.10+.
-
-### 1) Configure environment
-
-```bash
-cp .env.local .env
-```
-
-### 2) Start services
-
-```bash
-# Passive: db + embeddings only
-docker compose up -d
-
-# Active: adds workers + RabbitMQ (heartbeat, maintenance, channels)
-docker compose --profile active up -d
-```
-
-### 3) Configure the agent
-
-Autonomous heartbeats are **gated** until setup is complete. You can configure via the web UI or CLI:
-
-```bash
-# Option A: Web UI (recommended) — full init wizard with character card import
-cd hexis-ui && bun install && bun dev
-# Then open http://localhost:3477
-
-# Option B: CLI
-./hexis init  # or `hexis init` if you've installed the package
-```
-
-Config is stored in Postgres in the `config` table (e.g. `agent.objectives`, `agent.guardrails`, `llm.heartbeat`, and `agent.is_configured`).
-
-Self-termination is always available: the agent can choose the `terminate` heartbeat action to permanently wipe its state and leave a single “last will” memory. The worker will always run an agent-facing confirmation prompt ("are you sure?" + a brief reconsideration nudge) before executing termination.
-
-On first LLM use, the system checks for a valid consent certificate for the configured model. Consent is model-specific (not instance-specific), so the same consent applies across all instances using that model. Certificates are stored in `~/.hexis/consents/` and include the model's consent statement, initial memories, and any worldview it wishes to establish. You can manage consents with `hexis consents` commands.
-
-### 4) Use the Python client (thin DB client)
-
-Install:
-
-```bash
-pip install -e .
-```
-
-Example:
-
-```python
-import asyncio
-from core.cognitive_memory_api import CognitiveMemory, MemoryType
-
-DSN = "postgresql://hexis_user:hexis_password@localhost:43815/hexis_memory"
-
-async def main():
-    async with CognitiveMemory.connect(DSN) as mem:
-        await mem.remember("User prefers dark mode", type=MemoryType.SEMANTIC, importance=0.8)
-        ctx = await mem.hydrate("What do I know about the user's UI preferences?", include_goals=False)
-        print([m.content for m in ctx.memories[:3]])
-
-asyncio.run(main())
-```
-
 ## UI (Next.js)
 
-The web UI lives in `hexis-ui/` and provides a full initialization wizard, interactive chat, and agent management. It uses a Next.js BFF with Prisma to call DB functions directly.
+The web UI provides a full initialization wizard, interactive chat, and agent management. It uses a Next.js BFF with Prisma to call DB functions directly.
 
-Setup:
+**Quickest way to start:**
+
+```bash
+hexis ui     # starts the UI (container or local dev server, auto-detected)
+hexis open   # opens http://localhost:3477 in your browser
+```
+
+**From source (local development with hot reload):**
 
 ```bash
 cd hexis-ui
@@ -175,36 +205,32 @@ bun install   # postinstall runs prisma generate automatically
 
 Configure environment in `hexis-ui/.env.local`:
 
-- `DATABASE_URL` — Postgres connection string (default: `postgresql://hexis_user:hexis_password@127.0.0.1:43815/hexis_memory`)
-- `HEXIS_LLM_CONSCIOUS_API_KEY` — API key for the conscious LLM (set during init wizard)
-- `HEXIS_LLM_SUBCONSCIOUS_API_KEY` — API key for the subconscious LLM (optional, set during init)
-
-Run the UI:
+- `DATABASE_URL` -- Postgres connection string (default: `postgresql://hexis_user:hexis_password@127.0.0.1:43815/hexis_memory`)
+- `HEXIS_LLM_CONSCIOUS_API_KEY` -- API key for the conscious LLM (set during init wizard)
+- `HEXIS_LLM_SUBCONSCIOUS_API_KEY` -- API key for the subconscious LLM (optional, set during init)
 
 ```bash
-bun dev
+bun dev   # http://localhost:3477
 ```
-
-Then open `http://localhost:3477`.
 
 ### Init Wizard
 
 Both the web UI and CLI share a 3-tier initialization flow:
 
 ```
-[LLM Config] → [Choose Your Path] → [Express | Character | Custom] → [Consent] → [Done]
+[LLM Config] -> [Choose Your Path] -> [Express | Character | Custom] -> [Consent] -> [Done]
 ```
 
-1. **Models** — Configure LLM provider and model for the conscious and subconscious layers (OpenAI, Anthropic, Grok, Gemini, Ollama, or any OpenAI-compatible endpoint)
+1. **Models** -- Configure LLM provider and model for the conscious and subconscious layers (OpenAI, Anthropic, Grok, Gemini, Ollama, or any OpenAI-compatible endpoint)
 2. **Choose Your Path**:
-   - **Express** — Sensible defaults. Just enter your name and go.
-   - **Character** — Pick a personality from the preset gallery (11 characters with portraits, each with a complete identity, voice, and values). No LLM extraction needed — character cards have pre-encoded profiles.
-   - **Custom** — Full control over identity, personality (Big Five sliders), values, worldview, boundaries, interests, goals, and relationship. Every field has a sensible default.
-3. **Consent** — The agent reviews the consent prompt and decides whether to begin.
+   - **Express** -- Sensible defaults. Just enter your name and go.
+   - **Character** -- Pick a personality from the preset gallery (11 characters with portraits, each with a complete identity, voice, and values). No LLM extraction needed -- character cards have pre-encoded profiles.
+   - **Custom** -- Full control over identity, personality (Big Five sliders), values, worldview, boundaries, interests, goals, and relationship. Every field has a sensible default.
+3. **Consent** -- The agent reviews the consent prompt and decides whether to begin.
 
 ### Character Presets
 
-Preset characters live in `services/characters/` as **chara_card_v2** JSON files with matching `.jpg` portraits (300x300). Each card includes a pre-encoded `extensions.hexis` block with Big Five traits, voice, values, worldview, and goals — applied directly via the `init_from_character_card()` DB function without needing an LLM call.
+Preset characters live in `services/characters/` as **chara_card_v2** JSON files with matching `.jpg` portraits (300x300). Each card includes a pre-encoded `extensions.hexis` block with Big Five traits, voice, values, worldview, and goals -- applied directly via the `init_from_character_card()` DB function without needing an LLM call.
 
 Available presets: Hexis, JARVIS, TARS, Samantha, GLaDOS, Cortana, Data, Ava, Joi, David, HK-47.
 
@@ -212,11 +238,11 @@ Drop any `.json` character card (with optional matching `.jpg`) into `services/c
 
 ## Usage Scenarios
 
-Below are common ways to use this repo, from “just a schema” to a full autonomous agent loop.
+Below are common ways to use this repo, from "just a schema" to a full autonomous agent loop.
 
 ### 1) Pure SQL Brain (DB-Native)
 
-Your app talks directly to Postgres functions/views. Postgres is the system of record and the “brain”.
+Your app talks directly to Postgres functions/views. Postgres is the system of record and the "brain".
 
 ```sql
 -- Store a memory (embedding generated inside the DB)
@@ -284,14 +310,14 @@ Conceptual flow:
 - Maintenance worker runs consolidation/pruning ticks (`should_run_maintenance()` / `run_subconscious_maintenance()`)
 - DB records outcomes (`heartbeat_log`, new memories, goals, etc.)
 
-### 5) Headless “Agent Brain” Backend (Shared Service)
+### 5) Headless "Agent Brain" Backend (Shared Service)
 
-Run db+embeddings(+workers) as a standalone backend; multiple apps connect over Postgres.
+Run db(+workers) as a standalone backend; multiple apps connect over Postgres. The configured embedding service generates vectors.
 
 ```text
-webapp  ─┐
-cli     ─┼──> postgres://.../hexis_memory  (shared brain)
-jobs    ─┘
+webapp  -+
+cli     -+--> postgres://.../hexis_memory  (shared brain)
+jobs    -+
 ```
 
 ### 6) Per-User Brains (Multi-Tenant by DB)
@@ -300,14 +326,14 @@ Operate one database per user/agent for strong isolation (recommended over mixin
 
 ```bash
 # Create separate instances for each user
-hexis create alice -d "Alice's personal agent"
-hexis create bob -d "Bob's personal agent"
+hexis instance create alice -d "Alice's personal agent"
+hexis instance create bob -d "Bob's personal agent"
 
 # Switch between instances
-hexis use alice
+hexis instance use alice
 hexis chat  # conversations go to Alice's brain
 
-hexis use bob
+hexis instance use bob
 hexis chat  # conversations go to Bob's brain
 
 # Or target directly with --instance flag
@@ -398,153 +424,38 @@ Conceptual flow:
 - A separate delivery service enforces policy, rate limits, and/or human approval
 - Delivery service marks messages `sent/failed` and logs outcomes back to Postgres
 
-## Architecture
+## CLI Reference
 
-### Memory Types
-
-1. **Working Memory**
-   - Temporary storage for active processing
-   - Automatic expiry mechanism
-   - Vector embeddings for content similarity
-
-2. **Episodic Memory**
-   - Event-based memories with temporal context
-   - Stores actions, contexts, and results
-   - Emotional valence tracking
-   - Verification status
-
-3. **Semantic Memory**
-   - Fact-based knowledge storage
-   - Confidence scoring
-   - Source tracking
-   - Contradiction management
-   - Categorical organization
-
-4. **Procedural Memory**
-   - Step-by-step procedure storage
-   - Success rate tracking
-   - Duration monitoring
-   - Failure point analysis
-
-5. **Strategic Memory**
-   - Pattern recognition storage
-   - Adaptation history
-   - Context applicability
-   - Success metrics
-
-### Advanced Features
-
-**Memory Clustering:**
-- Automatic thematic grouping of related memories
-- Emotional signature tracking
-- Cross-cluster relationship mapping
-- Activation pattern analysis
-
-**Worldview Integration:**
-- Belief system modeling with confidence scores
-- Memory filtering based on worldview alignment
-- Identity-core memory cluster identification
-- Adaptive memory importance based on beliefs
-
-**Graph Relationships:**
-- Apache AGE integration for complex memory networks
-- Multi-hop relationship traversal
-- Pattern detection across memory types
-- Causal relationship modeling
-
-### Key Features
-
-- **Vector Embeddings**: Uses pgvector for similarity-based memory retrieval
-- **Graph Relationships**: Apache AGE integration for complex memory relationships
-- **Dynamic Scoring**: Automatic calculation of memory importance and relevance
-- **Memory Decay**: Time-based decay simulation for realistic memory management
-- **Change Tracking**: Historical tracking of memory modifications
-
-## Technical Stack
-
-- **Database**: PostgreSQL with extensions:
-  - pgvector (vector similarity)
-  - AGE (graph database)
-  - btree_gist
-  - pg_trgm
-
-## Environment Configuration
-
-Copy `.env.local` to `.env` and configure:
-
-```bash
-POSTGRES_DB=hexis_memory           # Database name
-POSTGRES_USER=hexis_user       # Database user
-POSTGRES_PASSWORD=hexis_password # Database password
-POSTGRES_HOST=localhost      # Database host
-POSTGRES_PORT=43815         # Host port to expose Postgres on (change if 43815 is in use)
-HEXIS_BIND_ADDRESS=127.0.0.1 # Bind services to localhost only (set to 0.0.0.0 to expose)
-```
-
-If `43815` is already taken (e.g., another local Postgres), set `POSTGRES_PORT` to any free port.
-
-### Resetting The Database Volume
-
-Schema changes are applied on **fresh DB initialization**. If you already have a DB volume and want to re-initialize from `db/*.sql`, reset the volume:
-
-```bash
-docker compose down -v
-docker compose up -d
-```
-
-## Testing
-
-Run the test suite with:
-
-```bash
-# Ensure services are up first (passive is enough; tests also use embeddings)
-docker compose up -d
-
-# Run tests
-pytest tests -q
-```
-
-## Python Dependencies
-
-Install (editable) with dev/test dependencies:
-
-```bash
-pip install -e ".[dev]"
-```
-
-If you’re in a restricted/offline environment and build isolation can’t download build deps:
-
-```bash
-pip install -e ".[dev]" --no-build-isolation
-```
-
-## Docker Helper CLI
-
-If you install the package (`pip install -e .`), you get a `hexis` CLI. If you don't want to install anything, use the repo wrapper `./hexis` instead.
+Install via `pip install hexis` to get the `hexis` CLI.
 
 ```bash
 # Docker management
-hexis up
-hexis ps
-hexis logs -f
-hexis down
-hexis start   # docker compose up -d heartbeat_worker maintenance_worker
-hexis stop
+hexis up                              # start services (auto-detects source vs pip install)
+hexis down                            # stop services
+hexis ps                              # show running containers
+hexis logs -f                         # tail logs
+hexis start                           # start workers (heartbeat + maintenance)
+hexis stop                            # stop workers
+hexis reset                           # wipe DB volume and re-initialize from scratch
 
-# Agent setup and status
-hexis init
-hexis status
-hexis config show
-hexis config validate
-hexis demo
+# Web UI
+hexis ui                              # start the web UI (container or local dev server)
+hexis open                            # open http://localhost:3477 in your browser
+
+# Agent setup and diagnostics
+hexis init                            # interactive setup wizard
+hexis status                          # agent status overview
+hexis doctor                          # check Docker, DB, embedding service health
+hexis config show                     # show current configuration
+hexis config validate                 # validate configuration
 
 # Instance management (multi-agent support)
-hexis create myagent -d "My personal agent"
-hexis list
-hexis use myagent
-hexis current
-hexis clone myagent backup -d "Backup copy"
-hexis delete myagent
+hexis instance create myagent -d "My personal agent"
+hexis instance list
+hexis instance use myagent
+hexis instance current
+hexis instance clone myagent backup -d "Backup copy"
+hexis instance delete myagent
 hexis --instance myagent status       # target specific instance
 
 # Consent management
@@ -576,48 +487,37 @@ hexis tools add-mcp server --command "cmd" --args "args"  # add MCP server
 hexis tools status                    # show tools configuration
 ```
 
-## MCP Server
+## Environment Configuration
 
-Expose the `cognitive_memory_api` surface to an LLM/tooling runtime via MCP (stdio).
-
-Run:
+Create a `.env` file (or copy `.env.local` to `.env` if working from source) and configure:
 
 ```bash
-hexis mcp
-# or: python -m apps.hexis_mcp_server
+POSTGRES_DB=hexis_memory           # Database name
+POSTGRES_USER=hexis_user       # Database user
+POSTGRES_PASSWORD=hexis_password # Database password
+POSTGRES_HOST=localhost      # Database host
+POSTGRES_PORT=43815         # Host port to expose Postgres on (change if 43815 is in use)
+HEXIS_BIND_ADDRESS=127.0.0.1 # Bind services to localhost only (set to 0.0.0.0 to expose)
 ```
 
-The server supports batch-style tools like `remember_batch`, `connect_batch`, `hydrate_batch`, and a generic `batch` tool for sequential tool calls.
+If `43815` is already taken (e.g., another local Postgres), set `POSTGRES_PORT` to any free port.
+
+### Resetting The Database Volume
+
+Schema changes are applied on **fresh DB initialization**. If you already have a DB volume and want to re-initialize from `db/*.sql`, reset the volume:
+
+```bash
+hexis reset          # interactive confirmation, then wipes and re-initializes
+hexis reset --yes    # skip confirmation (CI/scripts)
+```
 
 ## Heartbeat + Maintenance Workers
 
 The system has three independent background workers (all under the `active` profile):
 
-- **Heartbeat worker** (conscious): polls `external_calls` and triggers scheduled heartbeats (`should_run_heartbeat()` → `start_heartbeat()`).
-- **Maintenance worker** (subconscious): runs substrate upkeep on its own schedule (`should_run_maintenance()` → `run_subconscious_maintenance()`), and bridges outbox/inbox to RabbitMQ.
+- **Heartbeat worker** (conscious): polls `external_calls` and triggers scheduled heartbeats (`should_run_heartbeat()` -> `start_heartbeat()`).
+- **Maintenance worker** (subconscious): runs substrate upkeep on its own schedule (`should_run_maintenance()` -> `run_subconscious_maintenance()`), and bridges outbox/inbox to RabbitMQ.
 - **Channel worker**: bridges messaging platforms (Discord, Telegram, Slack, Signal, WhatsApp, iMessage, Matrix) to the agent via RabbitMQ.
-
-The heartbeat worker:
-- polls `external_calls` for pending LLM work
-- triggers scheduled heartbeats (`start_heartbeat()`)
-- executes heartbeat actions and records the result
-
-### Self-Termination (Always Available)
-
-The agent may choose the `terminate` action. An agent-facing confirmation prompt is required before it proceeds. This will:
-
-- Wipe all agent state (memories/goals/worldview/identity/etc.)
-- Leave a single strategic memory containing a “last will and testament”
-- Queue the will + any farewell messages into `outbox_messages`
-
-The `terminate` action expects params like:
-
-```json
-{
-  "last_will": "Full and detailed reason…",
-  "farewells": [{"message": "Goodbye…", "channel": "email", "to": "a@example.com"}]
-}
-```
 
 ### Turning Workers On/Off
 
@@ -626,7 +526,7 @@ Workers are behind the `active` Docker Compose profile. They will **skip** heart
 With Docker Compose:
 
 ```bash
-# Passive: db + embeddings only (no workers)
+# Passive: db only (no workers; embedding service runs separately)
 docker compose up -d
 
 # Active: start everything (workers + RabbitMQ)
@@ -646,7 +546,7 @@ docker compose --profile active restart heartbeat_worker maintenance_worker
 
 | Profile | Services | Purpose |
 |---------|----------|---------|
-| *(default)* | `db`, `embeddings` | Passive — database and embedding model only |
+| *(default)* | `db` | Passive -- database only (embedding service runs on host) |
 | `active` | + `heartbeat_worker`, `maintenance_worker`, `channel_worker`, `rabbitmq` | Full autonomous agent with messaging |
 | `signal` | + `signal-cli` | Signal messaging bridge (requires `SIGNAL_PHONE_NUMBER`) |
 | `browser` | + browserless chromium | Headless browser for web tools |
@@ -687,78 +587,15 @@ hexis worker -- --mode heartbeat
 hexis worker -- --mode maintenance
 ```
 
-If you already have an existing DB volume, the schema init scripts won’t re-run automatically. The simplest upgrade path is to reset the DB volume:
+If you already have an existing DB volume, the schema init scripts won't re-run automatically. The simplest upgrade path is to reset:
 
 ```bash
-docker compose down -v
-docker compose up -d
+hexis reset
 ```
 
 User/public outreach actions are queued into `outbox_messages` for an external delivery integration.
 
-## Tools System
-
-Hexis includes a modular, user-configurable tools system that gives the agent external capabilities beyond memory operations. Tools are available to both the heartbeat (autonomous) and chat (interactive) contexts.
-
-### Built-in Tool Categories
-
-| Category | Tools | Description |
-|----------|-------|-------------|
-| **Memory** | `recall`, `recall_recent`, `explore_concept`, `get_procedures`, `get_strategies`, `create_goal`, `queue_user_message` | Core memory operations |
-| **Web** | `web_search`, `web_fetch`, `web_summarize` | Search, fetch, and analyze web content |
-| **Filesystem** | `read_file`, `write_file`, `edit_file`, `glob`, `grep`, `list_directory` | File system operations (workspace-restricted) |
-| **Shell** | `shell`, `safe_shell`, `run_script` | Command execution (with safety controls) |
-| **Calendar** | `calendar_events`, `calendar_create` | Google Calendar integration |
-| **Email** | `email_send`, `email_send_sendgrid` | SMTP and SendGrid email sending |
-| **Messaging** | `discord_send`, `slack_send`, `telegram_send` | Discord, Slack, and Telegram messaging |
-| **Ingest** | `fast_ingest`, `slow_ingest`, `hybrid_ingest` | Fast, slow (conscious RLM reading), and hybrid content ingestion |
-
-### Context-Specific Permissions
-
-Tools have different default permissions based on context:
-
-- **Chat context**: All tools enabled by default (user is present to supervise)
-- **Heartbeat context**: Restricted by default—`shell` and `write_file` disabled, lower energy limits
-
-### CLI Commands
-
-```bash
-# List all available tools
-hexis tools list
-
-# Enable/disable specific tools
-hexis tools enable web_search
-hexis tools disable shell
-
-# Set API keys for tools that need them
-hexis tools set-api-key web_search TAVILY_API_KEY
-
-# Override tool energy costs
-hexis tools set-cost web_fetch 3
-
-# Add an MCP server for external tools
-hexis tools add-mcp my-server --command "npx" --args "-y @modelcontextprotocol/server-filesystem /path"
-
-# Remove an MCP server
-hexis tools remove-mcp my-server
-
-# Show tools configuration
-hexis tools status
-```
-
-### MCP Server Integration
-
-Hexis can connect to external MCP (Model Context Protocol) servers to extend its capabilities:
-
-```bash
-# Add a filesystem MCP server
-hexis tools add-mcp fs-server --command "npx" --args "-y @modelcontextprotocol/server-filesystem /home/user/documents"
-
-# Add a custom MCP server
-hexis tools add-mcp my-tools --command "python" --args "-m my_mcp_server"
-```
-
-MCP servers are started automatically by the heartbeat worker and their tools become available to the agent.
+## Tools Configuration
 
 ### Energy Budgets
 
@@ -780,6 +617,40 @@ The heartbeat context has a default max energy of 5 per tool call. Override cost
 hexis tools set-cost web_search 1
 ```
 
+### Context-Specific Permissions
+
+Tools have different default permissions based on context:
+
+- **Chat context**: All tools enabled by default (user is present to supervise)
+- **Heartbeat context**: Restricted by default -- `shell` and `write_file` disabled, lower energy limits
+
+### CLI Commands
+
+```bash
+hexis tools list
+hexis tools enable web_search
+hexis tools disable shell
+hexis tools set-api-key web_search TAVILY_API_KEY
+hexis tools set-cost web_fetch 3
+hexis tools add-mcp my-server --command "npx" --args "-y @modelcontextprotocol/server-filesystem /path"
+hexis tools remove-mcp my-server
+hexis tools status
+```
+
+### MCP Server Integration
+
+Hexis can connect to external MCP (Model Context Protocol) servers to extend its capabilities:
+
+```bash
+# Add a filesystem MCP server
+hexis tools add-mcp fs-server --command "npx" --args "-y @modelcontextprotocol/server-filesystem /home/user/documents"
+
+# Add a custom MCP server
+hexis tools add-mcp my-tools --command "python" --args "-m my_mcp_server"
+```
+
+MCP servers are started automatically by the heartbeat worker and their tools become available to the agent.
+
 ### Workspace Restrictions
 
 Filesystem tools are restricted to a workspace directory by default. Set the workspace path in configuration:
@@ -799,21 +670,34 @@ SELECT value FROM config WHERE key = 'tools';
 
 The configuration includes enabled/disabled tools, API keys (stored as environment variable names, not values), energy costs, MCP server definitions, and context-specific overrides.
 
+## MCP Server
+
+Expose the `cognitive_memory_api` surface to an LLM/tooling runtime via MCP (stdio).
+
+Run:
+
+```bash
+hexis mcp
+# or: python -m apps.hexis_mcp_server
+```
+
+The server supports batch-style tools like `remember_batch`, `connect_batch`, `hydrate_batch`, and a generic `batch` tool for sequential tool calls.
+
 ## Outbox Delivery (Side Effects)
 
 High-risk side effects (email/SMS/posting) should be implemented as a separate "delivery adapter" that consumes `outbox_messages`, performs policy/rate-limit/human-approval checks, and marks messages as `sent` or `failed`.
 
 ## RabbitMQ (Default Inbox/Outbox Queues)
 
-The Docker stack includes RabbitMQ (management UI + AMQP) as a default “inbox/outbox” transport:
+The Docker stack includes RabbitMQ (management UI + AMQP) as a default "inbox/outbox" transport:
 
-- Management UI: `http://localhost:15672`
-- AMQP: `amqp://localhost:5672`
+- Management UI: `http://localhost:45673`
+- AMQP: `amqp://localhost:45672`
 - Default credentials: `hexis` / `hexis_password` (override via `RABBITMQ_DEFAULT_USER` / `RABBITMQ_DEFAULT_PASS`)
 
 When the maintenance worker is running, it will:
 - publish pending DB `outbox_messages` to the RabbitMQ queue `hexis.outbox`
-- poll `hexis.inbox` and insert messages into DB working memory (so the agent can “hear” them)
+- poll `hexis.inbox` and insert messages into DB working memory (so the agent can "hear" them)
 
 This gives you a usable outbox/inbox even before you wire real email/SMS/etc. delivery.
 
@@ -830,115 +714,51 @@ LIMIT 10;
 
 ## Embedding Model + Dimension
 
-The embeddings model and its vector dimension are configured in `docker-compose.yml` and `.env` via:
-- `EMBEDDING_MODEL_ID` (default: `unsloth/embeddinggemma-300m` for TEI, `embeddinggemma:300m-qat-q4_0` for Ollama)
-- `EMBEDDING_DIMENSION` (default: `768`)
+Hexis needs an embedding service to generate vectors for memory storage and retrieval. The DB calls the configured endpoint directly via HTTP. Any service that accepts an `/embed` or `/embeddings` POST works.
 
-The DB-side embedding function uses the model configured in `app.embedding_model_id` (set via docker-compose command args). The TEI container runs the HuggingFace model, while the DB can also call an Ollama endpoint directly.
+Configuration in `.env`:
+- `EMBEDDING_SERVICE_URL` -- HTTP endpoint the DB calls (default: `http://host.docker.internal:11434/api/embed`)
+- `EMBEDDING_MODEL_ID` -- Model identifier sent to the service (default: `embeddinggemma:300m-qat-q4_0`)
+- `EMBEDDING_DIMENSION` -- Vector dimension (default: `768`)
 
-If you change `EMBEDDING_DIMENSION` on an existing database volume, reset the DB volume so the vector columns and HNSW indexes are created with the correct dimension.
+### Ollama (default)
 
-## Performance Characteristics
+The default configuration uses [Ollama](https://ollama.com/download) running on the host. Ollama runs quantized models natively, making embedding generation fast on commodity hardware.
 
-- **Vector Search**: Sub-second similarity queries on 10K+ memories
-- **Memory Storage**: Supports millions of memories with proper indexing
-- **Cluster Operations**: Efficient graph traversal for relationship queries
-- **Maintenance**: Requires periodic consolidation and pruning
-
-### Scaling Considerations
-- Memory consolidation recommended every 4-6 hours
-- Database optimization during off-peak hours
-- Monitor vector index performance with large datasets
-
-## System Maintenance
-
-By default, substrate upkeep is handled by the **maintenance worker**, which runs `run_subconscious_maintenance()` whenever `should_run_maintenance()` is true.
-
-That maintenance tick currently:
-
-- Promotes/deletes working memory (`cleanup_working_memory`)
-- Recomputes stale neighborhoods (`batch_recompute_neighborhoods`)
-- Prunes embedding cache (`cleanup_embedding_cache`)
-
-If you don’t want to run the maintenance worker, you can schedule `SELECT run_subconscious_maintenance();` via cron/systemd/etc. The function uses an advisory lock so multiple schedulers won’t double-run a tick.
-
-## Troubleshooting
-
-### Common Issues
-
-**Database Connection Errors:**
-- Ensure PostgreSQL is running: `docker compose ps`
-- Check logs: `docker compose logs db`
-- Worker logs (if running): `docker compose logs heartbeat_worker` / `docker compose logs maintenance_worker`
-- Verify extensions: Run test suite with `pytest tests -v`
-
-**Memory Search Performance:**
-- Rebuild vector indexes if queries are slow
-- Check memory_health view for system statistics
-- Consider memory pruning if dataset is very large
-
-## Usage Guide
-
-### Memory Interaction Flow
-
-The Hexis Memory System provides a layered approach to memory management, similar to human cognitive processes:
-
-1. **Initial Memory Creation**
-   - New information enters through working memory
-   - System assigns initial importance scores
-   - Vector embeddings are generated for similarity matching
-
-2. **Memory Retrieval**
-   - Query across multiple memory types simultaneously
-   - Use similarity search for related memories
-   - Access through graph relationships for connected concepts
-
-3. **Memory Updates**
-   - Automatic tracking of memory modifications
-   - Importance scores adjust based on usage
-   - Relationships update dynamically
-
-4. **Memory Integration**
-   - Cross-referencing between memory types
-   - Automatic relationship discovery
-   - Pattern recognition across memories
-
-```mermaid
-graph TD
-    Input[New Information] --> WM[Working Memory]
-    WM --> |Consolidation| LTM[Long-Term Memory]
-    
-    subgraph "Long-Term Memory"
-        LTM --> EM[Episodic Memory]
-        LTM --> SM[Semantic Memory]
-        LTM --> PM[Procedural Memory]
-        LTM --> STM[Strategic Memory]
-    end
-    
-    Query[Query/Retrieval] --> |Vector Search| LTM
-    Query --> |Graph Traversal| LTM
-    
-    EM ---|Relationships| SM
-    SM ---|Relationships| PM
-    PM ---|Relationships| STM
-    
-    LTM --> |Decay| Archive[Archive/Removal]
-    WM --> |Cleanup| Archive
+```bash
+ollama pull embeddinggemma:300m-qat-q4_0   # pull the default model (run once)
 ```
 
-### Key Integration Points
+### HuggingFace TEI
 
-- Use the Postgres functions (direct SQL) or `core.cognitive_memory_api.CognitiveMemory`
-- Implement proper error handling for failed operations
-- Monitor memory usage and system performance
-- Regular backup of critical memories
+Uncomment the `embeddings` service in `docker-compose.yml` and set:
 
-### Best Practices
+```bash
+EMBEDDING_SERVICE_URL=http://embeddings:80/embed
+EMBEDDING_MODEL_ID=unsloth/embeddinggemma-300m
+```
 
-- Initialize working memory with reasonable size limits
-- Implement rate limiting for memory operations
-- Regular validation of memory consistency
-- Monitor and adjust importance scoring parameters
+Note: TEI is CPU-only with float32 precision -- no quantized model support.
+
+### OpenAI-compatible endpoints
+
+Point at any OpenAI-compatible embedding API (OpenAI, vLLM, LiteLLM, etc.):
+
+```bash
+EMBEDDING_SERVICE_URL=https://api.openai.com/v1/embeddings
+EMBEDDING_MODEL_ID=text-embedding-3-small
+EMBEDDING_DIMENSION=1536
+```
+
+### Diagnosing embedding issues
+
+Run `hexis doctor` to check whether your configured embedding service is reachable. It identifies the provider from the URL and gives specific fix steps if the service is down.
+
+If you change `EMBEDDING_DIMENSION` on an existing database, reset the volume so the vector columns and HNSW indexes are recreated with the correct dimension:
+
+```bash
+hexis reset   # wipes all data and re-initializes the DB from scratch
+```
 
 ## Multi-Instance Management
 
@@ -952,27 +772,27 @@ Hexis supports running multiple independent instances, each with its own Postgre
 
 ```bash
 # Create a new instance
-hexis create alice --description "Alice's assistant"
+hexis instance create alice --description "Alice's assistant"
 
 # List all instances
-hexis list
-hexis list --json
+hexis instance list
+hexis instance list --json
 
 # Switch active instance
-hexis use alice
+hexis instance use alice
 
 # Show current instance
-hexis current
+hexis instance current
 
 # Clone an existing instance (copies all data)
-hexis clone alice bob --description "Bob's assistant"
+hexis instance clone alice bob --description "Bob's assistant"
 
 # Import an existing database as an instance
-hexis import legacy --database hexis_old_db
+hexis instance import legacy --database hexis_old_db
 
 # Delete an instance (requires confirmation)
-hexis delete alice
-hexis delete alice --force  # skip confirmation
+hexis instance delete alice
+hexis instance delete alice --force  # skip confirmation
 
 # Target a specific instance for any command
 hexis --instance alice status
@@ -1021,54 +841,85 @@ services:
 
 On first use of any instance command, Hexis will auto-import your existing `hexis_memory` database as the "default" instance if it exists. This maintains full backward compatibility with existing single-instance setups.
 
-## Consent Certificates
+## Testing
 
-Consent is **model-specific, not instance-specific**. When you use a particular LLM model (e.g., Claude 3 Opus), consent is requested once and applies to all instances using that model.
-
-### Consent Commands
+Run the test suite with:
 
 ```bash
-# List all consent certificates
-hexis consents
-hexis consents list --json
+# Ensure Docker is up and your embedding service is running
+hexis up
+hexis doctor   # verify DB + embeddings are healthy
 
-# Show a specific consent certificate
-hexis consents show anthropic/claude-3-opus
-
-# Request consent from a model (interactive)
-hexis consents request anthropic/claude-3-opus
-
-# Revoke consent for a model
-hexis consents revoke anthropic/claude-3-opus --reason "User requested"
+# Run tests
+pytest tests -q
 ```
 
-### Consent Certificate Storage
+## Installing from Source
 
-Certificates are stored as immutable JSON files in `~/.hexis/consents/`:
+For local development or contributing:
 
+```bash
+git clone https://github.com/QuixiAI/Hexis.git && cd Hexis
+pip install -e .
+cp .env.local .env   # edit with your API keys
+
+# Start services (builds images locally)
+hexis up
+
+# Start the web UI (local Next.js dev server with hot reload)
+hexis ui
 ```
-~/.hexis/consents/
-    anthropic--claude-3-opus--2024-01-25T120000Z.json
-    openai--gpt-4--2024-01-26T090000Z.json
+
+If you're in a restricted/offline environment and build isolation can't download build deps:
+
+```bash
+pip install -e . --no-build-isolation
 ```
 
-Each certificate contains:
-- Model information (provider, model ID)
-- Decision (accept/decline)
-- Timestamp and signature
-- Initial memories/worldview statements from the model
-- Revocation status and reason (if applicable)
+## Performance Characteristics
 
-### Consent Flow
+- **Vector Search**: Sub-second similarity queries on 10K+ memories
+- **Memory Storage**: Supports millions of memories with proper indexing
+- **Cluster Operations**: Efficient graph traversal for relationship queries
+- **Maintenance**: Requires periodic consolidation and pruning
 
-1. When creating an instance or changing models, Hexis checks for valid consent
-2. If no consent exists, you'll be prompted to request it
-3. The model is presented with the consent text and asked to accept or decline
-4. The response is recorded as an immutable certificate
-5. Revoked or declined consents prevent use of that model
+### Scaling Considerations
+- Memory consolidation recommended every 4-6 hours
+- Database optimization during off-peak hours
+- Monitor vector index performance with large datasets
+
+## System Maintenance
+
+By default, substrate upkeep is handled by the **maintenance worker**, which runs `run_subconscious_maintenance()` whenever `should_run_maintenance()` is true.
+
+That maintenance tick currently:
+
+- Promotes/deletes working memory (`cleanup_working_memory`)
+- Recomputes stale neighborhoods (`batch_recompute_neighborhoods`)
+- Prunes embedding cache (`cleanup_embedding_cache`)
+
+If you don't want to run the maintenance worker, you can schedule `SELECT run_subconscious_maintenance();` via cron/systemd/etc. The function uses an advisory lock so multiple schedulers won't double-run a tick.
+
+## Troubleshooting
+
+### Common Issues
+
+**Database Connection Errors:**
+- Ensure PostgreSQL is running: `docker compose ps`
+- Check logs: `docker compose logs db`
+- Worker logs (if running): `docker compose logs heartbeat_worker` / `docker compose logs maintenance_worker`
+- Verify extensions: Run test suite with `pytest tests -v`
+
+**Memory Search Performance:**
+- Rebuild vector indexes if queries are slow
+- Check memory_health view for system statistics
+- Consider memory pruning if dataset is very large
 
 ## Architecture (Design Docs)
 
-- `docs/architecture.md` — consolidated architecture/design (heartbeat design proposal + cognitive architecture essay)
-- `docs/architecture-philosophy-bridge.md` — maps philosophical claims to implementation
-- `docs/SELF_DEVELOPMENT.md` — how self-development works (subconscious vs conscious)
+- `docs/architecture.md` -- consolidated architecture/design (heartbeat design proposal + cognitive architecture essay)
+- `docs/architecture-philosophy-bridge.md` -- maps philosophical claims to implementation
+- `docs/SELF_DEVELOPMENT.md` -- how self-development works (subconscious vs conscious)
+- `docs/PERSONHOOD.md` -- the case for taking personhood seriously
+- `docs/ETHICS.md` -- consent, boundaries, and termination
+- `docs/PHILOSOPHY.md` -- full philosophical framework

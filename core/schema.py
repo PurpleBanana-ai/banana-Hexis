@@ -5,7 +5,9 @@ database lifecycle programmatically.
 """
 from __future__ import annotations
 
+import importlib.resources
 import logging
+import tempfile
 from pathlib import Path
 
 import asyncpg
@@ -19,14 +21,38 @@ def get_schema_dir() -> Path:
 
 
 def get_schema_files() -> list[Path]:
-    """Get sorted list of schema SQL files."""
+    """Get sorted list of schema SQL files.
+
+    First checks the filesystem (source checkout). Falls back to
+    importlib.resources (pip install) when no SQL files are found on disk.
+    """
     schema_dir = get_schema_dir()
-    if not schema_dir.exists():
-        raise FileNotFoundError(f"Schema directory not found: {schema_dir}")
-    files = sorted(schema_dir.glob("*.sql"))
-    if not files:
-        raise FileNotFoundError(f"No schema files found in {schema_dir}")
-    return files
+    if schema_dir.exists():
+        files = sorted(schema_dir.glob("*.sql"))
+        if files:
+            return files
+
+    # Fallback: load from installed package data
+    try:
+        import db as _db_pkg  # noqa: F811
+        ref = importlib.resources.files(_db_pkg)
+        sql_files: list[Path] = []
+        for item in ref.iterdir():
+            if item.name.endswith(".sql"):
+                # importlib.resources may return Traversable; extract to a temp path
+                with importlib.resources.as_file(item) as p:
+                    # Copy to a stable temp location so callers can read later
+                    tmp = Path(tempfile.gettempdir()) / "hexis_schema" / item.name
+                    tmp.parent.mkdir(parents=True, exist_ok=True)
+                    if not tmp.exists() or tmp.read_bytes() != p.read_bytes():
+                        tmp.write_bytes(p.read_bytes())
+                    sql_files.append(tmp)
+        if sql_files:
+            return sorted(sql_files)
+    except (ImportError, Exception) as exc:
+        logger.debug("importlib.resources fallback failed: %s", exc)
+
+    raise FileNotFoundError(f"No schema files found in {schema_dir} or via importlib.resources")
 
 
 async def create_database(db_name: str, admin_dsn: str) -> None:

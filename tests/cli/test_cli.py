@@ -28,7 +28,7 @@ async def test_cli_instance_list_empty(temp_hexis_dir):
     with patch.object(InstanceRegistry, "CONFIG_DIR", temp_hexis_dir):
         with patch.object(InstanceRegistry, "CONFIG_FILE", temp_hexis_dir / "instances.json"):
             p = subprocess.run(
-                [sys.executable, "-m", "apps.hexis_cli", "list"],
+                [sys.executable, "-m", "apps.hexis_cli", "instance", "list"],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -44,7 +44,7 @@ async def test_cli_instance_current_none(temp_hexis_dir):
     with patch.object(InstanceRegistry, "CONFIG_DIR", temp_hexis_dir):
         with patch.object(InstanceRegistry, "CONFIG_FILE", temp_hexis_dir / "instances.json"):
             p = subprocess.run(
-                [sys.executable, "-m", "apps.hexis_cli", "current"],
+                [sys.executable, "-m", "apps.hexis_cli", "instance", "current"],
                 capture_output=True,
                 text=True,
                 env=env,
@@ -57,7 +57,7 @@ async def test_cli_instance_use_nonexistent():
     """Test switching to a nonexistent instance fails."""
     env = os.environ.copy()
     p = subprocess.run(
-        [sys.executable, "-m", "apps.hexis_cli", "use", "nonexistent-instance-xyz"],
+        [sys.executable, "-m", "apps.hexis_cli", "instance", "use", "nonexistent-instance-xyz"],
         capture_output=True,
         text=True,
         env=env,
@@ -143,7 +143,7 @@ async def test_cli_config_show_and_validate(db_pool):
     env = os.environ.copy()
 
     show = subprocess.run(
-        [sys.executable, "-m", "apps.hexis_cli", "config", "show", "--wait-seconds", "60"],
+        [sys.executable, "-m", "apps.hexis_cli", "config", "show", "--json", "--wait-seconds", "60"],
         capture_output=True,
         text=True,
         env=env,
@@ -180,3 +180,36 @@ async def test_cli_config_validate_fails_when_unconfigured(db_pool):
     finally:
         async with db_pool.acquire() as conn:
             await conn.execute("SELECT set_config('agent.is_configured', 'true'::jsonb)")
+
+
+async def test_cli_version():
+    """Test --version flag outputs version string."""
+    env = os.environ.copy()
+    p = subprocess.run(
+        [sys.executable, "-m", "apps.hexis_cli", "--version"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    assert p.returncode == 0
+    assert "hexis" in p.stdout.lower()
+
+
+async def test_cli_help_grouped():
+    """Test grouped help output contains group names."""
+    env = os.environ.copy()
+    p = subprocess.run(
+        [sys.executable, "-m", "apps.hexis_cli", "help"],
+        capture_output=True,
+        text=True,
+        env=env,
+        cwd=str(Path(__file__).resolve().parents[1]),
+    )
+    assert p.returncode == 0
+    combined = p.stdout + p.stderr
+    assert "Getting Started" in combined
+    assert "Stack" in combined
+    assert "Interact" in combined
+    assert "Memory & Goals" in combined
+    assert "Instances" in combined

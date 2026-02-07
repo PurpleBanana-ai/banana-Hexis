@@ -1,7 +1,7 @@
 import path from "path";
 import { readFile } from "fs/promises";
 
-const PROMPT_ROOT = path.resolve(process.cwd(), "..", "services", "prompts");
+const PROMPT_ROOT = process.env.HEXIS_PROMPTS_DIR || path.resolve(process.cwd(), "..", "services", "prompts");
 const PERSONHOOD_PATH = path.join(PROMPT_ROOT, "personhood.md");
 const CONVERSATION_PATH = path.join(PROMPT_ROOT, "conversation.md");
 
