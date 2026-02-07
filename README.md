@@ -22,57 +22,43 @@ This is both an engineering project and a philosophical experiment. For the phil
 - **11 preset character cards** -- chara_card_v2 format with portraits, or bring your own
 - **Consent, boundaries, and termination** -- The agent can refuse requests, and can choose to end its own existence. See [ETHICS.md](docs/ETHICS.md)
 
-## Quickstart
+## Quick Start
 
-### Prerequisites
-
-| Dependency | Purpose | Install |
-|------------|---------|---------|
-| **Docker Desktop** | Runs the Postgres brain and workers | [docker.com/get-docker](https://docs.docker.com/get-docker/) |
-| **Embedding service** | Generates vector embeddings for memory | See [Embedding Model + Dimension](#embedding-model--dimension) |
-| **Python 3.10+** | CLI tools (`hexis chat`, `hexis init`, etc.) | `pip install hexis` |
-
-The default embedding configuration uses **Ollama** on the host. After installing [Ollama](https://ollama.com/download), pull the default model:
+Get a running agent in under 5 minutes. You need [Docker Desktop](https://docs.docker.com/get-docker/), [Ollama](https://ollama.com/download), and Python 3.10+.
 
 ```bash
-ollama pull embeddinggemma:300m-qat-q4_0
-```
-
-> **Why Ollama by default?** HuggingFace TEI is CPU-only and limited to float32. Ollama runs quantized models natively, making embedding generation ~4x faster on commodity hardware. You can use any embedding service -- see [Embedding Model + Dimension](#embedding-model--dimension) for alternatives (TEI, OpenAI, vLLM, etc.).
-
-```bash
+# 1. Install Hexis and pull the embedding model
 pip install hexis
+ollama pull embeddinggemma:300m-qat-q4_0
 
-# Create a project directory and configure
+# 2. Create a project directory
 mkdir my-agent && cd my-agent
+
+# 3. Add your LLM API key
 cat > .env <<'EOF'
 ANTHROPIC_API_KEY=sk-ant-...
 EOF
 
-# Start services (pulls pre-built images from GHCR)
+# 4. Start the stack
 hexis up
 
-# Open the web UI
+# 5. Open the web UI
 hexis ui
-
-# Or configure via CLI
-hexis init
 ```
 
-### Start workers (optional)
-
-Workers enable the autonomous heartbeat, maintenance, and messaging channels:
+The init wizard walks you through setup. The fastest path: **Models** (pick your LLM) -> **Character** (select **Hexis**) -> **Consent** -> done. The Hexis character is a philosophical, curious agent designed to explore its own nature -- a good default for seeing what the system can do.
 
 ```bash
-# Active: adds workers + RabbitMQ (heartbeat, maintenance, channels)
+# 6. Chat with your agent
+hexis chat
+
+# 7. Enable the autonomous heartbeat (optional)
 hexis up --profile active
 ```
 
-### About configuration
+With the `active` profile, the agent wakes on its own, reviews goals, reflects, and reaches out when it has something to say. Without it, the agent only responds when you talk to it.
 
-Autonomous heartbeats are **gated** until setup is complete -- configure via the web UI (`hexis ui`) or CLI (`hexis init`).
-
-Config is stored in Postgres in the `config` table (e.g. `agent.objectives`, `agent.guardrails`, `llm.heartbeat`, and `agent.is_configured`).
+> **Note:** You can use any LLM provider (OpenAI, Anthropic, Grok, Gemini, Ollama, or any OpenAI-compatible endpoint) and any embedding service. See [Embedding Model + Dimension](#embedding-model--dimension) for alternatives.
 
 ## Architecture
 
