@@ -137,6 +137,7 @@ hexis mcp                 # Start MCP server
 ## Commit & Pull Request Guidelines
 
 - **Commits**: Short, imperative summaries (e.g., "Add MCP server tools", "Gate heartbeat on config")
+- **Never add `Co-Authored-By` trailers** to commit messages
 - **PRs**: Include rationale, how to run/verify, and any DB reset requirements
 - **Call out changes to**: `db/*.sql`, `docker-compose.yml`, `README.md`
 
