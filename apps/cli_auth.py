@@ -274,14 +274,8 @@ _PROVIDER_LABELS = {
 # ---------------------------------------------------------------------------
 
 async def _generic_oauth_status(dsn: str, wait_seconds: int, provider: str, *, as_json: bool) -> int:
-    from core.agent_api import _connect_with_retry
     mod = _provider_module(provider)
-
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        creds = await mod.load_credentials(conn)
-    finally:
-        await conn.close()
+    creds = mod.load_credentials()
 
     label = _PROVIDER_LABELS.get(provider, provider)
     if not creds:
@@ -321,7 +315,6 @@ async def _generic_oauth_status(dsn: str, wait_seconds: int, provider: str, *, a
 
 async def _generic_logout(dsn: str, wait_seconds: int, provider: str, yes: bool) -> int:
     from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
     mod = _provider_module(provider)
     label = _PROVIDER_LABELS.get(provider, provider)
 
@@ -335,12 +328,7 @@ async def _generic_logout(dsn: str, wait_seconds: int, provider: str, yes: bool)
             console.print("[dim]Aborted.[/dim]")
             return 1
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await mod.delete_credentials(conn)
-    finally:
-        await conn.close()
-
+    mod.delete_credentials()
     console.print(f"[ok]Deleted {label} credentials.[/ok]")
     return 0
 
@@ -350,10 +338,10 @@ async def _generic_logout(dsn: str, wait_seconds: int, provider: str, yes: bool)
 # ---------------------------------------------------------------------------
 
 async def _openai_codex_login(dsn: str, wait_seconds: int, no_open: bool, timeout_seconds: int) -> int:
+    import socket
     import webbrowser
 
     from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
     from core.auth.callback_server import run_callback_server
     from core.auth.openai_codex import (
         OPENAI_CODEX_REDIRECT_URI,
@@ -366,42 +354,78 @@ async def _openai_codex_login(dsn: str, wait_seconds: int, no_open: bool, timeou
         save_openai_codex_credentials,
     )
 
+    # Pre-check whether port 1455 is available before starting the flow.
+    port_available = True
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as s:
+            s.bind(("127.0.0.1", 1455))
+    except OSError:
+        port_available = False
+
     verifier, challenge = generate_pkce()
     state = create_state()
     auth_url = build_authorize_url(challenge=challenge, state=state)
 
     console.print("\n[bold]OpenAI Codex OAuth[/bold]")
-    console.print("1. A browser window should open. Sign in to ChatGPT and approve.")
-    console.print("2. If the callback page fails to load, copy the browser URL and paste it here.\n")
-    console.print(f"[dim]{auth_url}[/dim]\n")
 
-    if not no_open:
+    if not port_available:
+        # Identify the blocking process for the error message.
+        blocker = ""
         try:
-            webbrowser.open(auth_url)
+            import subprocess as _sp
+            out = _sp.check_output(
+                ["lsof", "-i", ":1455", "-sTCP:LISTEN", "-P", "-n", "-Fp"],
+                text=True, timeout=5,
+            )
+            pids = [line[1:] for line in out.splitlines() if line.startswith("p")]
+            if pids:
+                names = _sp.check_output(
+                    ["ps", "-p", ",".join(pids), "-o", "pid=,comm="],
+                    text=True, timeout=5,
+                ).strip()
+                blocker = f"\n  Blocking process:\n    {names}\n"
         except Exception:
             pass
 
-    # Try callback server
-    result = run_callback_server(
-        port=1455,
-        callback_path="/auth/callback",
-        timeout_seconds=timeout_seconds,
-        expected_state=state,
-    )
+        console.print(
+            "[fail]Port 1455 is required for OpenAI Codex OAuth but is already in use.[/fail]\n"
+            f"{blocker}\n"
+            "  Please free the port and try again:\n"
+            "    [bold]lsof -ti :1455 | xargs kill[/bold]\n"
+        )
+        return 1
+    else:
+        console.print("1. A browser window should open. Sign in to ChatGPT and approve.")
+        console.print("2. If the callback page fails to load, copy the browser URL and paste it here.\n")
+        console.print(f"[dim]{auth_url}[/dim]\n")
 
-    code: str | None = result.get("code") if result else None
+        if not no_open:
+            try:
+                webbrowser.open(auth_url)
+            except Exception:
+                pass
 
-    if not code:
-        try:
-            pasted = input("Paste the authorization code (or full redirect URL): ").strip()
-        except (KeyboardInterrupt, EOFError):
-            console.print("\n[dim]Aborted.[/dim]")
-            return 1
-        parsed_code, parsed_state = parse_authorization_input(pasted)
-        if parsed_state and parsed_state != state:
-            _print_err("State mismatch. Ensure you pasted the redirect URL from this login attempt.")
-            return 1
-        code = parsed_code
+        # Try callback server
+        result = run_callback_server(
+            port=1455,
+            callback_path="/auth/callback",
+            timeout_seconds=timeout_seconds,
+            expected_state=state,
+        )
+
+        code: str | None = result.get("code") if result else None
+
+        if not code:
+            try:
+                pasted = input("Paste the authorization code (or full redirect URL): ").strip()
+            except (KeyboardInterrupt, EOFError):
+                console.print("\n[dim]Aborted.[/dim]")
+                return 1
+            parsed_code, parsed_state = parse_authorization_input(pasted)
+            if parsed_state and parsed_state != state:
+                _print_err("State mismatch. Ensure you pasted the redirect URL from this login attempt.")
+                return 1
+            code = parsed_code
 
     if not code:
         _print_err("Missing authorization code.")
@@ -410,12 +434,8 @@ async def _openai_codex_login(dsn: str, wait_seconds: int, no_open: bool, timeou
     console.print("[accent]Exchanging code for tokens...[/accent]")
     creds = await exchange_authorization_code(code=code, verifier=verifier)
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await save_openai_codex_credentials(conn, creds)
-        await ensure_fresh_openai_codex_credentials(conn, skew_seconds=0)
-    finally:
-        await conn.close()
+    save_openai_codex_credentials(creds)
+    await ensure_fresh_openai_codex_credentials(skew_seconds=0)
 
     expires_sec = max(0, int((creds.expires_ms - int(time.time() * 1000)) / 1000))
     console.print(f"[ok]Logged in.[/ok] account_id={creds.account_id} expires_in~{expires_sec}s")
@@ -423,14 +443,9 @@ async def _openai_codex_login(dsn: str, wait_seconds: int, no_open: bool, timeou
 
 
 async def _openai_codex_status(dsn: str, wait_seconds: int, *, as_json: bool) -> int:
-    from core.agent_api import _connect_with_retry
     from core.auth.openai_codex import load_openai_codex_credentials
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        creds = await load_openai_codex_credentials(conn)
-    finally:
-        await conn.close()
+    creds = load_openai_codex_credentials()
 
     if not creds:
         if as_json:
@@ -458,7 +473,6 @@ async def _openai_codex_status(dsn: str, wait_seconds: int, *, as_json: bool) ->
 
 async def _openai_codex_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
     from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
     from core.auth.openai_codex import delete_openai_codex_credentials
 
     if not yes:
@@ -471,12 +485,7 @@ async def _openai_codex_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
             console.print("[dim]Aborted.[/dim]")
             return 1
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await delete_openai_codex_credentials(conn)
-    finally:
-        await conn.close()
-
+    delete_openai_codex_credentials()
     console.print("[ok]Deleted OAuth credentials.[/ok]")
     return 0
 
@@ -489,7 +498,6 @@ async def _anthropic_setup_token(dsn: str, wait_seconds: int, token: str | None)
     import getpass
 
     from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
     from core.auth.anthropic_setup_token import (
         AnthropicSetupTokenCredentials,
         save_credentials,
@@ -508,25 +516,15 @@ async def _anthropic_setup_token(dsn: str, wait_seconds: int, token: str | None)
         _print_err(f"Invalid setup token: {error}")
         return 1
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await save_credentials(conn, AnthropicSetupTokenCredentials(token=token))
-    finally:
-        await conn.close()
-
+    save_credentials(AnthropicSetupTokenCredentials(token=token))
     console.print("[ok]Setup token saved.[/ok]")
     return 0
 
 
 async def _anthropic_status(dsn: str, wait_seconds: int, *, as_json: bool) -> int:
-    from core.agent_api import _connect_with_retry
     from core.auth.anthropic_setup_token import load_credentials
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        creds = await load_credentials(conn)
-    finally:
-        await conn.close()
+    creds = load_credentials()
 
     if not creds:
         if as_json:
@@ -547,7 +545,6 @@ async def _anthropic_status(dsn: str, wait_seconds: int, *, as_json: bool) -> in
 
 async def _anthropic_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
     from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
     from core.auth.anthropic_setup_token import delete_credentials
 
     if not yes:
@@ -560,12 +557,7 @@ async def _anthropic_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
             console.print("[dim]Aborted.[/dim]")
             return 1
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await delete_credentials(conn)
-    finally:
-        await conn.close()
-
+    delete_credentials()
     console.print("[ok]Deleted Anthropic setup token.[/ok]")
     return 0
 
@@ -579,7 +571,6 @@ async def _chutes_login(dsn: str, wait_seconds: int, args: Any) -> int:
     import webbrowser
 
     from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
     from core.auth import create_state, generate_pkce
     from core.auth.callback_server import run_callback_server
     from core.auth.chutes import exchange_code, save_credentials
@@ -646,12 +637,7 @@ async def _chutes_login(dsn: str, wait_seconds: int, args: Any) -> int:
         client_secret=os.getenv("CHUTES_CLIENT_SECRET"),
     )
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await save_credentials(conn, creds)
-    finally:
-        await conn.close()
-
+    save_credentials(creds)
     console.print(f"[ok]Logged in.[/ok] email={creds.email or 'unknown'}")
     return 0
 
@@ -664,7 +650,6 @@ async def _github_copilot_login(dsn: str, wait_seconds: int, args: Any) -> int:
     import webbrowser
 
     from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
     from core.auth.github_copilot import (
         exchange_github_for_copilot,
         poll_for_github_token,
@@ -694,12 +679,7 @@ async def _github_copilot_login(dsn: str, wait_seconds: int, args: Any) -> int:
     console.print("[accent]Exchanging for Copilot token...[/accent]")
     creds = await exchange_github_for_copilot(github_token, enterprise_domain)
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await save_credentials(conn, creds)
-    finally:
-        await conn.close()
-
+    save_credentials(creds)
     console.print(f"[ok]Logged in.[/ok] base_url={creds.base_url}")
     return 0
 
@@ -712,7 +692,6 @@ async def _qwen_portal_login(dsn: str, wait_seconds: int, args: Any) -> int:
     import webbrowser
 
     from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
     from core.auth.qwen_portal import poll_for_token, save_credentials, start_device_flow
 
     console.print("\n[bold]Qwen Portal (device code flow)[/bold]")
@@ -732,12 +711,7 @@ async def _qwen_portal_login(dsn: str, wait_seconds: int, args: Any) -> int:
     console.print("[accent]Waiting for authorization...[/accent]")
     creds = await poll_for_token(device.device_code, verifier, device.interval, device.expires_in)
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await save_credentials(conn, creds)
-    finally:
-        await conn.close()
-
+    save_credentials(creds)
     console.print("[ok]Logged in.[/ok]")
     return 0
 
@@ -750,7 +724,6 @@ async def _minimax_portal_login(dsn: str, wait_seconds: int, args: Any) -> int:
     import webbrowser
 
     from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
     from core.auth.minimax_portal import poll_for_token, save_credentials, start_user_code_flow
 
     region = getattr(args, "region", "global")
@@ -771,12 +744,7 @@ async def _minimax_portal_login(dsn: str, wait_seconds: int, args: Any) -> int:
         user_code_resp.expires_in, region,
     )
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await save_credentials(conn, creds)
-    finally:
-        await conn.close()
-
+    save_credentials(creds)
     console.print("[ok]Logged in.[/ok]")
     return 0
 
@@ -789,7 +757,6 @@ async def _google_gemini_cli_login(dsn: str, wait_seconds: int, args: Any) -> in
     import webbrowser
 
     from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
     from core.auth import create_state, generate_pkce
     from core.auth.callback_server import run_callback_server
     from core.auth.google_gemini_cli import (
@@ -843,12 +810,7 @@ async def _google_gemini_cli_login(dsn: str, wait_seconds: int, args: Any) -> in
     console.print("[accent]Exchanging code and discovering project...[/accent]")
     creds = await complete_login(code, verifier)
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await save_credentials(conn, creds)
-    finally:
-        await conn.close()
-
+    save_credentials(creds)
     console.print(f"[ok]Logged in.[/ok] project={creds.project_id} email={creds.email or 'unknown'}")
     return 0
 
@@ -861,7 +823,6 @@ async def _google_antigravity_login(dsn: str, wait_seconds: int, args: Any) -> i
     import webbrowser
 
     from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
     from core.auth import create_state, generate_pkce
     from core.auth.callback_server import run_callback_server
     from core.auth.google_antigravity import (
@@ -915,11 +876,6 @@ async def _google_antigravity_login(dsn: str, wait_seconds: int, args: Any) -> i
     console.print("[accent]Exchanging code and discovering project...[/accent]")
     creds = await complete_login(code, verifier)
 
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await save_credentials(conn, creds)
-    finally:
-        await conn.close()
-
+    save_credentials(creds)
     console.print(f"[ok]Logged in.[/ok] project={creds.project_id} email={creds.email or 'unknown'}")
     return 0

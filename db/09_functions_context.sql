@@ -207,11 +207,10 @@ BEGIN
                 'strength', (strength::text)::float
             ) as obj
             FROM ag_catalog.cypher('memory_graph', $q$
-                MATCH (s:SelfNode)-[r]->(c)
-                WHERE type(r) IN ['CAPABLE_OF', 'VALUES', 'STRUGGLES_WITH', 'ASSOCIATED']
-                RETURN type(r) as kind, c.name as concept, r.strength as strength
+                MATCH (s:SelfNode)-[r:ASSOCIATED]->(c)
+                RETURN r.kind as kind, c.name as concept, r.strength as strength
                 ORDER BY r.strength DESC
-                LIMIT 10
+                LIMIT 15
             $q$) as (kind ag_catalog.agtype, concept ag_catalog.agtype, strength ag_catalog.agtype)
         ) sub;
     EXCEPTION WHEN OTHERS THEN result := '[]'::jsonb; END;

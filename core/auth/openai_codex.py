@@ -210,7 +210,7 @@ async def refresh_openai_codex_token(refresh_token: str) -> OpenAICodexCredentia
 
 
 # ---------------------------------------------------------------------------
-# DB persistence
+# Persistence (filesystem – survives DB resets)
 # ---------------------------------------------------------------------------
 
 def credentials_to_dict(creds: OpenAICodexCredentials) -> dict[str, Any]:
@@ -255,32 +255,30 @@ def credentials_from_value(value: Any) -> OpenAICodexCredentials | None:
     )
 
 
-async def load_openai_codex_credentials(conn) -> OpenAICodexCredentials | None:  # type: ignore[type-arg]
-    value = await conn.fetchval("SELECT get_config($1)", OPENAI_CODEX_OAUTH_CONFIG_KEY)
-    return credentials_from_value(value)
+def load_openai_codex_credentials() -> OpenAICodexCredentials | None:
+    from core.auth.store import load_auth
+    return credentials_from_value(load_auth(OPENAI_CODEX_OAUTH_CONFIG_KEY))
 
 
-async def save_openai_codex_credentials(conn, creds: OpenAICodexCredentials) -> None:  # type: ignore[type-arg]
-    await conn.execute(
-        "SELECT set_config($1, $2::jsonb)",
-        OPENAI_CODEX_OAUTH_CONFIG_KEY,
-        json.dumps(credentials_to_dict(creds)),
-    )
+def save_openai_codex_credentials(creds: OpenAICodexCredentials) -> None:
+    from core.auth.store import save_auth
+    save_auth(OPENAI_CODEX_OAUTH_CONFIG_KEY, credentials_to_dict(creds))
 
 
-async def delete_openai_codex_credentials(conn) -> None:  # type: ignore[type-arg]
-    await conn.execute("SELECT delete_config_key($1)", OPENAI_CODEX_OAUTH_CONFIG_KEY)
+def delete_openai_codex_credentials() -> None:
+    from core.auth.store import delete_auth
+    delete_auth(OPENAI_CODEX_OAUTH_CONFIG_KEY)
 
 
 async def ensure_fresh_openai_codex_credentials(
-    conn,
     *,
     skew_seconds: int = 300,
 ) -> OpenAICodexCredentials:
-    """Return valid credentials, refreshing under advisory lock if needed."""
-    async with conn.transaction():
-        await conn.execute("SELECT pg_advisory_xact_lock($1)", _OPENAI_CODEX_OAUTH_LOCK_KEY)
-        creds = await load_openai_codex_credentials(conn)
+    """Return valid credentials, refreshing under file lock if needed."""
+    from core.auth.store import auth_lock
+
+    with auth_lock(OPENAI_CODEX_OAUTH_CONFIG_KEY):
+        creds = load_openai_codex_credentials()
         if not creds:
             raise RuntimeError(
                 "OpenAI Codex OAuth is not configured. Run: `hexis auth openai-codex login`"
@@ -291,5 +289,5 @@ async def ensure_fresh_openai_codex_credentials(
             return creds
 
         refreshed = await refresh_openai_codex_token(creds.refresh)
-        await save_openai_codex_credentials(conn, refreshed)
+        save_openai_codex_credentials(refreshed)
         return refreshed

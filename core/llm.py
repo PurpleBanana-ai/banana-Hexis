@@ -186,10 +186,8 @@ async def _codex_responses_completion(
     }
     if instructions:
         payload["instructions"] = instructions
-    if temperature is not None:
-        payload["temperature"] = temperature
-    # Codex compatibility: max token field support is inconsistent; omit unless proven.
-    _ = max_tokens  # kept for signature parity
+    # Codex Responses API does not support temperature or max_tokens; omit both.
+    _ = temperature, max_tokens  # kept for signature parity
 
     if responses_tools:
         payload["tools"] = responses_tools

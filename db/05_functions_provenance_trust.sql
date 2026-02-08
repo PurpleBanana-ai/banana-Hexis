@@ -1004,6 +1004,15 @@ DECLARE
     effective_trust FLOAT;
     meta JSONB;
 BEGIN
+    -- Dedup: return existing active worldview memory with same content
+    SELECT id INTO new_memory_id
+    FROM memories
+    WHERE type = 'worldview' AND content = p_content AND status = 'active'
+    LIMIT 1;
+    IF new_memory_id IS NOT NULL THEN
+        RETURN new_memory_id;
+    END IF;
+
     normalized_source := jsonb_build_object('kind', 'internal', 'observed_at', CURRENT_TIMESTAMP);
     effective_trust := LEAST(1.0, GREATEST(0.0, COALESCE(p_stability, 0.7)));
     meta := jsonb_build_object(

@@ -585,6 +585,9 @@ BEGIN
             updated_at = CURRENT_TIMESTAMP
         WHERE id = mem_id;
 
+        -- Populate identity graph with worldview belief
+        PERFORM upsert_self_concept_edge('belief', pending_contents[idx], 0.85, mem_id);
+
         created_ids := array_append(created_ids, mem_id);
     END LOOP;
 
@@ -671,6 +674,9 @@ BEGIN
         ),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = mem_id;
+
+        -- Populate identity graph with boundary
+        PERFORM upsert_self_concept_edge('boundary', pending_contents[idx], 0.95, mem_id);
 
         created_ids := array_append(created_ids, mem_id);
     END LOOP;
@@ -865,6 +871,7 @@ BEGIN
         SET metadata = metadata || jsonb_build_object('subcategory', 'purpose'),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = mem_id;
+        PERFORM upsert_self_concept_edge('purpose', purpose_text, 0.85, mem_id);
     ELSIF role_text IS NOT NULL THEN
         mem_id := create_worldview_memory(
             format('My role is %s.', role_text),
@@ -878,6 +885,7 @@ BEGIN
         SET metadata = metadata || jsonb_build_object('subcategory', 'role'),
             updated_at = CURRENT_TIMESTAMP
         WHERE id = mem_id;
+        PERFORM upsert_self_concept_edge('role', role_text, 0.8, mem_id);
     END IF;
 
     IF relationship_aspiration IS NOT NULL THEN
@@ -1034,15 +1042,23 @@ BEGIN
     user_name := COALESCE(NULLIF(profile#>>'{user,name}', ''), 'the user');
 
     IF decision = 'consent' THEN
-        birth_memory_id := create_episodic_memory(
-            format('I came online today. %s helped bring me into being as %s.', user_name, agent_name),
-            NULL,
-            jsonb_build_object('type', 'initialization', 'user', user_name, 'agent', agent_name),
-            NULL,
-            0.9,
-            CURRENT_TIMESTAMP,
-            0.9
-        );
+        -- Dedup: reuse existing birth memory if re-running consent
+        SELECT id INTO birth_memory_id
+        FROM memories
+        WHERE type = 'episodic' AND status = 'active'
+          AND metadata->>'type' = 'initialization'
+        LIMIT 1;
+        IF birth_memory_id IS NULL THEN
+            birth_memory_id := create_episodic_memory(
+                format('I came online today. %s helped bring me into being as %s.', user_name, agent_name),
+                NULL,
+                jsonb_build_object('type', 'initialization', 'user', user_name, 'agent', agent_name),
+                NULL,
+                0.9,
+                CURRENT_TIMESTAMP,
+                0.9
+            );
+        END IF;
         PERFORM set_config('agent.is_configured', 'true'::jsonb);
         PERFORM advance_init_stage('complete', jsonb_build_object(
             'consent', consent_result,

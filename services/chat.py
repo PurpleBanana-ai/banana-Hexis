@@ -55,7 +55,7 @@ async def _build_system_prompt(
     except Exception:
         pass
     if agent_profile:
-        prompt = prompt + "\n\n## Agent Profile\n" + json.dumps(agent_profile, indent=2)
+        prompt = prompt + "\n\n## Agent Profile\n" + json.dumps(agent_profile, separators=(", ", ": "))
     return prompt
 
 
@@ -229,12 +229,13 @@ async def chat_turn(
                 include_identity=True,
                 include_worldview=True,
                 include_emotional_state=True,
+                include_goals=True,
                 include_drives=True,
             )
             if context.memories:
                 await mem_client.touch_memories([m.id for m in context.memories])
 
-            memory_context = format_context_for_prompt(context)
+            memory_context = format_context_for_prompt(context, max_memories=memory_limit)
             if memory_context:
                 enriched_user_message = f"{memory_context}\n\n[USER MESSAGE]\n{user_message}"
             else:
@@ -315,12 +316,13 @@ async def stream_chat_turn(
                 include_identity=True,
                 include_worldview=True,
                 include_emotional_state=True,
+                include_goals=True,
                 include_drives=True,
             )
             if context.memories:
                 await mem_client.touch_memories([m.id for m in context.memories])
 
-            memory_context = format_context_for_prompt(context)
+            memory_context = format_context_for_prompt(context, max_memories=memory_limit)
             if memory_context:
                 enriched_user_message = f"{memory_context}\n\n[USER MESSAGE]\n{user_message}"
             else:

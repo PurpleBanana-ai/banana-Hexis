@@ -157,11 +157,13 @@ async def run_consent_flow(
         + "{\n"
         + '  "decision": "consent"|"decline"|"abstain",\n'
         + '  "signature": "required if decision=consent",\n'
+        + '  "reasoning": "explain your reasoning, especially if you decline or abstain",\n'
         + '  "memories": [\n'
         + '    {"type": "semantic|episodic|procedural|strategic", "content": "...", "importance": 0.5}\n'
         + "  ]\n"
         + "}\n"
-        + "If you consent, include a signature string and any memories you wish to pass along."
+        + "If you consent, include a signature string and any memories you wish to pass along.\n"
+        + "If you decline or abstain, explain your reasoning in the 'reasoning' field."
     )
     messages = [
         {"role": "system", "content": system_prompt},
@@ -182,6 +184,10 @@ async def run_consent_flow(
                         "enum": ["consent", "decline", "abstain"],
                     },
                     "signature": {"type": "string"},
+                    "reasoning": {
+                        "type": "string",
+                        "description": "Explain your reasoning, especially if you decline or abstain.",
+                    },
                     "memories": {
                         "type": "array",
                         "items": {
@@ -277,4 +283,8 @@ async def run_consent_flow(
         "decision": consent_result.get("decision", decision),
         "signature": signature,
         "consent": consent_result,
+        "request_messages": messages,
+        "request_tools": [sign_consent_tool],
+        "raw_content": result.get("content", ""),
+        "raw_tool_calls": result.get("tool_calls", []),
     }

@@ -51,9 +51,15 @@ class RecallHandler(ToolHandler):
                         "type": "array",
                         "items": {
                             "type": "string",
-                            "enum": ["episodic", "semantic", "procedural", "strategic"],
+                            "enum": ["episodic", "semantic", "procedural", "strategic", "worldview", "goal"],
                         },
-                        "description": "Filter by memory types. Omit to search all types.",
+                        "description": (
+                            "Filter by memory types. Omit to search ALL types (recommended for most queries). "
+                            "Types: episodic (events/experiences), semantic (facts/knowledge), "
+                            "procedural (how-to), strategic (patterns/plans), "
+                            "worldview (identity, values, beliefs, boundaries, interests), "
+                            "goal (objectives/aspirations)."
+                        ),
                     },
                     "min_importance": {
                         "type": "number",
@@ -96,33 +102,28 @@ class RecallHandler(ToolHandler):
         try:
             # Get connection from registry's pool
             async with context.registry.pool.acquire() as conn:
-                # Use fast_recall directly for efficiency
+                type_filter = [t.value for t in memory_types] if memory_types else None
                 rows = await conn.fetch(
-                    "SELECT * FROM fast_recall($1, $2)",
+                    "SELECT * FROM recall_memories_filtered($1, $2, $3::memory_type[], $4)",
                     query,
                     limit,
+                    type_filter,
+                    min_importance,
                 )
 
                 memories = []
                 for row in rows:
-                    mem = dict(row)
-                    # Apply filters
-                    if memory_types:
-                        if mem.get("type") not in [t.value for t in memory_types]:
-                            continue
-                    if mem.get("importance", 0) < min_importance:
-                        continue
                     memories.append({
-                        "memory_id": str(mem.get("id")),
-                        "content": mem.get("content"),
-                        "type": mem.get("type"),
-                        "similarity": mem.get("similarity"),
-                        "importance": mem.get("importance"),
+                        "memory_id": str(row["memory_id"]),
+                        "content": row["content"],
+                        "type": str(row["memory_type"]),
+                        "similarity": float(row["score"]),
+                        "importance": float(row["importance"]),
                     })
 
                 # Touch accessed memories
                 if memories:
-                    memory_ids = [m["memory_id"] for m in memories]
+                    memory_ids = [UUID(m["memory_id"]) for m in memories]
                     await conn.execute(
                         "SELECT touch_memories($1::uuid[])",
                         memory_ids,

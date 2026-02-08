@@ -88,6 +88,7 @@ class EmailSendHandler(ToolHandler):
             energy_cost=4,
             is_read_only=False,
             requires_approval=True,
+            optional=True,
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 
@@ -243,6 +244,7 @@ class SendGridEmailHandler(ToolHandler):
             energy_cost=4,
             is_read_only=False,
             requires_approval=True,
+            optional=True,
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 

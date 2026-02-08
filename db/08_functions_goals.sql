@@ -83,6 +83,15 @@ DECLARE
     goal_embedding vector;
     goal_metadata JSONB;
 BEGIN
+    -- Dedup: return existing active goal with same title
+    SELECT id INTO new_goal_id
+    FROM memories
+    WHERE type = 'goal' AND content = p_title AND status = 'active'
+    LIMIT 1;
+    IF new_goal_id IS NOT NULL THEN
+        RETURN new_goal_id;
+    END IF;
+
     IF p_priority = 'active' THEN
         SELECT COUNT(*) INTO active_count
         FROM memories

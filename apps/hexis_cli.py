@@ -1535,6 +1535,8 @@ def _run_module(module: str, argv: list[str]) -> int:
     try:
         result = subprocess.run(cmd, env=os.environ.copy())
         return result.returncode
+    except KeyboardInterrupt:
+        return 0
     except FileNotFoundError:
         _print_err(f"Failed to run {cmd[0]!r}")
         return 1

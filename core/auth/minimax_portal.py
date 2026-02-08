@@ -154,7 +154,7 @@ async def poll_for_token(
 
 
 # ---------------------------------------------------------------------------
-# DB persistence
+# Persistence (filesystem – survives DB resets)
 # ---------------------------------------------------------------------------
 
 def credentials_to_dict(creds: MiniMaxPortalCredentials) -> dict[str, Any]:
@@ -195,32 +195,30 @@ def credentials_from_value(value: Any) -> MiniMaxPortalCredentials | None:
     )
 
 
-async def load_credentials(conn) -> MiniMaxPortalCredentials | None:
-    value = await conn.fetchval("SELECT get_config($1)", MINIMAX_PORTAL_CONFIG_KEY)
-    return credentials_from_value(value)
+def load_credentials() -> MiniMaxPortalCredentials | None:
+    from core.auth.store import load_auth
+    return credentials_from_value(load_auth(MINIMAX_PORTAL_CONFIG_KEY))
 
 
-async def save_credentials(conn, creds: MiniMaxPortalCredentials) -> None:
-    await conn.execute(
-        "SELECT set_config($1, $2::jsonb)",
-        MINIMAX_PORTAL_CONFIG_KEY,
-        json.dumps(credentials_to_dict(creds)),
-    )
+def save_credentials(creds: MiniMaxPortalCredentials) -> None:
+    from core.auth.store import save_auth
+    save_auth(MINIMAX_PORTAL_CONFIG_KEY, credentials_to_dict(creds))
 
 
-async def delete_credentials(conn) -> None:
-    await conn.execute("SELECT delete_config_key($1)", MINIMAX_PORTAL_CONFIG_KEY)
+def delete_credentials() -> None:
+    from core.auth.store import delete_auth
+    delete_auth(MINIMAX_PORTAL_CONFIG_KEY)
 
 
-async def ensure_fresh_credentials(conn, *, skew_seconds: int = 300) -> MiniMaxPortalCredentials:
+async def ensure_fresh_credentials(*, skew_seconds: int = 300) -> MiniMaxPortalCredentials:
     """MiniMax refresh is not implemented in OpenClaw; re-auth if expired."""
-    async with conn.transaction():
-        await conn.execute("SELECT pg_advisory_xact_lock($1)", _MINIMAX_PORTAL_LOCK_KEY)
-        creds = await load_credentials(conn)
+    from core.auth.store import auth_lock
+    from core.auth.utils import needs_refresh as _needs_refresh
+
+    with auth_lock(MINIMAX_PORTAL_CONFIG_KEY):
+        creds = load_credentials()
         if not creds:
             raise RuntimeError("MiniMax Portal is not configured. Run: `hexis auth minimax-portal login`")
-        from core.auth.utils import needs_refresh as _needs_refresh
-
         if not _needs_refresh(creds.expires_ms, skew_seconds):
             return creds
         raise RuntimeError(

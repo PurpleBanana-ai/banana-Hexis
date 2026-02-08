@@ -106,12 +106,12 @@ async def _ensure_oauth_login(provider: str, dsn: str, conn: Any, *, wait_second
     # Map provider -> (module path, load function name)
     _LOADERS: dict[str, tuple[str, str]] = {
         "openai-codex":       ("core.auth.openai_codex",      "load_openai_codex_credentials"),
-        "chutes":             ("core.auth.chutes",             "load_chutes_credentials"),
-        "github-copilot":     ("core.auth.github_copilot",     "load_github_copilot_credentials"),
-        "qwen-portal":        ("core.auth.qwen_portal",        "load_qwen_portal_credentials"),
-        "minimax-portal":     ("core.auth.minimax_portal",     "load_minimax_portal_credentials"),
-        "google-gemini-cli":  ("core.auth.google_gemini_cli",  "load_google_gemini_cli_credentials"),
-        "google-antigravity": ("core.auth.google_antigravity", "load_google_antigravity_credentials"),
+        "chutes":             ("core.auth.chutes",             "load_credentials"),
+        "github-copilot":     ("core.auth.github_copilot",     "load_credentials"),
+        "qwen-portal":        ("core.auth.qwen_portal",        "load_credentials"),
+        "minimax-portal":     ("core.auth.minimax_portal",     "load_credentials"),
+        "google-gemini-cli":  ("core.auth.google_gemini_cli",  "load_credentials"),
+        "google-antigravity": ("core.auth.google_antigravity", "load_credentials"),
     }
 
     entry = _LOADERS.get(provider)
@@ -121,7 +121,7 @@ async def _ensure_oauth_login(provider: str, dsn: str, conn: Any, *, wait_second
     import importlib
     mod = importlib.import_module(entry[0])
     load_fn = getattr(mod, entry[1])
-    existing = await load_fn(conn)
+    existing = load_fn()
     if existing:
         return
 
@@ -879,6 +879,40 @@ async def _run_consent(conn: Any, llm_config: dict[str, Any]) -> bool:
         return False
 
     decision = result.get("decision", "abstain")
+
+    # Extract response fields for display
+    raw_tool_calls = result.get("raw_tool_calls", [])
+    tc_args: dict[str, Any] = {}
+    for tc in raw_tool_calls:
+        if tc.get("name") == "sign_consent":
+            tc_args = tc.get("arguments", {})
+            if isinstance(tc_args, str):
+                try:
+                    tc_args = json.loads(tc_args)
+                except Exception:
+                    tc_args = {}
+            break
+
+    reasoning = tc_args.get("reasoning", "")
+    signature = tc_args.get("signature", "")
+    memories = tc_args.get("memories", [])
+
+    # Build human-readable response
+    lines: list[str] = []
+    if reasoning:
+        lines.append(f"[key]Reasoning:[/key]\n{reasoning}")
+    if signature:
+        lines.append(f"\n[key]Signature:[/key]\n{signature}")
+    if memories:
+        lines.append(f"\n[key]Initial Memories:[/key]")
+        for m in memories:
+            mtype = m.get("type", "?")
+            mcontent = m.get("content", "")
+            mimp = m.get("importance", "")
+            lines.append(f"  [{mtype}] {mcontent}" + (f" (importance: {mimp})" if mimp else ""))
+
+    if lines:
+        console.print(make_panel("\n".join(lines), title="Agent Response"))
 
     if decision == "consent":
         console.print(f"[ok]\u2714 Consent granted[/ok]")

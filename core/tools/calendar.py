@@ -73,6 +73,7 @@ class GoogleCalendarHandler(ToolHandler):
             category=ToolCategory.CALENDAR,
             energy_cost=2,
             is_read_only=True,
+            optional=True,
         )
 
     async def execute(
@@ -218,6 +219,7 @@ class CreateCalendarEventHandler(ToolHandler):
             energy_cost=3,
             is_read_only=False,
             requires_approval=True,
+            optional=True,
         )
 
     async def execute(

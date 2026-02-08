@@ -18,7 +18,7 @@ DEFAULT_LLM_MODEL = os.getenv("LLM_MODEL", "gpt-4o")
 async def _load_openai_codex(conn, cfg: dict[str, Any]) -> None:
     from core.auth.openai_codex import ensure_fresh_openai_codex_credentials
 
-    creds = await ensure_fresh_openai_codex_credentials(conn)
+    creds = await ensure_fresh_openai_codex_credentials()
     cfg["api_key"] = creds.access
     cfg.setdefault("endpoint", "https://chatgpt.com/backend-api")
 
@@ -26,7 +26,7 @@ async def _load_openai_codex(conn, cfg: dict[str, Any]) -> None:
 async def _load_chutes(conn, cfg: dict[str, Any]) -> None:
     from core.auth.chutes import CHUTES_DEFAULT_ENDPOINT, ensure_fresh_credentials
 
-    creds = await ensure_fresh_credentials(conn)
+    creds = await ensure_fresh_credentials()
     cfg["api_key"] = creds.access
     cfg.setdefault("endpoint", CHUTES_DEFAULT_ENDPOINT)
 
@@ -34,7 +34,7 @@ async def _load_chutes(conn, cfg: dict[str, Any]) -> None:
 async def _load_github_copilot(conn, cfg: dict[str, Any]) -> None:
     from core.auth.github_copilot import ensure_fresh_credentials
 
-    creds = await ensure_fresh_credentials(conn)
+    creds = await ensure_fresh_credentials()
     cfg["api_key"] = creds.access
     cfg.setdefault("endpoint", creds.base_url)
 
@@ -42,7 +42,7 @@ async def _load_github_copilot(conn, cfg: dict[str, Any]) -> None:
 async def _load_qwen_portal(conn, cfg: dict[str, Any]) -> None:
     from core.auth.qwen_portal import QWEN_PORTAL_DEFAULT_ENDPOINT, ensure_fresh_credentials
 
-    creds = await ensure_fresh_credentials(conn)
+    creds = await ensure_fresh_credentials()
     cfg["api_key"] = creds.access
     cfg.setdefault("endpoint", creds.resource_url or QWEN_PORTAL_DEFAULT_ENDPOINT)
 
@@ -50,7 +50,7 @@ async def _load_qwen_portal(conn, cfg: dict[str, Any]) -> None:
 async def _load_minimax_portal(conn, cfg: dict[str, Any]) -> None:
     from core.auth.minimax_portal import default_endpoint, ensure_fresh_credentials
 
-    creds = await ensure_fresh_credentials(conn)
+    creds = await ensure_fresh_credentials()
     cfg["api_key"] = creds.access
     cfg.setdefault("endpoint", creds.resource_url or default_endpoint(creds.region))
 
@@ -58,7 +58,7 @@ async def _load_minimax_portal(conn, cfg: dict[str, Any]) -> None:
 async def _load_google_gemini_cli(conn, cfg: dict[str, Any]) -> None:
     from core.auth.google_gemini_cli import GOOGLE_CODE_ASSIST_ENDPOINT, ensure_fresh_credentials
 
-    creds = await ensure_fresh_credentials(conn)
+    creds = await ensure_fresh_credentials()
     # Pack token + project as JSON for downstream parsing in llm.py
     cfg["api_key"] = json.dumps({"token": creds.access, "projectId": creds.project_id})
     cfg.setdefault("endpoint", GOOGLE_CODE_ASSIST_ENDPOINT)
@@ -67,7 +67,7 @@ async def _load_google_gemini_cli(conn, cfg: dict[str, Any]) -> None:
 async def _load_google_antigravity(conn, cfg: dict[str, Any]) -> None:
     from core.auth.google_antigravity import CODE_ASSIST_ENDPOINTS, ensure_fresh_credentials
 
-    creds = await ensure_fresh_credentials(conn)
+    creds = await ensure_fresh_credentials()
     cfg["api_key"] = json.dumps({"token": creds.access, "projectId": creds.project_id})
     cfg.setdefault("endpoint", CODE_ASSIST_ENDPOINTS[0])
 
@@ -76,7 +76,7 @@ async def _load_anthropic_setup_token(conn, cfg: dict[str, Any]) -> None:
     """Fallback loader for 'anthropic' provider when no env API key is available."""
     from core.auth.anthropic_setup_token import load_credentials
 
-    creds = await load_credentials(conn)
+    creds = load_credentials()
     if creds:
         cfg["api_key"] = creds.token
         cfg["auth_mode"] = "setup-token"

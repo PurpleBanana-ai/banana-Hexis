@@ -171,6 +171,9 @@ class ToolRegistry:
         enabled = []
         for handler in self.list_all():
             spec = handler.spec
+            # Skip optional tools unless explicitly allowlisted
+            if spec.optional and not config.is_optional_allowed(spec.name, spec.category):
+                continue
             if config.is_tool_enabled_for_context(spec.name, spec.category, context):
                 if context in spec.allowed_contexts:
                     enabled.append(handler)

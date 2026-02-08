@@ -74,6 +74,7 @@ class DiscordSendHandler(ToolHandler):
             energy_cost=5,
             is_read_only=False,
             requires_approval=True,
+            optional=True,
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 
@@ -242,6 +243,7 @@ class SlackSendHandler(ToolHandler):
                     },
                     "blocks": {
                         "type": "array",
+                        "items": {"type": "object"},
                         "description": "Slack Block Kit blocks (optional)",
                     },
                     "thread_ts": {
@@ -255,6 +257,7 @@ class SlackSendHandler(ToolHandler):
             energy_cost=5,
             is_read_only=False,
             requires_approval=True,
+            optional=True,
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 
@@ -446,6 +449,7 @@ class TelegramSendHandler(ToolHandler):
             energy_cost=5,
             is_read_only=False,
             requires_approval=True,
+            optional=True,
             allowed_contexts={ToolContext.HEARTBEAT, ToolContext.CHAT},
         )
 

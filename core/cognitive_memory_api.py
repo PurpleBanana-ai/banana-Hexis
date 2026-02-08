@@ -1251,7 +1251,11 @@ def format_context_for_prompt(context: HydratedContext, *, max_memories: int = 5
     if context.identity:
         parts.append("\n## Identity")
         for aspect in context.identity[:3]:
-            parts.append(f"- {aspect.get('aspect_type', 'unknown')}: {aspect.get('content', {})}")
+            kind = aspect.get("type", aspect.get("aspect_type", "unknown"))
+            concept = aspect.get("concept", aspect.get("content", ""))
+            strength = aspect.get("strength")
+            suffix = f" ({strength:.1f})" if strength is not None else ""
+            parts.append(f"- {kind}: {concept}{suffix}")
 
     if context.worldview:
         parts.append("\n## Beliefs")
@@ -1264,6 +1268,18 @@ def format_context_for_prompt(context: HydratedContext, *, max_memories: int = 5
         parts.append("\n## Current Emotional State")
         parts.append(f"- Feeling: {es.get('primary_emotion', 'neutral')}")
         parts.append(f"- Valence: {es.get('valence', 0):.2f}, Arousal: {es.get('arousal', 0.5):.2f}")
+
+    if context.goals:
+        active = context.goals.get("active", [])
+        queued = context.goals.get("queued", [])
+        all_goals = active + queued
+        if all_goals:
+            parts.append("\n## Goals")
+            for g in all_goals[:5]:
+                title = g.get("title", "")
+                source = g.get("source", "")
+                suffix = f" (source: {source})" if source else ""
+                parts.append(f"- {title}{suffix}")
 
     if context.urgent_drives:
         parts.append("\n## Urgent Drives")

@@ -797,6 +797,14 @@ BEGIN
             updated_at = CURRENT_TIMESTAMP
         WHERE id = new_id;
 
+        -- Populate identity graph with personality trait
+        PERFORM upsert_self_concept_edge(
+            'personality_trait',
+            pending_contents[idx],
+            pending_values[idx],
+            new_id
+        );
+
         created_ids := array_append(created_ids, new_id);
     END LOOP;
 

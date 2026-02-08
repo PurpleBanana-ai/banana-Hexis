@@ -444,6 +444,8 @@ class AgentLoop:
                     "total_energy_spent": self._energy_spent,
                     "duration": result.duration_seconds,
                     "error": result.error,
+                    "output": result.output,
+                    "display_output": result.display_output,
                 })
 
                 self._tool_calls_made.append({

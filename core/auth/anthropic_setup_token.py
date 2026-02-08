@@ -49,18 +49,16 @@ def credentials_from_value(value: Any) -> AnthropicSetupTokenCredentials | None:
     return AnthropicSetupTokenCredentials(token=token)
 
 
-async def load_credentials(conn) -> AnthropicSetupTokenCredentials | None:
-    value = await conn.fetchval("SELECT get_config($1)", ANTHROPIC_SETUP_TOKEN_CONFIG_KEY)
-    return credentials_from_value(value)
+def load_credentials() -> AnthropicSetupTokenCredentials | None:
+    from core.auth.store import load_auth
+    return credentials_from_value(load_auth(ANTHROPIC_SETUP_TOKEN_CONFIG_KEY))
 
 
-async def save_credentials(conn, creds: AnthropicSetupTokenCredentials) -> None:
-    await conn.execute(
-        "SELECT set_config($1, $2::jsonb)",
-        ANTHROPIC_SETUP_TOKEN_CONFIG_KEY,
-        json.dumps(credentials_to_dict(creds)),
-    )
+def save_credentials(creds: AnthropicSetupTokenCredentials) -> None:
+    from core.auth.store import save_auth
+    save_auth(ANTHROPIC_SETUP_TOKEN_CONFIG_KEY, credentials_to_dict(creds))
 
 
-async def delete_credentials(conn) -> None:
-    await conn.execute("SELECT delete_config_key($1)", ANTHROPIC_SETUP_TOKEN_CONFIG_KEY)
+def delete_credentials() -> None:
+    from core.auth.store import delete_auth
+    delete_auth(ANTHROPIC_SETUP_TOKEN_CONFIG_KEY)

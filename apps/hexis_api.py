@@ -175,12 +175,13 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
                 include_identity=True,
                 include_worldview=True,
                 include_emotional_state=True,
+                include_goals=True,
                 include_drives=True,
             )
             if context.memories:
                 await mem_client.touch_memories([m.id for m in context.memories])
 
-            memory_context = format_context_for_prompt(context)
+            memory_context = format_context_for_prompt(context, max_memories=10)
 
             # Log memory recall
             if context.memories:
@@ -399,10 +400,10 @@ async def init_consent_request(req: InitConsentRequest):
     existing: dict[str, Any] | None = None
     if provider == "openai-codex":
         async with pool.acquire() as conn:
-            from core.openai_codex_oauth import ensure_fresh_openai_codex_credentials
+            from core.auth.openai_codex import ensure_fresh_openai_codex_credentials
 
             try:
-                creds = await ensure_fresh_openai_codex_credentials(conn)
+                creds = await ensure_fresh_openai_codex_credentials()
             except Exception as exc:
                 return JSONResponse({"error": str(exc)}, status_code=400)
 
