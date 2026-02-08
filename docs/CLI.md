@@ -23,7 +23,7 @@ hexis chat
 
 Notes:
 
-- `openai-codex` is **ChatGPT subscription OAuth** (no API key). See `docs/OAUTH_OPENAI_CODEX.md`.
+- `openai-codex` is **ChatGPT subscription OAuth** (no API key). See [AUTH.md](AUTH.md) for all supported providers.
 - To enable autonomy (optional): `hexis up --profile active`
 
 ### Stack Lifecycle
@@ -35,15 +35,21 @@ hexis logs -f api
 hexis down
 ```
 
-### OAuth Login / Status / Logout (Codex)
+### Auth Login / Status / Logout
 
 ```bash
-hexis auth openai-codex login
-hexis auth openai-codex status
-hexis auth openai-codex logout
+# Each provider supports: login (or setup-token), status, logout
+hexis auth openai-codex login|status|logout
+hexis auth anthropic setup-token|status|logout
+hexis auth chutes login|status|logout
+hexis auth github-copilot login|status|logout
+hexis auth qwen-portal login|status|logout
+hexis auth minimax-portal login|status|logout
+hexis auth google-gemini-cli login|status|logout
+hexis auth google-antigravity login|status|logout
 ```
 
-If you use `hexis init --provider openai-codex`, init will trigger login automatically if needed.
+If you use `hexis init --provider openai-codex`, init will trigger login automatically if needed. For full auth documentation, see [AUTH.md](AUTH.md).
 
 ## Ingestion Guide (Practical)
 
@@ -142,17 +148,27 @@ options:
 
 ```text
 usage: hexis auth [-h] [--dsn DSN] [--wait-seconds WAIT_SECONDS]
-                  {openai-codex} ...
+                  {openai-codex,anthropic,chutes,github-copilot,
+                   qwen-portal,minimax-portal,google-gemini-cli,
+                   google-antigravity} ...
 
 positional arguments:
-  {openai-codex}
     openai-codex        ChatGPT Plus/Pro (Codex OAuth)
+    anthropic           Anthropic setup-token (Claude Code)
+    chutes              Chutes OAuth (PKCE)
+    github-copilot      GitHub Copilot (device code)
+    qwen-portal         Qwen Portal (device code)
+    minimax-portal      MiniMax Portal (user code + PKCE)
+    google-gemini-cli   Google Gemini CLI (OAuth PKCE)
+    google-antigravity  Google Antigravity (OAuth PKCE)
 
 options:
   -h, --help            show this help message and exit
   --dsn DSN             Postgres DSN; defaults to POSTGRES_* env vars
   --wait-seconds WAIT_SECONDS
 ```
+
+For detailed documentation on each provider, see [AUTH.md](AUTH.md).
 
 ### `hexis auth openai-codex`
 

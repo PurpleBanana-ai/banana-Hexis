@@ -1,0 +1,251 @@
+"""HTTP-based Anthropic Messages client.
+
+Supports two auth modes:
+- ``api-key``: Standard ``x-api-key`` header (used by MiniMax Portal).
+- ``setup-token``: Bearer auth with Claude Code headers (used by Anthropic setup-token).
+
+The official ``anthropic`` Python SDK does not support Bearer / setup-token auth,
+so this module implements the Messages API via raw ``httpx`` requests.
+"""
+
+from __future__ import annotations
+
+import json
+import uuid
+from typing import Any
+
+import httpx
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
+_ANTHROPIC_VERSION = "2023-06-01"
+_ANTHROPIC_BETA = "claude-code-20250219,oauth-2025-04-20"
+_CLAUDE_CODE_USER_AGENT = "claude-cli/2.1.2 (external, cli)"
+_CLAUDE_CODE_IDENTITY = (
+    "You are Claude Code, made by Anthropic. "
+    "You are an interactive agent that helps users with software engineering tasks."
+)
+
+
+# ---------------------------------------------------------------------------
+# Internal helpers
+# ---------------------------------------------------------------------------
+
+def _build_headers(api_key: str, auth_mode: str) -> dict[str, str]:
+    if auth_mode == "setup-token":
+        return {
+            "Authorization": f"Bearer {api_key}",
+            "anthropic-version": _ANTHROPIC_VERSION,
+            "anthropic-beta": _ANTHROPIC_BETA,
+            "user-agent": _CLAUDE_CODE_USER_AGENT,
+            "x-app": "cli",
+            "Content-Type": "application/json",
+        }
+    # api-key mode (MiniMax, standard Anthropic)
+    return {
+        "x-api-key": api_key,
+        "anthropic-version": _ANTHROPIC_VERSION,
+        "Content-Type": "application/json",
+    }
+
+
+def _convert_tools(tools: list[dict[str, Any]] | None) -> list[dict[str, Any]]:
+    """Convert OpenAI-format tools to Anthropic Messages tool format."""
+    if not tools:
+        return []
+    result: list[dict[str, Any]] = []
+    for tool in tools:
+        fn = tool.get("function", {})
+        result.append({
+            "name": fn.get("name", ""),
+            "description": fn.get("description", ""),
+            "input_schema": fn.get("parameters") or {"type": "object", "properties": {}},
+        })
+    return result
+
+
+def _build_system_prompt(system_prompt: str | None, auth_mode: str) -> str | None:
+    if auth_mode == "setup-token":
+        parts = [_CLAUDE_CODE_IDENTITY]
+        if system_prompt:
+            parts.append(system_prompt)
+        return "\n\n".join(parts)
+    return system_prompt
+
+
+def _build_request_body(
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    *,
+    auth_mode: str,
+    max_tokens: int,
+    system_prompt: str | None,
+    stream: bool = False,
+) -> dict[str, Any]:
+    body: dict[str, Any] = {
+        "model": model,
+        "messages": messages,
+        "max_tokens": max_tokens,
+    }
+    sys = _build_system_prompt(system_prompt, auth_mode)
+    if sys:
+        body["system"] = sys
+    anthropic_tools = _convert_tools(tools)
+    if anthropic_tools:
+        body["tools"] = anthropic_tools
+    if stream:
+        body["stream"] = True
+    return body
+
+
+def _parse_response(data: dict[str, Any]) -> dict[str, Any]:
+    """Parse a non-streaming Anthropic Messages response into {content, tool_calls, raw}."""
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    for block in data.get("content") or []:
+        btype = block.get("type", "")
+        if btype == "text":
+            text_parts.append(block.get("text", ""))
+        elif btype == "tool_use":
+            tool_calls.append({
+                "id": block.get("id") or str(uuid.uuid4()),
+                "name": block.get("name", ""),
+                "arguments": block.get("input") or {},
+            })
+    return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": data}
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
+
+async def anthropic_http_completion(
+    endpoint: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    *,
+    auth_mode: str = "api-key",
+    max_tokens: int = 16384,
+    system_prompt: str | None = None,
+) -> dict[str, Any]:
+    """Non-streaming Anthropic Messages completion via HTTP."""
+    url = f"{endpoint.rstrip('/')}/v1/messages"
+    headers = _build_headers(api_key, auth_mode)
+    body = _build_request_body(
+        model, messages, tools,
+        auth_mode=auth_mode, max_tokens=max_tokens,
+        system_prompt=system_prompt, stream=False,
+    )
+
+    timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        resp = await client.post(url, headers=headers, json=body)
+    if resp.status_code < 200 or resp.status_code >= 300:
+        raise RuntimeError(
+            f"Anthropic HTTP request failed: HTTP {resp.status_code}: {resp.text}"
+        )
+    return _parse_response(resp.json())
+
+
+async def stream_anthropic_http_completion(
+    endpoint: str,
+    api_key: str,
+    model: str,
+    messages: list[dict[str, Any]],
+    tools: list[dict[str, Any]] | None,
+    *,
+    auth_mode: str = "api-key",
+    max_tokens: int = 16384,
+    system_prompt: str | None = None,
+    on_text_delta: Any | None = None,
+) -> dict[str, Any]:
+    """Streaming Anthropic Messages completion via HTTP SSE.
+
+    Returns the same shape as ``anthropic_http_completion()``.
+    Optionally calls ``on_text_delta(text)`` for each text token.
+    """
+    import asyncio
+
+    url = f"{endpoint.rstrip('/')}/v1/messages"
+    headers = _build_headers(api_key, auth_mode)
+    body = _build_request_body(
+        model, messages, tools,
+        auth_mode=auth_mode, max_tokens=max_tokens,
+        system_prompt=system_prompt, stream=True,
+    )
+
+    text_parts: list[str] = []
+    tool_calls: list[dict[str, Any]] = []
+    current_tool: dict[str, Any] | None = None
+
+    timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        async with client.stream("POST", url, headers=headers, json=body) as resp:
+            if resp.status_code < 200 or resp.status_code >= 300:
+                error_text = await resp.aread()
+                raise RuntimeError(
+                    f"Anthropic HTTP request failed: HTTP {resp.status_code}: "
+                    f"{error_text.decode('utf-8', errors='replace')}"
+                )
+
+            # Parse SSE events
+            async for line in resp.aiter_lines():
+                if not line.startswith("data: "):
+                    continue
+                data_str = line[6:].strip()
+                if not data_str or data_str == "[DONE]":
+                    continue
+                try:
+                    event = json.loads(data_str)
+                except Exception:
+                    continue
+
+                event_type = event.get("type", "")
+
+                if event_type == "content_block_start":
+                    block = event.get("content_block") or {}
+                    if block.get("type") == "tool_use":
+                        current_tool = {
+                            "id": block.get("id") or str(uuid.uuid4()),
+                            "name": block.get("name", ""),
+                            "arguments_json": "",
+                        }
+
+                elif event_type == "content_block_delta":
+                    delta = event.get("delta") or {}
+                    dtype = delta.get("type", "")
+                    if dtype == "text_delta":
+                        text = delta.get("text", "")
+                        if text:
+                            text_parts.append(text)
+                            if on_text_delta:
+                                result = on_text_delta(text)
+                                if asyncio.iscoroutine(result):
+                                    await result
+                    elif dtype == "input_json_delta" and current_tool is not None:
+                        current_tool["arguments_json"] += delta.get("partial_json", "")
+
+                elif event_type == "content_block_stop":
+                    if current_tool is not None:
+                        raw_args = current_tool["arguments_json"]
+                        try:
+                            args = json.loads(raw_args) if raw_args else {}
+                        except Exception:
+                            args = {}
+                        tool_calls.append({
+                            "id": current_tool["id"],
+                            "name": current_tool["name"],
+                            "arguments": args,
+                        })
+                        current_tool = None
+
+                elif event_type == "error":
+                    msg = (event.get("error") or {}).get("message", "Anthropic streaming error")
+                    raise RuntimeError(msg)
+
+    return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": None}

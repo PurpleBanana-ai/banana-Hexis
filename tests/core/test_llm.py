@@ -23,10 +23,42 @@ def test_normalize_provider_variants():
     assert llm.normalize_provider("openai_chat_completions_endpoint") == "openai-chat-completions-endpoint"
 
 
+def test_normalize_provider_new_aliases():
+    assert llm.normalize_provider("github_copilot") == "github-copilot"
+    assert llm.normalize_provider("qwen_portal") == "qwen-portal"
+    assert llm.normalize_provider("minimax_portal") == "minimax-portal"
+    assert llm.normalize_provider("google_gemini_cli") == "google-gemini-cli"
+    assert llm.normalize_provider("google_antigravity") == "google-antigravity"
+    # Already-hyphenated should pass through
+    assert llm.normalize_provider("github-copilot") == "github-copilot"
+    assert llm.normalize_provider("chutes") == "chutes"
+
+
 def test_normalize_endpoint_defaults():
     assert llm.normalize_endpoint("ollama", None) == "http://localhost:11434/v1"
     assert llm.normalize_endpoint("openai", "  ") is None
     assert llm.normalize_endpoint("openai", " https://example.com ") == "https://example.com"
+
+
+def test_normalize_endpoint_new_providers():
+    assert llm.normalize_endpoint("chutes", None) == "https://api.chutes.ai/v1"
+    assert llm.normalize_endpoint("qwen-portal", None) == "https://portal.qwen.ai/v1"
+    assert llm.normalize_endpoint("google-gemini-cli", None) == "https://cloudcode-pa.googleapis.com"
+    assert llm.normalize_endpoint("google-antigravity", None) == "https://cloudcode-pa.googleapis.com"
+
+
+def test_normalize_llm_config_preserves_auth_mode():
+    cfg = llm.normalize_llm_config({
+        "provider": "anthropic",
+        "model": "claude-sonnet-4-20250514",
+        "auth_mode": "setup-token",
+    })
+    assert cfg["auth_mode"] == "setup-token"
+
+
+def test_normalize_llm_config_no_auth_mode():
+    cfg = llm.normalize_llm_config({"provider": "openai", "model": "gpt-4o"})
+    assert "auth_mode" not in cfg
 
 
 def test_resolve_api_key_from_env(monkeypatch):

@@ -310,6 +310,7 @@ class AgentLoop:
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
                 on_text_delta=_on_text_delta,
+                auth_mode=llm.get("auth_mode"),
             )
         else:
             return await chat_completion(
@@ -321,6 +322,7 @@ class AgentLoop:
                 tools=tools if tools else None,
                 temperature=cfg.temperature,
                 max_tokens=cfg.max_tokens,
+                auth_mode=llm.get("auth_mode"),
             )
 
     async def _execute_loop(

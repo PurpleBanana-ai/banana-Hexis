@@ -16,7 +16,7 @@ This is both an engineering project and a philosophical experiment. For the phil
 - **Autonomous heartbeat** -- The agent wakes on its own, reviews goals, reflects on experience, and reaches out when it has something to say
 - **Energy-budgeted actions** -- Every action has a cost; autonomy is intentional, not unbounded
 - **Identity and worldview** -- Persistent values, beliefs with confidence scores, boundaries, and emotional state
-- **Multi-provider LLM support** -- OpenAI, Anthropic, Grok, Gemini, Ollama, or any OpenAI-compatible endpoint
+- **Multi-provider LLM support** -- OpenAI, Anthropic, Grok, Gemini, Ollama, GitHub Copilot, Chutes, Qwen, MiniMax, or any OpenAI-compatible endpoint. Free-tier OAuth providers supported via `hexis auth`
 - **Configurable tools** -- Web search, filesystem, shell, calendar, email, messaging, MCP servers
 - **Messaging channels** -- Discord, Telegram, Slack, Signal, WhatsApp, iMessage, Matrix
 - **11 preset character cards** -- chara_card_v2 format with portraits, or bring your own
@@ -36,12 +36,30 @@ This flow uses ChatGPT Plus/Pro OAuth (no API key). `hexis init` will open a bro
 
 `hexis init` can also auto-detect API-key providers from the key prefix. It writes the `.env`, starts Docker, pulls the embedding model, configures the character, and runs consent -- all in one command.
 
-For a full CLI reference (including ingestion flows and flags), see [CLI.md](docs/CLI.md). For deeper Codex OAuth details, see [OAUTH_OPENAI_CODEX.md](docs/OAUTH_OPENAI_CODEX.md).
+For a full CLI reference (including ingestion flows and flags), see [CLI.md](docs/CLI.md). For details on all supported auth providers (Codex, Copilot, Chutes, Gemini, Anthropic setup-token, etc.), see [AUTH.md](docs/AUTH.md).
 
-**Other providers:**
+**Other providers (OAuth -- no API key needed):**
 
 ```bash
-# OpenAI Platform (API key; auto-detect provider)
+# GitHub Copilot (device code login)
+hexis init --character jarvis --provider github-copilot --model gpt-4o
+
+# Chutes (free inference)
+hexis init --character hexis --provider chutes --model deepseek-ai/DeepSeek-V3-0324
+
+# Google Gemini CLI
+hexis init --provider google-gemini-cli --model gemini-2.5-flash --character hexis
+
+# Qwen Portal
+hexis init --provider qwen-portal --model qwen-max-latest --character hexis
+```
+
+`hexis init` automatically triggers the login flow for OAuth/device-code providers -- no separate `hexis auth` step needed.
+
+**API-key providers:**
+
+```bash
+# OpenAI Platform (auto-detect provider from key prefix)
 hexis init --character jarvis --api-key sk-...
 
 # OpenAI Platform (explicit provider + model)
@@ -50,7 +68,7 @@ hexis init --character jarvis --provider openai --model gpt-5.2 --api-key sk-...
 # Ollama (fully local, no API key needed)
 hexis init --provider ollama --model llama3.1 --character hexis
 
-# Explicit provider + model
+# Anthropic (explicit provider + model)
 hexis init --provider anthropic --model claude-sonnet-4-20250514 --api-key sk-ant-...
 
 # Express defaults (no character card)
@@ -69,7 +87,7 @@ hexis up --profile active
 
 With the `active` profile, the agent wakes on its own, reviews goals, reflects, and reaches out when it has something to say. Without it, the agent only responds when you talk to it.
 
-> **Note:** You can use any LLM provider (OpenAI, Anthropic, Grok, Gemini, Ollama, or any OpenAI-compatible endpoint) and any embedding service. See [Embedding Model + Dimension](#embedding-model--dimension) for alternatives.
+> **Note:** You can use any LLM provider (OpenAI, Anthropic, Grok, Gemini, Ollama, GitHub Copilot, Chutes, Qwen, MiniMax, or any OpenAI-compatible endpoint) and any embedding service. See [AUTH.md](docs/AUTH.md) for all provider options and [Embedding Model + Dimension](#embedding-model--dimension) for alternatives.
 
 ## Architecture
 
@@ -474,6 +492,18 @@ hexis worker -- --instance myagent --mode heartbeat  # worker for specific insta
 
 # MCP server
 hexis mcp
+
+# Auth (OAuth / device-code / token providers)
+hexis auth openai-codex login           # ChatGPT subscription OAuth
+hexis auth anthropic setup-token        # Claude Code setup token
+hexis auth chutes login                 # Chutes free inference OAuth
+hexis auth github-copilot login         # GitHub Copilot device code
+hexis auth qwen-portal login            # Qwen Portal device code
+hexis auth minimax-portal login         # MiniMax Portal user code
+hexis auth google-gemini-cli login      # Google Gemini CLI OAuth
+hexis auth google-antigravity login     # Google Antigravity OAuth
+hexis auth <provider> status [--json]   # check credential health
+hexis auth <provider> logout [--yes]    # remove stored credentials
 
 # Tools management
 hexis tools list                      # list available tools

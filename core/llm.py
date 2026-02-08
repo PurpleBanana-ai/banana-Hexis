@@ -31,6 +31,9 @@ OPENAI_COMPATIBLE = {
     "openai-chat-completions-endpoint",
     "ollama",
     "grok",
+    "chutes",
+    "github-copilot",
+    "qwen-portal",
 }
 
 # OpenAI Codex (ChatGPT subscription) backend
@@ -433,27 +436,37 @@ def _extract_responses_result(response: Any) -> dict[str, Any]:
     return {"content": content, "tool_calls": tool_calls, "raw": response}
 
 
+_PROVIDER_ALIASES: dict[str, str] = {
+    "openai_chat_completions_endpoint": "openai-chat-completions-endpoint",
+    "openai_codex": "openai-codex",
+    "github_copilot": "github-copilot",
+    "qwen_portal": "qwen-portal",
+    "minimax_portal": "minimax-portal",
+    "google_gemini_cli": "google-gemini-cli",
+    "google_antigravity": "google-antigravity",
+}
+
+
 def normalize_provider(provider: str | None) -> str:
     if not provider:
         return "openai"
     raw = provider.strip().lower()
-    if raw in {"openai_chat_completions_endpoint"}:
-        return "openai-chat-completions-endpoint"
-    if raw in {"openai_codex"}:
-        return "openai-codex"
-    return raw
+    return _PROVIDER_ALIASES.get(raw, raw)
 
 
 def normalize_endpoint(provider: str, endpoint: str | None) -> str | None:
     if endpoint:
         return endpoint.strip() or None
-    if provider == "ollama":
-        return "http://localhost:11434/v1"
-    if provider == "grok":
-        return "https://api.x.ai/v1"
-    if provider == "openai-codex":
-        return _CODEX_DEFAULT_BASE_URL
-    return None
+    _DEFAULTS: dict[str, str] = {
+        "ollama": "http://localhost:11434/v1",
+        "grok": "https://api.x.ai/v1",
+        "openai-codex": _CODEX_DEFAULT_BASE_URL,
+        "chutes": "https://api.chutes.ai/v1",
+        "qwen-portal": "https://portal.qwen.ai/v1",
+        "google-gemini-cli": "https://cloudcode-pa.googleapis.com",
+        "google-antigravity": "https://cloudcode-pa.googleapis.com",
+    }
+    return _DEFAULTS.get(provider)
 
 
 def resolve_api_key(api_key_env: str | None) -> str | None:
@@ -487,12 +500,17 @@ def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = 
         env_name = provider_env_map.get(provider)
         if env_name:
             api_key = os.getenv(env_name)
-    return {
+    result: dict[str, Any] = {
         "provider": provider,
         "model": model,
         "endpoint": endpoint,
         "api_key": api_key,
     }
+    # Preserve auth_mode when set by provider-specific config loaders.
+    auth_mode = config.get("auth_mode")
+    if auth_mode:
+        result["auth_mode"] = auth_mode
+    return result
 
 
 def _extract_system_prompt(messages: list[dict[str, Any]]) -> tuple[str, list[dict[str, Any]]]:
@@ -793,6 +811,7 @@ async def chat_completion(
     temperature: float = 0.7,
     max_tokens: int = 1200,
     response_format: dict[str, Any] | None = None,
+    auth_mode: str | None = None,
 ) -> dict[str, Any]:
     provider = normalize_provider(provider)
     endpoint = normalize_endpoint(provider, endpoint)
@@ -842,7 +861,11 @@ async def chat_completion(
     if provider in OPENAI_COMPATIBLE:
         if openai is None:
             raise RuntimeError("openai package is required for OpenAI-compatible providers.")
-        client = openai.AsyncOpenAI(api_key=api_key, base_url=endpoint)
+        client_kwargs: dict[str, Any] = {"api_key": api_key, "base_url": endpoint}
+        if provider == "github-copilot":
+            from core.auth.github_copilot import COPILOT_REQUEST_HEADERS
+            client_kwargs["default_headers"] = COPILOT_REQUEST_HEADERS
+        client = openai.AsyncOpenAI(**client_kwargs)
 
         # Try Responses API first, fall back to Chat Completions
         if _should_try_responses(endpoint):
@@ -888,6 +911,19 @@ async def chat_completion(
         )
 
     if provider == "anthropic":
+        if auth_mode == "setup-token":
+            from core.providers.anthropic_http import anthropic_http_completion
+            system_prompt, rest = _extract_system_prompt(messages)
+            return await anthropic_http_completion(
+                endpoint=endpoint or "https://api.anthropic.com",
+                api_key=api_key or "",
+                model=model,
+                messages=rest,
+                tools=tools,
+                auth_mode="setup-token",
+                max_tokens=max_tokens,
+                system_prompt=system_prompt or None,
+            )
         if anthropic is None:
             raise RuntimeError("anthropic package is required for Anthropic provider.")
         client = anthropic.AsyncAnthropic(api_key=api_key)
@@ -910,6 +946,36 @@ async def chat_completion(
                 tool_calls.append({"id": block.id, "name": block.name, "arguments": block.input})
         return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": response}
 
+    if provider == "minimax-portal":
+        from core.providers.anthropic_http import anthropic_http_completion
+        system_prompt, rest = _extract_system_prompt(messages)
+        return await anthropic_http_completion(
+            endpoint=endpoint or "https://api.minimax.io/anthropic",
+            api_key=api_key or "",
+            model=model,
+            messages=rest,
+            tools=tools,
+            auth_mode="api-key",
+            max_tokens=max_tokens,
+            system_prompt=system_prompt or None,
+        )
+
+    if provider in {"google-gemini-cli", "google-antigravity"}:
+        from core.providers.google_code_assist import google_code_assist_completion
+        _api_key_data = json.loads(api_key) if api_key else {}
+        access_token = _api_key_data.get("token", api_key or "")
+        project_id = _api_key_data.get("projectId", "")
+        return await google_code_assist_completion(
+            endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
+            access_token=access_token,
+            project_id=project_id,
+            model=model,
+            messages=messages,
+            tools=tools,
+            is_antigravity=(provider == "google-antigravity"),
+            system_prompt=_extract_system_prompt(messages)[0] or None,
+        )
+
     raise ValueError(f"Unsupported provider: {provider}")
 
 
@@ -924,6 +990,7 @@ async def stream_chat_completion(
     temperature: float = 0.7,
     max_tokens: int = 1200,
     on_text_delta: Any | None = None,
+    auth_mode: str | None = None,
 ) -> dict[str, Any]:
     """
     Streaming chat completion that supports tools.
@@ -1003,7 +1070,11 @@ async def stream_chat_completion(
     if provider in OPENAI_COMPATIBLE:
         if openai is None:
             raise RuntimeError("openai package is required for OpenAI-compatible providers.")
-        client = openai.AsyncOpenAI(api_key=api_key, base_url=endpoint)
+        client_kwargs: dict[str, Any] = {"api_key": api_key, "base_url": endpoint}
+        if provider == "github-copilot":
+            from core.auth.github_copilot import COPILOT_REQUEST_HEADERS
+            client_kwargs["default_headers"] = COPILOT_REQUEST_HEADERS
+        client = openai.AsyncOpenAI(**client_kwargs)
 
         # Try Responses API first, fall back to Chat Completions
         if _should_try_responses(endpoint):
@@ -1087,22 +1158,36 @@ async def stream_chat_completion(
         )
 
     if provider == "anthropic":
+        if auth_mode == "setup-token":
+            from core.providers.anthropic_http import stream_anthropic_http_completion
+            system_prompt, rest = _extract_system_prompt(messages)
+            return await stream_anthropic_http_completion(
+                endpoint=endpoint or "https://api.anthropic.com",
+                api_key=api_key or "",
+                model=model,
+                messages=rest,
+                tools=tools,
+                auth_mode="setup-token",
+                max_tokens=max_tokens,
+                system_prompt=system_prompt or None,
+                on_text_delta=on_text_delta,
+            )
         if anthropic is None:
             raise RuntimeError("anthropic package is required for Anthropic provider.")
         client = anthropic.AsyncAnthropic(api_key=api_key)
         system_prompt, rest = _extract_system_prompt(messages)
         anthropic_tools = _anthropic_tools(tools)
-        kwargs: dict[str, Any] = {
+        sdk_kwargs: dict[str, Any] = {
             "model": model,
             "messages": rest,
             "max_tokens": max_tokens,
             "temperature": temperature,
         }
         if system_prompt:
-            kwargs["system"] = system_prompt
+            sdk_kwargs["system"] = system_prompt
         if anthropic_tools:
-            kwargs["tools"] = anthropic_tools
-        async with client.messages.stream(**kwargs) as stream:
+            sdk_kwargs["tools"] = anthropic_tools
+        async with client.messages.stream(**sdk_kwargs) as stream:
             text_parts: list[str] = []
             tool_calls: list[dict[str, Any]] = []
             current_tool: dict[str, Any] | None = None
@@ -1139,6 +1224,39 @@ async def stream_chat_completion(
                             current_tool = None
 
             return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": None}
+
+    if provider == "minimax-portal":
+        from core.providers.anthropic_http import stream_anthropic_http_completion
+        system_prompt, rest = _extract_system_prompt(messages)
+        return await stream_anthropic_http_completion(
+            endpoint=endpoint or "https://api.minimax.io/anthropic",
+            api_key=api_key or "",
+            model=model,
+            messages=rest,
+            tools=tools,
+            auth_mode="api-key",
+            max_tokens=max_tokens,
+            system_prompt=system_prompt or None,
+            on_text_delta=on_text_delta,
+        )
+
+    if provider in {"google-gemini-cli", "google-antigravity"}:
+        from core.providers.google_code_assist import stream_google_code_assist_completion
+        _api_key_data = json.loads(api_key) if api_key else {}
+        access_token = _api_key_data.get("token", api_key or "")
+        project_id = _api_key_data.get("projectId", "")
+        system_prompt = _extract_system_prompt(messages)[0] or None
+        return await stream_google_code_assist_completion(
+            endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
+            access_token=access_token,
+            project_id=project_id,
+            model=model,
+            messages=messages,
+            tools=tools,
+            is_antigravity=(provider == "google-antigravity"),
+            system_prompt=system_prompt,
+            on_text_delta=on_text_delta,
+        )
 
     raise ValueError(f"Unsupported provider: {provider}")
 
@@ -1269,6 +1387,43 @@ async def stream_text_completion(
                     elif event_type in {"error", "response.failed"}:
                         message = event.get("message") or "Codex request failed"
                         raise RuntimeError(str(message))
+        return
+
+    if provider == "minimax-portal":
+        from core.providers.anthropic_http import stream_anthropic_http_completion
+        system_prompt, rest = _extract_system_prompt(messages)
+        result = await stream_anthropic_http_completion(
+            endpoint=endpoint or "https://api.minimax.io/anthropic",
+            api_key=api_key or "",
+            model=model,
+            messages=rest,
+            tools=None,
+            auth_mode="api-key",
+            max_tokens=max_tokens,
+            system_prompt=system_prompt or None,
+        )
+        if result["content"]:
+            yield result["content"]
+        return
+
+    if provider in {"google-gemini-cli", "google-antigravity"}:
+        from core.providers.google_code_assist import stream_google_code_assist_completion
+        _api_key_data = json.loads(api_key) if api_key else {}
+        access_token = _api_key_data.get("token", api_key or "")
+        project_id = _api_key_data.get("projectId", "")
+        system_prompt = _extract_system_prompt(messages)[0] or None
+        result = await stream_google_code_assist_completion(
+            endpoint=endpoint or "https://cloudcode-pa.googleapis.com",
+            access_token=access_token,
+            project_id=project_id,
+            model=model,
+            messages=messages,
+            tools=None,
+            is_antigravity=(provider == "google-antigravity"),
+            system_prompt=system_prompt,
+        )
+        if result["content"]:
+            yield result["content"]
         return
 
     raise ValueError(f"Unsupported provider: {provider}")

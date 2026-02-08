@@ -1,0 +1,228 @@
+"""MiniMax Portal OAuth (user-code + PKCE) auth module."""
+
+from __future__ import annotations
+
+import json
+from dataclasses import dataclass
+from typing import Any
+
+import httpx
+
+from core.auth.utils import advisory_lock_key, create_state, generate_pkce, now_ms
+
+# Constants (from OpenClaw extensions/minimax-portal-auth/oauth.ts)
+MINIMAX_CLIENT_ID = "78257093-7e40-4613-99e0-527b14b39113"
+MINIMAX_SCOPE = "group_id profile model.completion"
+MINIMAX_GRANT_TYPE = "urn:ietf:params:oauth:grant-type:user_code"
+
+MINIMAX_REGIONS: dict[str, str] = {
+    "global": "https://api.minimax.io",
+    "cn": "https://api.minimaxi.com",
+}
+MINIMAX_DEFAULT_REGION = "global"
+
+MINIMAX_PORTAL_CONFIG_KEY = "oauth.minimax_portal"
+_MINIMAX_PORTAL_LOCK_KEY = advisory_lock_key(MINIMAX_PORTAL_CONFIG_KEY)
+
+
+def _base_url(region: str) -> str:
+    return MINIMAX_REGIONS.get(region, MINIMAX_REGIONS["global"])
+
+
+def default_endpoint(region: str) -> str:
+    """Return the Anthropic-compatible API endpoint for the given region."""
+    return f"{_base_url(region)}/anthropic"
+
+
+@dataclass(frozen=True)
+class MiniMaxPortalCredentials:
+    access: str
+    refresh: str
+    expires_ms: int
+    region: str = MINIMAX_DEFAULT_REGION
+    resource_url: str | None = None
+
+
+@dataclass
+class UserCodeResponse:
+    user_code: str
+    verification_uri: str
+    expires_in: int
+    interval: int
+    state: str
+
+
+async def start_user_code_flow(region: str = MINIMAX_DEFAULT_REGION) -> tuple[UserCodeResponse, str]:
+    """Start user-code flow. Returns (response, verifier)."""
+    verifier, challenge = generate_pkce()
+    state = create_state()
+    base = _base_url(region)
+
+    async with httpx.AsyncClient(timeout=30.0) as client:
+        resp = await client.post(
+            f"{base}/oauth/code",
+            headers={"Content-Type": "application/json"},
+            json={
+                "client_id": MINIMAX_CLIENT_ID,
+                "scope": MINIMAX_SCOPE,
+                "response_type": "code",
+                "code_challenge": challenge,
+                "code_challenge_method": "S256",
+                "state": state,
+            },
+        )
+    if resp.status_code < 200 or resp.status_code >= 300:
+        raise RuntimeError(f"MiniMax code request failed: HTTP {resp.status_code}: {resp.text}")
+
+    data = resp.json()
+    resp_state = data.get("state", "")
+    if resp_state != state:
+        raise RuntimeError("MiniMax state mismatch (CSRF check failed).")
+
+    return UserCodeResponse(
+        user_code=data["user_code"],
+        verification_uri=data["verification_uri"],
+        expires_in=int(data.get("expired_in", data.get("expires_in", 300))),
+        interval=int(data.get("interval", 2)),
+        state=state,
+    ), verifier
+
+
+async def poll_for_token(
+    user_code: str,
+    verifier: str,
+    interval_seconds: int,
+    expires_in: int,
+    region: str = MINIMAX_DEFAULT_REGION,
+) -> MiniMaxPortalCredentials:
+    """Poll until user authorizes or flow expires."""
+    import asyncio
+
+    base = _base_url(region)
+    deadline = now_ms() + expires_in * 1000
+    interval_ms = max(1000, interval_seconds * 1000)
+
+    while now_ms() < deadline:
+        async with httpx.AsyncClient(timeout=30.0) as client:
+            resp = await client.post(
+                f"{base}/oauth/token",
+                headers={"Content-Type": "application/json"},
+                json={
+                    "client_id": MINIMAX_CLIENT_ID,
+                    "grant_type": MINIMAX_GRANT_TYPE,
+                    "user_code": user_code,
+                    "code_verifier": verifier,
+                },
+            )
+        data = resp.json()
+
+        status = data.get("status", "")
+        if status == "success" or isinstance(data.get("access_token"), str):
+            access = data.get("access_token") or data.get("access")
+            refresh = data.get("refresh_token") or data.get("refresh", "")
+            # MiniMax uses expired_in (Unix seconds), not ms
+            expires_raw = data.get("expired_in") or data.get("expires_in") or data.get("expires_at")
+            if isinstance(expires_raw, (int, float)):
+                # If value is small enough it's seconds-from-now, else Unix timestamp
+                if expires_raw < 1e10:
+                    expires_ms = now_ms() + int(expires_raw) * 1000
+                else:
+                    expires_ms = int(expires_raw) * 1000
+            else:
+                expires_ms = now_ms() + 3600 * 1000
+
+            return MiniMaxPortalCredentials(
+                access=access,
+                refresh=refresh,
+                expires_ms=expires_ms,
+                region=region,
+                resource_url=data.get("resource_url"),
+            )
+
+        if status == "pending" or data.get("error") == "authorization_pending":
+            await asyncio.sleep(interval_ms / 1000)
+            continue
+        if data.get("error") == "slow_down":
+            interval_ms = int(interval_ms * 1.5)
+            await asyncio.sleep(interval_ms / 1000)
+            continue
+
+        error = data.get("error") or status or "unknown"
+        raise RuntimeError(f"MiniMax auth flow failed: {error}")
+
+    raise RuntimeError("MiniMax auth flow timed out.")
+
+
+# ---------------------------------------------------------------------------
+# DB persistence
+# ---------------------------------------------------------------------------
+
+def credentials_to_dict(creds: MiniMaxPortalCredentials) -> dict[str, Any]:
+    d: dict[str, Any] = {
+        "access": creds.access,
+        "refresh": creds.refresh,
+        "expires_ms": creds.expires_ms,
+        "region": creds.region,
+    }
+    if creds.resource_url:
+        d["resource_url"] = creds.resource_url
+    return d
+
+
+def credentials_from_value(value: Any) -> MiniMaxPortalCredentials | None:
+    if value is None:
+        return None
+    if isinstance(value, str):
+        try:
+            value = json.loads(value)
+        except Exception:
+            return None
+    if not isinstance(value, dict):
+        return None
+    access = value.get("access")
+    refresh = value.get("refresh", "")
+    expires_ms = value.get("expires_ms")
+    if not isinstance(access, str):
+        return None
+    if not isinstance(expires_ms, (int, float)):
+        return None
+    return MiniMaxPortalCredentials(
+        access=access,
+        refresh=refresh,
+        expires_ms=int(expires_ms),
+        region=value.get("region", MINIMAX_DEFAULT_REGION),
+        resource_url=value.get("resource_url"),
+    )
+
+
+async def load_credentials(conn) -> MiniMaxPortalCredentials | None:
+    value = await conn.fetchval("SELECT get_config($1)", MINIMAX_PORTAL_CONFIG_KEY)
+    return credentials_from_value(value)
+
+
+async def save_credentials(conn, creds: MiniMaxPortalCredentials) -> None:
+    await conn.execute(
+        "SELECT set_config($1, $2::jsonb)",
+        MINIMAX_PORTAL_CONFIG_KEY,
+        json.dumps(credentials_to_dict(creds)),
+    )
+
+
+async def delete_credentials(conn) -> None:
+    await conn.execute("SELECT delete_config_key($1)", MINIMAX_PORTAL_CONFIG_KEY)
+
+
+async def ensure_fresh_credentials(conn, *, skew_seconds: int = 300) -> MiniMaxPortalCredentials:
+    """MiniMax refresh is not implemented in OpenClaw; re-auth if expired."""
+    async with conn.transaction():
+        await conn.execute("SELECT pg_advisory_xact_lock($1)", _MINIMAX_PORTAL_LOCK_KEY)
+        creds = await load_credentials(conn)
+        if not creds:
+            raise RuntimeError("MiniMax Portal is not configured. Run: `hexis auth minimax-portal login`")
+        from core.auth.utils import needs_refresh as _needs_refresh
+
+        if not _needs_refresh(creds.expires_ms, skew_seconds):
+            return creds
+        raise RuntimeError(
+            "MiniMax Portal credentials have expired. Run: `hexis auth minimax-portal login`"
+        )

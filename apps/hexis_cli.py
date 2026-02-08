@@ -421,25 +421,8 @@ def build_parser() -> argparse.ArgumentParser:
     # -- Auth (OAuth / subscription flows) --
     auth = sub.add_parser("auth", parents=[_db], help="Manage provider authentication (OAuth)")
     auth_sub = auth.add_subparsers(dest="auth_command")
-
-    # OpenAI Codex (ChatGPT subscription OAuth)
-    oai_codex = auth_sub.add_parser("openai-codex", parents=[_db], help="ChatGPT Plus/Pro (Codex OAuth)")
-    oai_codex_sub = oai_codex.add_subparsers(dest="openai_codex_command")
-
-    oai_codex_login = oai_codex_sub.add_parser("login", parents=[_db], help="Login via browser OAuth (PKCE)")
-    oai_codex_login.add_argument("--no-open", action="store_true", help="Don't open browser automatically")
-    oai_codex_login.add_argument("--timeout-seconds", type=int, default=60, help="Callback wait timeout (default: 60)")
-    oai_codex_login.set_defaults(func="auth_openai_codex_login")
-
-    oai_codex_status = oai_codex_sub.add_parser("status", parents=[_db], help="Show current OAuth status")
-    oai_codex_status.add_argument("--json", action="store_true", help="Output JSON")
-    oai_codex_status.set_defaults(func="auth_openai_codex_status")
-
-    oai_codex_logout = oai_codex_sub.add_parser("logout", parents=[_db], help="Delete stored OAuth credentials")
-    oai_codex_logout.add_argument("--yes", "-y", action="store_true", help="Skip confirmation prompt")
-    oai_codex_logout.set_defaults(func="auth_openai_codex_logout")
-
-    oai_codex.set_defaults(func="auth_openai_codex")
+    from apps.cli_auth import register_auth_subparsers
+    register_auth_subparsers(auth_sub, _db)
     auth.set_defaults(func="auth")
 
     # -- Tools subcommand --
@@ -1211,225 +1194,6 @@ def _get_dsn(args) -> str:
     if args.instance:
         return db_dsn_from_env(args.instance)
     return db_dsn_from_env()
-
-
-async def _auth_openai_codex_login(dsn: str, wait_seconds: int, no_open: bool, timeout_seconds: int) -> int:
-    """
-    Interactive PKCE OAuth login for OpenAI Codex (ChatGPT subscription).
-    Stores credentials in Postgres config under `oauth.openai_codex`.
-    """
-    import queue
-    import threading
-    import time
-    import webbrowser
-    from http.server import BaseHTTPRequestHandler
-    from socketserver import TCPServer
-    from urllib.parse import parse_qs, urlparse
-
-    from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
-    from core.openai_codex_oauth import (
-        build_authorize_url,
-        create_state,
-        ensure_fresh_openai_codex_credentials,
-        exchange_authorization_code,
-        generate_pkce,
-        parse_authorization_input,
-        save_openai_codex_credentials,
-    )
-
-    verifier, challenge = generate_pkce()
-    state = create_state()
-    auth_url = build_authorize_url(challenge=challenge, state=state)
-
-    # Try to start local callback server (best-effort).
-    code_queue: queue.Queue[str] = queue.Queue(maxsize=1)
-    server: TCPServer | None = None
-
-    class Handler(BaseHTTPRequestHandler):
-        def log_message(self, *_args, **_kwargs):  # noqa: ANN001
-            return
-
-        def do_GET(self):  # noqa: N802
-            try:
-                parsed = urlparse(self.path or "")
-                if parsed.path != "/auth/callback":
-                    self.send_response(404)
-                    self.end_headers()
-                    self.wfile.write(b"Not found")
-                    return
-
-                qs = parse_qs(parsed.query)
-                req_state = (qs.get("state") or [""])[0]
-                code = (qs.get("code") or [""])[0]
-
-                if req_state != state:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b"State mismatch")
-                    return
-
-                if not code:
-                    self.send_response(400)
-                    self.end_headers()
-                    self.wfile.write(b"Missing authorization code")
-                    return
-
-                self.send_response(200)
-                self.send_header("Content-Type", "text/html; charset=utf-8")
-                self.end_headers()
-                self.wfile.write(
-                    b"<!doctype html><html><body><p>Authentication successful. Return to your terminal.</p></body></html>"
-                )
-                try:
-                    code_queue.put_nowait(code)
-                except Exception:
-                    pass
-            except Exception:
-                self.send_response(500)
-                self.end_headers()
-                self.wfile.write(b"Internal error")
-
-    def start_server() -> TCPServer | None:
-        try:
-            # Bind to 127.0.0.1:1455 (redirect URI uses localhost:1455).
-            srv = TCPServer(("127.0.0.1", 1455), Handler)
-            return srv
-        except OSError:
-            return None
-
-    server = start_server()
-    thread: threading.Thread | None = None
-    if server is not None:
-        def _serve() -> None:
-            with server:
-                server.serve_forever(poll_interval=0.1)
-
-        thread = threading.Thread(target=_serve, daemon=True)
-        thread.start()
-    else:
-        console.print(
-            "[yellow]Could not bind http://127.0.0.1:1455 for OAuth callback. "
-            "Continuing with manual paste flow.[/yellow]"
-        )
-
-    console.print("\n[bold]OpenAI Codex OAuth[/bold]")
-    console.print("1. A browser window should open. Sign in to ChatGPT and approve.")
-    console.print("2. If the callback page fails to load, copy the browser URL and paste it here.\n")
-    console.print(f"[dim]{auth_url}[/dim]\n")
-
-    if not no_open:
-        try:
-            webbrowser.open(auth_url)
-        except Exception:
-            pass
-
-    code: str | None = None
-    if server is not None:
-        try:
-            code = code_queue.get(timeout=max(5, int(timeout_seconds)))
-        except Exception:
-            code = None
-        try:
-            server.shutdown()
-        except Exception:
-            pass
-        if thread is not None:
-            thread.join(timeout=1.0)
-
-    if not code:
-        try:
-            pasted = input("Paste the authorization code (or full redirect URL): ").strip()
-        except (KeyboardInterrupt, EOFError):
-            console.print("\n[dim]Aborted.[/dim]")
-            return 1
-        parsed_code, parsed_state = parse_authorization_input(pasted)
-        if parsed_state and parsed_state != state:
-            _print_err("State mismatch. Ensure you pasted the redirect URL from this login attempt.")
-            return 1
-        code = parsed_code
-
-    if not code:
-        _print_err("Missing authorization code.")
-        return 1
-
-    console.print("[accent]Exchanging code for tokens...[/accent]")
-    creds = await exchange_authorization_code(code=code, verifier=verifier)
-
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await save_openai_codex_credentials(conn, creds)
-        # Verify refresh works now so we fail fast if the token is unusable.
-        await ensure_fresh_openai_codex_credentials(conn, skew_seconds=0)
-    finally:
-        await conn.close()
-
-    expires_sec = max(0, int((creds.expires_ms - int(time.time() * 1000)) / 1000))
-    console.print(f"[ok]Logged in.[/ok] account_id={creds.account_id} expires_in~{expires_sec}s")
-    return 0
-
-
-async def _auth_openai_codex_status(dsn: str, wait_seconds: int, *, as_json: bool) -> int:
-    import datetime as _dt
-    import time
-
-    from core.agent_api import _connect_with_retry
-    from core.openai_codex_oauth import load_openai_codex_credentials
-
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        creds = await load_openai_codex_credentials(conn)
-    finally:
-        await conn.close()
-
-    if not creds:
-        if as_json:
-            sys.stdout.write(json.dumps({"configured": False}, indent=2, sort_keys=True) + "\n")
-        else:
-            sys.stdout.write("not logged in\n")
-        return 0
-
-    now_ms = int(time.time() * 1000)
-    expires_in_s = int((creds.expires_ms - now_ms) / 1000)
-    expires_at = _dt.datetime.fromtimestamp(creds.expires_ms / 1000, tz=_dt.timezone.utc).isoformat()
-
-    payload = {
-        "configured": True,
-        "account_id": creds.account_id,
-        "expires_at": expires_at,
-        "expires_in_seconds": expires_in_s,
-    }
-
-    if as_json:
-        sys.stdout.write(json.dumps(payload, indent=2, sort_keys=True) + "\n")
-    else:
-        sys.stdout.write(f"account_id={creds.account_id} expires_in={expires_in_s}s\n")
-    return 0
-
-
-async def _auth_openai_codex_logout(dsn: str, wait_seconds: int, yes: bool) -> int:
-    from apps.cli_theme import console
-    from core.agent_api import _connect_with_retry
-    from core.openai_codex_oauth import delete_openai_codex_credentials
-
-    if not yes:
-        try:
-            answer = input("Delete stored OpenAI Codex OAuth credentials? Type 'yes' to confirm: ").strip().lower()
-        except (KeyboardInterrupt, EOFError):
-            console.print("\n[dim]Aborted.[/dim]")
-            return 1
-        if answer != "yes":
-            console.print("[dim]Aborted.[/dim]")
-            return 1
-
-    conn = await _connect_with_retry(dsn, wait_seconds=wait_seconds)
-    try:
-        await delete_openai_codex_credentials(conn)
-    finally:
-        await conn.close()
-
-    console.print("[ok]Deleted OAuth credentials.[/ok]")
-    return 0
 
 
 async def _channels_status(dsn: str, as_json: bool) -> int:
@@ -2574,24 +2338,14 @@ def main(argv: list[str] | None = None) -> int:
         sys.stdout.write("ok\n")
         return 0
 
-    # Auth commands (OAuth / subscription flows)
-    if func == "auth":
-        # Default: show OpenAI Codex status.
+    # Auth commands (OAuth / subscription flows) — delegated to cli_auth
+    if func.startswith("auth"):
+        from apps.cli_auth import dispatch_auth_command
+
         dsn = _get_dsn(args)
-        return asyncio.run(_auth_openai_codex_status(dsn, args.wait_seconds, as_json=False))
-    if func == "auth_openai_codex":
-        # Default: show status.
-        dsn = _get_dsn(args)
-        return asyncio.run(_auth_openai_codex_status(dsn, args.wait_seconds, as_json=False))
-    if func == "auth_openai_codex_login":
-        dsn = _get_dsn(args)
-        return asyncio.run(_auth_openai_codex_login(dsn, args.wait_seconds, args.no_open, args.timeout_seconds))
-    if func == "auth_openai_codex_status":
-        dsn = _get_dsn(args)
-        return asyncio.run(_auth_openai_codex_status(dsn, args.wait_seconds, as_json=bool(args.json)))
-    if func == "auth_openai_codex_logout":
-        dsn = _get_dsn(args)
-        return asyncio.run(_auth_openai_codex_logout(dsn, args.wait_seconds, args.yes))
+        result = dispatch_auth_command(func, args, dsn)
+        if result is not None:
+            return result
 
     # Tools commands
     if func == "tools_list":

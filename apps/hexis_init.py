@@ -38,6 +38,12 @@ _DEFAULT_MODELS: dict[str, str] = {
     "grok": "grok-3",
     "gemini": "gemini-2.5-flash",
     "ollama": "llama3.1",
+    "chutes": "deepseek-ai/DeepSeek-V3-0324",
+    "github-copilot": "gpt-4o",
+    "qwen-portal": "qwen-max-latest",
+    "minimax-portal": "MiniMax-M1",
+    "google-gemini-cli": "gemini-2.5-flash",
+    "google-antigravity": "gemini-2.5-flash",
 }
 
 _PROVIDER_ENV_VARS: dict[str, str] = {
@@ -47,6 +53,18 @@ _PROVIDER_ENV_VARS: dict[str, str] = {
     "grok": "XAI_API_KEY",
     "gemini": "GEMINI_API_KEY",
     "ollama": "",
+    "chutes": "",
+    "github-copilot": "",
+    "qwen-portal": "",
+    "minimax-portal": "",
+    "google-gemini-cli": "",
+    "google-antigravity": "",
+}
+
+# Providers that use OAuth / device-code / token auth (no API key needed).
+_OAUTH_PROVIDERS: set[str] = {
+    "openai-codex", "chutes", "github-copilot", "qwen-portal",
+    "minimax-portal", "google-gemini-cli", "google-antigravity",
 }
 
 
@@ -67,40 +85,84 @@ def detect_provider(api_key: str) -> str:
 
 def _normalize_provider_name(provider: str | None) -> str:
     raw = (provider or "").strip().lower()
-    if raw in {"openai_codex"}:
-        return "openai-codex"
-    return raw
+    _ALIASES = {
+        "openai_codex": "openai-codex",
+        "github_copilot": "github-copilot",
+        "qwen_portal": "qwen-portal",
+        "minimax_portal": "minimax-portal",
+        "google_gemini_cli": "google-gemini-cli",
+        "google_antigravity": "google-antigravity",
+    }
+    return _ALIASES.get(raw, raw)
 
 
-async def _ensure_openai_codex_oauth(dsn: str, conn: Any, *, wait_seconds: int) -> None:
+async def _ensure_oauth_login(provider: str, dsn: str, conn: Any, *, wait_seconds: int) -> None:
     """
-    Ensure ChatGPT subscription (Codex) OAuth credentials exist in the DB.
+    Ensure OAuth/device-code/token credentials exist for the given provider.
 
-    This is used by `hexis init` so the README quick start can use OAuth with:
-      hexis init --provider openai-codex --model gpt-5.2
+    Called by `hexis init` so the Quick Start can use OAuth providers without
+    a separate `hexis auth <provider> login` step.
     """
-    from core.openai_codex_oauth import load_openai_codex_credentials
+    # Map provider -> (module path, load function name)
+    _LOADERS: dict[str, tuple[str, str]] = {
+        "openai-codex":       ("core.auth.openai_codex",      "load_openai_codex_credentials"),
+        "chutes":             ("core.auth.chutes",             "load_chutes_credentials"),
+        "github-copilot":     ("core.auth.github_copilot",     "load_github_copilot_credentials"),
+        "qwen-portal":        ("core.auth.qwen_portal",        "load_qwen_portal_credentials"),
+        "minimax-portal":     ("core.auth.minimax_portal",     "load_minimax_portal_credentials"),
+        "google-gemini-cli":  ("core.auth.google_gemini_cli",  "load_google_gemini_cli_credentials"),
+        "google-antigravity": ("core.auth.google_antigravity", "load_google_antigravity_credentials"),
+    }
 
-    existing = await load_openai_codex_credentials(conn)
+    entry = _LOADERS.get(provider)
+    if not entry:
+        return
+
+    import importlib
+    mod = importlib.import_module(entry[0])
+    load_fn = getattr(mod, entry[1])
+    existing = await load_fn(conn)
     if existing:
         return
 
-    console.print("[muted]Starting ChatGPT Codex OAuth login...[/muted]")
+    display = provider.replace("-", " ").title()
+    console.print(f"[muted]Starting {display} login...[/muted]")
 
-    # Reuse the CLI's battle-tested OAuth login flow (local callback server + manual paste fallback).
-    from apps.hexis_cli import _auth_openai_codex_login
-
-    timeout_seconds = int(os.getenv("OPENAI_CODEX_OAUTH_TIMEOUT_SECONDS", "180"))
-    no_open = os.getenv("OPENAI_CODEX_OAUTH_NO_OPEN", "").strip().lower() in {"1", "true", "yes", "y"}
-
-    rc = await _auth_openai_codex_login(
-        dsn,
-        wait_seconds,
-        no_open=no_open,
-        timeout_seconds=timeout_seconds,
+    # Call the async login handler directly (we're already in an event loop).
+    from apps.cli_auth import (
+        _openai_codex_login, _chutes_login, _github_copilot_login,
+        _qwen_portal_login, _minimax_portal_login,
+        _google_gemini_cli_login, _google_antigravity_login,
     )
+
+    ns = argparse.Namespace(
+        no_open=False,
+        timeout_seconds=180,
+        manual=False,
+    )
+
+    if provider == "openai-codex":
+        rc = await _openai_codex_login(dsn, wait_seconds, no_open=False, timeout_seconds=180)
+    elif provider == "chutes":
+        ns.client_id = None
+        rc = await _chutes_login(dsn, wait_seconds, ns)
+    elif provider == "github-copilot":
+        ns.enterprise_domain = "github.com"
+        rc = await _github_copilot_login(dsn, wait_seconds, ns)
+    elif provider == "qwen-portal":
+        rc = await _qwen_portal_login(dsn, wait_seconds, ns)
+    elif provider == "minimax-portal":
+        ns.region = "global"
+        rc = await _minimax_portal_login(dsn, wait_seconds, ns)
+    elif provider == "google-gemini-cli":
+        rc = await _google_gemini_cli_login(dsn, wait_seconds, ns)
+    elif provider == "google-antigravity":
+        rc = await _google_antigravity_login(dsn, wait_seconds, ns)
+    else:
+        return
+
     if rc != 0:
-        raise RuntimeError("OpenAI Codex OAuth login failed")
+        raise RuntimeError(f"{display} login failed")
 
 
 async def _load_llm_config_for_consent(
@@ -111,8 +173,8 @@ async def _load_llm_config_for_consent(
     provider: str,
     model: str,
 ) -> dict[str, Any]:
-    if provider == "openai-codex":
-        await _ensure_openai_codex_oauth(dsn, conn, wait_seconds=wait_seconds)
+    if provider in _OAUTH_PROVIDERS:
+        await _ensure_oauth_login(provider, dsn, conn, wait_seconds=wait_seconds)
 
     from core.llm_config import load_llm_config
 
@@ -230,7 +292,7 @@ async def _run_init_noninteractive(args: argparse.Namespace) -> int:
             provider = "ollama"
     provider = _normalize_provider_name(provider)
 
-    if provider not in {"ollama", "openai-codex"} and not args.api_key:
+    if provider not in (_OAUTH_PROVIDERS | {"ollama"}) and not args.api_key:
         err_console.print(f"[fail]--api-key required for provider '{provider}'[/fail]")
         return 1
 
@@ -464,13 +526,13 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
     heading("LLM Configuration")
 
     provider = _prompt(
-        "Model provider (openai|openai-codex|anthropic|openai_compatible|ollama|grok|gemini)",
+        "Provider (openai, openai-codex, anthropic, ollama, chutes, github-copilot, qwen-portal, ...)",
         default=os.getenv("LLM_PROVIDER", "openai"),
         required=True,
     )
     provider = _normalize_provider_name(provider)
 
-    default_model = os.getenv("LLM_MODEL") or ("gpt-5.2" if provider == "openai-codex" else "gpt-4o")
+    default_model = os.getenv("LLM_MODEL") or _DEFAULT_MODELS.get(provider, "gpt-4o")
     model = _prompt(
         "Model",
         default=default_model,
@@ -478,11 +540,11 @@ async def _configure_llm(conn: Any, *, dsn: str, wait_seconds: int) -> dict[str,
     )
     endpoint = _prompt(
         "Endpoint (blank for provider default)",
-        default="" if provider == "openai-codex" else os.getenv("OPENAI_BASE_URL", ""),
+        default="" if provider in _OAUTH_PROVIDERS else os.getenv("OPENAI_BASE_URL", ""),
     )
     api_key_env = _prompt(
         "API key env var name (e.g. OPENAI_API_KEY)",
-        default="OPENAI_API_KEY" if provider in {"openai", "openai_compatible"} else "",
+        default=_PROVIDER_ENV_VARS.get(provider, "") or ("OPENAI_API_KEY" if provider in {"openai", "openai_compatible"} else ""),
     )
 
     use_separate_sub = _prompt_yes_no("Use separate subconscious model?", default=False)
