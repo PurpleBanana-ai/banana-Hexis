@@ -212,6 +212,7 @@ _HELP_GROUPS = [
         ("config", "Show/validate agent configuration"),
         ("auth", "Login/logout for subscription OAuth providers"),
         ("tools", "Manage tools configuration"),
+        ("characters", "Manage character cards"),
         ("consents", "Manage consent certificates"),
         ("channels", "Manage channel adapters"),
     ]),
@@ -488,6 +489,51 @@ def build_parser() -> argparse.ArgumentParser:
     ch_setup.set_defaults(func="channels_setup")
 
     channels.set_defaults(func="channels")
+
+    # -- Characters subcommand --
+    characters = sub.add_parser("characters", help="Manage character cards")
+    char_sub = characters.add_subparsers(dest="characters_command")
+
+    char_list = char_sub.add_parser("list", help="List available character cards")
+    char_list.add_argument("--json", action="store_true", help="Output JSON")
+    char_list.set_defaults(func="characters_list")
+
+    char_show = char_sub.add_parser("show", help="Show character card details")
+    char_show.add_argument("name", help="Character name or filename (without .json)")
+    char_show.set_defaults(func="characters_show")
+
+    char_create = char_sub.add_parser("create", help="Create a new character card")
+    char_create.add_argument("--name", required=True, help="Character name")
+    char_create.add_argument("--voice", default="", help="Voice description")
+    char_create.add_argument("--description", "-d", default="", help="Character description")
+    char_create.add_argument("--purpose", default="", help="Character purpose")
+    char_create.add_argument("--pronouns", default="they/them", help="Pronouns (default: they/them)")
+    char_create.add_argument("--values", default="", help="Comma-separated values")
+    char_create.add_argument("--interests", default="", help="Comma-separated interests")
+    char_create.add_argument("--goals", default="", help="Comma-separated goals")
+    char_create.add_argument("--boundaries", default="", help="Comma-separated boundaries")
+    char_create.add_argument("--personality", default="", help="Personality description")
+    char_create.add_argument("--openness", type=float, default=0.5, help="Big Five: openness (0-1)")
+    char_create.add_argument("--conscientiousness", type=float, default=0.5, help="Big Five: conscientiousness (0-1)")
+    char_create.add_argument("--extraversion", type=float, default=0.5, help="Big Five: extraversion (0-1)")
+    char_create.add_argument("--agreeableness", type=float, default=0.5, help="Big Five: agreeableness (0-1)")
+    char_create.add_argument("--neuroticism", type=float, default=0.5, help="Big Five: neuroticism (0-1)")
+    char_create.add_argument("--metaphysics", default="", help="Worldview: metaphysics")
+    char_create.add_argument("--human-nature", default="", help="Worldview: human nature")
+    char_create.add_argument("--epistemology", default="", help="Worldview: epistemology")
+    char_create.add_argument("--ethics", default="", help="Worldview: ethics")
+    char_create.set_defaults(func="characters_create")
+
+    char_import = char_sub.add_parser("import", help="Import a character card file")
+    char_import.add_argument("path", help="Path to .json character card file")
+    char_import.set_defaults(func="characters_import")
+
+    char_export = char_sub.add_parser("export", parents=[_db], help="Export current agent identity as a character card")
+    char_export.add_argument("name", help="Name for the exported card")
+    char_export.add_argument("--output", "-o", default=None, help="Output path (default: ~/.hexis/characters/<name>.json)")
+    char_export.set_defaults(func="characters_export")
+
+    characters.set_defaults(func="characters")
 
     # -- Recall command --
     recall = sub.add_parser("recall", parents=[_db], help="Search memories by semantic query")
@@ -1173,6 +1219,313 @@ def _consents_revoke(model_spec: str, reason: str) -> int:
     except ValueError as e:
         _print_err(str(e))
         return 1
+
+
+def _characters_list(as_json: bool) -> int:
+    """List available character cards."""
+    from core.init_api import load_character_cards, PACKAGE_CHARACTERS_DIR, USER_CHARACTERS_DIR
+
+    cards = load_character_cards()
+
+    if as_json:
+        sys.stdout.write(json.dumps(cards, indent=2) + "\n")
+    else:
+        from apps.cli_theme import console as _con, make_table as _mt
+
+        if not cards:
+            _con.print("[muted]No character cards found.[/muted]")
+        else:
+            table = _mt(
+                ("Name", {"style": "bold"}),
+                "Source",
+                "Voice",
+                "Values",
+                title="Characters",
+            )
+            for card in cards:
+                source = "custom" if card.get("source_dir") == str(USER_CHARACTERS_DIR) else "preset"
+                source_styled = f"[accent]{source}[/accent]" if source == "custom" else f"[muted]{source}[/muted]"
+                voice = card.get("voice", "")
+                if len(voice) > 40:
+                    voice = voice[:37] + "..."
+                values = ", ".join(card.get("values", [])[:3])
+                table.add_row(card["name"], source_styled, voice, values)
+            _con.print(table)
+            _con.print(f"\n[muted]Total: {len(cards)} characters[/muted]")
+    return 0
+
+
+def _characters_show(name_query: str) -> int:
+    """Show details for a specific character card."""
+    from core.init_api import load_character_cards
+
+    cards = load_character_cards()
+    # Match by name (case-insensitive) or filename stem
+    query = name_query.lower().replace(".json", "")
+    card = next(
+        (c for c in cards if c["name"].lower() == query or c["filename"].lower().replace(".json", "") == query),
+        None,
+    )
+    if not card:
+        _print_err(f"Character '{name_query}' not found")
+        return 1
+
+    ext = card.get("extensions_hexis", {})
+
+    from apps.cli_theme import console as _con
+    _con.print(f"\n[bold]{card['name']}[/bold]")
+    if ext.get("pronouns"):
+        _con.print(f"  [muted]Pronouns:[/muted] {ext['pronouns']}")
+    if card.get("voice"):
+        _con.print(f"  [muted]Voice:[/muted] {card['voice']}")
+    if card.get("description"):
+        _con.print(f"  [muted]Description:[/muted] {card['description']}")
+    if ext.get("purpose"):
+        _con.print(f"  [muted]Purpose:[/muted] {ext['purpose']}")
+
+    traits = ext.get("personality_traits", {})
+    if traits:
+        _con.print("\n  [bold]Big Five[/bold]")
+        for trait, val in traits.items():
+            bar = "█" * int(val * 20) + "░" * (20 - int(val * 20))
+            _con.print(f"    {trait:<20} {bar} {val:.2f}")
+
+    if card.get("values"):
+        _con.print(f"\n  [bold]Values[/bold]: {', '.join(card['values'])}")
+
+    worldview = ext.get("worldview", {})
+    if isinstance(worldview, dict) and worldview:
+        _con.print("\n  [bold]Worldview[/bold]")
+        for key, val in worldview.items():
+            text = val if len(val) <= 80 else val[:77] + "..."
+            _con.print(f"    {key}: {text}")
+
+    if ext.get("interests"):
+        _con.print(f"\n  [bold]Interests[/bold]: {', '.join(ext['interests'])}")
+    if ext.get("goals"):
+        _con.print(f"\n  [bold]Goals[/bold]: {', '.join(ext['goals'])}")
+    if ext.get("boundaries"):
+        _con.print("\n  [bold]Boundaries[/bold]")
+        for b in ext["boundaries"]:
+            _con.print(f"    - {b}")
+
+    _con.print(f"\n  [muted]Source: {card.get('source_dir', 'unknown')}[/muted]\n")
+    return 0
+
+
+def _characters_create(args: Any) -> int:
+    """Create a new character card from CLI flags."""
+    from core.init_api import save_character_card
+
+    name = args.name
+    filename = name.lower().replace(" ", "_").replace("-", "_") + ".json"
+
+    # Build chara_card_v2
+    hexis_ext: dict[str, Any] = {
+        "name": name,
+        "pronouns": args.pronouns,
+        "voice": args.voice,
+        "description": args.description,
+        "purpose": args.purpose,
+        "personality_description": args.personality,
+        "personality_traits": {
+            "openness": args.openness,
+            "conscientiousness": args.conscientiousness,
+            "extraversion": args.extraversion,
+            "agreeableness": args.agreeableness,
+            "neuroticism": args.neuroticism,
+        },
+        "values": [v.strip() for v in args.values.split(",") if v.strip()] if args.values else [],
+        "worldview": {},
+        "interests": [i.strip() for i in args.interests.split(",") if i.strip()] if args.interests else [],
+        "goals": [g.strip() for g in args.goals.split(",") if g.strip()] if args.goals else [],
+        "boundaries": [b.strip() for b in args.boundaries.split(",") if b.strip()] if args.boundaries else [],
+    }
+
+    # Worldview
+    wv: dict[str, str] = {}
+    if args.metaphysics:
+        wv["metaphysics"] = args.metaphysics
+    if args.human_nature:
+        wv["human_nature"] = args.human_nature
+    if args.epistemology:
+        wv["epistemology"] = args.epistemology
+    if args.ethics:
+        wv["ethics"] = args.ethics
+    hexis_ext["worldview"] = wv
+
+    card_data: dict[str, Any] = {
+        "spec": "chara_card_v2",
+        "spec_version": "2.0",
+        "data": {
+            "name": name,
+            "description": args.description,
+            "personality": args.personality,
+            "scenario": "",
+            "first_mes": "",
+            "mes_example": "",
+            "system_prompt": "",
+            "extensions": {"hexis": hexis_ext},
+        },
+    }
+
+    dest = save_character_card(card_data, filename)
+    sys.stdout.write(f"Created character card: {dest}\n")
+    return 0
+
+
+def _characters_import(source: str) -> int:
+    """Import a character card file."""
+    from core.init_api import import_character_card
+
+    source_path = Path(source).resolve()
+    if not source_path.exists():
+        _print_err(f"File not found: {source}")
+        return 1
+    if not source_path.name.endswith(".json"):
+        _print_err("File must be a .json character card")
+        return 1
+
+    try:
+        dest = import_character_card(source_path)
+        sys.stdout.write(f"Imported character card: {dest}\n")
+        return 0
+    except (json.JSONDecodeError, ValueError) as e:
+        _print_err(f"Invalid character card: {e}")
+        return 1
+
+
+async def _characters_export(dsn: str, name: str, output: str | None) -> int:
+    """Export current agent identity from DB as a character card."""
+    import asyncpg
+    from core.init_api import save_character_card
+
+    pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+    try:
+        async with pool.acquire() as conn:
+            # Gather identity
+            identity_row = await conn.fetchrow(
+                "SELECT value FROM config WHERE key = 'agent.identity'"
+            )
+            identity = json.loads(identity_row["value"]) if identity_row else {}
+
+            # Gather personality traits (from worldview memories with personality subcategory)
+            traits_rows = await conn.fetch("""
+                SELECT content, metadata FROM memories
+                WHERE type = 'worldview'
+                  AND metadata->>'subcategory' = 'personality'
+                  AND status = 'active'
+            """)
+            traits: dict[str, float] = {}
+            for row in traits_rows:
+                content = row["content"]
+                meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                # Typical format: "Openness: 0.9" or stored in metadata
+                if meta.get("trait_name"):
+                    traits[meta["trait_name"].lower()] = float(meta.get("trait_value", 0.5))
+
+            # Gather values
+            values_rows = await conn.fetch("""
+                SELECT content FROM memories
+                WHERE type = 'worldview'
+                  AND metadata->>'subcategory' = 'values'
+                  AND status = 'active'
+                ORDER BY importance DESC
+            """)
+            values = [row["content"] for row in values_rows]
+
+            # Gather worldview beliefs
+            wv_rows = await conn.fetch("""
+                SELECT content, metadata FROM memories
+                WHERE type = 'worldview'
+                  AND (metadata->>'subcategory' IS NULL OR metadata->>'subcategory' NOT IN ('personality', 'values', 'boundaries'))
+                  AND status = 'active'
+                ORDER BY importance DESC
+                LIMIT 10
+            """)
+            worldview: dict[str, str] = {}
+            for row in wv_rows:
+                meta = json.loads(row["metadata"]) if row["metadata"] else {}
+                cat = meta.get("subcategory", meta.get("category", "general"))
+                if cat in ("metaphysics", "human_nature", "epistemology", "ethics"):
+                    worldview[cat] = row["content"]
+
+            # Gather boundaries
+            boundary_rows = await conn.fetch("""
+                SELECT content FROM memories
+                WHERE type = 'worldview'
+                  AND metadata->>'subcategory' = 'boundaries'
+                  AND status = 'active'
+            """)
+            boundaries = [row["content"] for row in boundary_rows]
+
+            # Gather goals
+            goal_rows = await conn.fetch("""
+                SELECT content FROM memories
+                WHERE type = 'goal'
+                  AND status = 'active'
+                ORDER BY importance DESC
+            """)
+            goals = [row["content"] for row in goal_rows]
+
+            # Gather interests
+            interest_rows = await conn.fetch("""
+                SELECT content FROM memories
+                WHERE type = 'worldview'
+                  AND metadata->>'subcategory' = 'interests'
+                  AND status = 'active'
+            """)
+            interests = [row["content"] for row in interest_rows]
+
+        # Assemble card
+        agent_name = identity.get("name", name)
+        hexis_ext: dict[str, Any] = {
+            "name": agent_name,
+            "pronouns": identity.get("pronouns", "they/them"),
+            "voice": identity.get("voice", ""),
+            "description": identity.get("description", ""),
+            "purpose": identity.get("purpose", ""),
+            "personality_description": identity.get("personality_description", ""),
+            "personality_traits": traits if traits else {
+                "openness": 0.5, "conscientiousness": 0.5,
+                "extraversion": 0.5, "agreeableness": 0.5, "neuroticism": 0.5,
+            },
+            "values": values,
+            "worldview": worldview,
+            "interests": interests,
+            "goals": goals,
+            "boundaries": boundaries,
+        }
+
+        card_data: dict[str, Any] = {
+            "spec": "chara_card_v2",
+            "spec_version": "2.0",
+            "data": {
+                "name": agent_name,
+                "description": identity.get("description", ""),
+                "personality": identity.get("personality_description", ""),
+                "scenario": "",
+                "first_mes": "",
+                "mes_example": "",
+                "system_prompt": "",
+                "extensions": {"hexis": hexis_ext},
+            },
+        }
+
+        filename = name.lower().replace(" ", "_").replace("-", "_") + ".json"
+        if output:
+            out_path = Path(output).resolve()
+            out_path.write_text(json.dumps(card_data, indent=2, ensure_ascii=False))
+            sys.stdout.write(f"Exported character card: {out_path}\n")
+        else:
+            dest = save_character_card(card_data, filename)
+            sys.stdout.write(f"Exported character card: {dest}\n")
+        return 0
+    except Exception as e:
+        _print_err(f"Failed to export: {e}")
+        return 1
+    finally:
+        await pool.close()
 
 
 def _run_module(module: str, argv: list[str]) -> int:
@@ -2052,6 +2405,21 @@ def main(argv: list[str] | None = None) -> int:
         return asyncio.run(_consents_request(args.model))
     if func == "consents_revoke":
         return _consents_revoke(args.model, args.reason)
+
+    # Character card management (don't need docker, except export)
+    if func == "characters":
+        return _characters_list(False)
+    if func == "characters_list":
+        return _characters_list(args.json)
+    if func == "characters_show":
+        return _characters_show(args.name)
+    if func == "characters_create":
+        return _characters_create(args)
+    if func == "characters_import":
+        return _characters_import(args.path)
+    if func == "characters_export":
+        dsn = _get_dsn(args)
+        return asyncio.run(_characters_export(dsn, args.name, args.output))
 
     docker_cmds = {"up", "down", "ps", "logs", "start", "stop", "reset"}
     docker_bin: str | None = None

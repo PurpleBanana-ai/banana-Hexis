@@ -1,9 +1,20 @@
 import { readFile, access } from "fs/promises";
 import path from "path";
+import os from "os";
 
 export const runtime = "nodejs";
 
-const CHARACTERS_DIR = process.env.HEXIS_CHARACTERS_DIR || path.resolve(process.cwd(), "..", "services", "characters");
+const PACKAGE_CHARACTERS_DIR = path.resolve(process.cwd(), "..", "characters");
+const USER_CHARACTERS_DIR = path.join(os.homedir(), ".hexis", "characters");
+
+function characterSearchDirs(): string[] {
+  const dirs: string[] = [];
+  const envDir = process.env.HEXIS_CHARACTERS_DIR;
+  if (envDir) dirs.push(envDir);
+  dirs.push(USER_CHARACTERS_DIR);
+  dirs.push(PACKAGE_CHARACTERS_DIR);
+  return dirs;
+}
 
 export async function GET(request: Request) {
   const { searchParams } = new URL(request.url);
@@ -18,18 +29,22 @@ export async function GET(request: Request) {
     return new Response("Invalid name", { status: 400 });
   }
 
-  const filePath = path.join(CHARACTERS_DIR, `${safeName}.jpg`);
-
-  try {
-    await access(filePath);
-    const buffer = await readFile(filePath);
-    return new Response(buffer, {
-      headers: {
-        "Content-Type": "image/jpeg",
-        "Cache-Control": "public, max-age=86400, immutable",
-      },
-    });
-  } catch {
-    return new Response("Image not found", { status: 404 });
+  // Search all character dirs for the image
+  for (const dir of characterSearchDirs()) {
+    const filePath = path.join(dir, `${safeName}.jpg`);
+    try {
+      await access(filePath);
+      const buffer = await readFile(filePath);
+      return new Response(buffer, {
+        headers: {
+          "Content-Type": "image/jpeg",
+          "Cache-Control": "public, max-age=86400, immutable",
+        },
+      });
+    } catch {
+      continue;
+    }
   }
+
+  return new Response("Image not found", { status: 404 });
 }

@@ -659,6 +659,81 @@ export default function Home() {
     setGoals((prev) => prev.filter((_, idx) => idx !== index));
   };
 
+  const importFileRef = useRef<HTMLInputElement>(null);
+  const [importMsg, setImportMsg] = useState<string | null>(null);
+  const [exportMsg, setExportMsg] = useState<string | null>(null);
+
+  const handleImportCard = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+    setImportMsg(null);
+    try {
+      const text = await file.text();
+      const card = JSON.parse(text);
+      if (!card?.data || typeof card.data !== "object") {
+        setImportMsg("Invalid card: missing 'data' object");
+        return;
+      }
+      const res = await postJson<{ filename: string }>("/api/init/characters/save", {
+        card,
+        filename: file.name,
+      });
+      if (res?.filename) {
+        setImportMsg(`Imported: ${res.filename}`);
+        // Refresh character list
+        const data = await (await fetch("/api/init/characters")).json();
+        if (Array.isArray(data?.characters)) setCharacters(data.characters);
+      }
+    } catch {
+      setImportMsg("Failed to import character card");
+    }
+    // Reset input so same file can be re-selected
+    if (importFileRef.current) importFileRef.current.value = "";
+  };
+
+  const handleExportAsCard = async () => {
+    setExportMsg(null);
+    const traits = Object.fromEntries(
+      traitKeys.map((key) => [key, personalityTraits[key] / 100])
+    );
+    const hexisExt: Record<string, any> = {
+      name: identity.name || "Custom",
+      pronouns: identity.pronouns || "they/them",
+      voice: identity.voice,
+      description: identity.description,
+      purpose: identity.purpose,
+      personality_description: personalityDesc,
+      personality_traits: traits,
+      values: valuesText.split("\n").map((v: string) => v.trim()).filter(Boolean),
+      worldview,
+      interests: interestsText.split("\n").map((v: string) => v.trim()).filter(Boolean),
+      goals: goals.filter((g) => g.title.trim()).map((g) => g.title.trim()),
+      boundaries: boundaries.filter((b) => b.content.trim()).map((b) => b.content.trim()),
+    };
+    const card = {
+      spec: "chara_card_v2",
+      spec_version: "2.0",
+      data: {
+        name: identity.name || "Custom",
+        description: identity.description,
+        personality: personalityDesc,
+        scenario: "",
+        first_mes: "",
+        mes_example: "",
+        system_prompt: "",
+        extensions: { hexis: hexisExt },
+      },
+    };
+    try {
+      const res = await postJson<{ filename: string }>("/api/init/characters/save", { card });
+      if (res?.filename) {
+        setExportMsg(`Saved: ${res.filename}`);
+      }
+    } catch {
+      setExportMsg("Failed to save character card");
+    }
+  };
+
   const consentSummary = [
     consentRecords.conscious?.decision || "pending",
     consentRecords.subconscious?.decision || "pending",
@@ -1043,6 +1118,26 @@ export default function Home() {
                   </div>
                 )}
 
+                {/* Import card button */}
+                <div className="flex items-center gap-3">
+                  <input
+                    ref={importFileRef}
+                    type="file"
+                    accept=".json"
+                    className="hidden"
+                    onChange={handleImportCard}
+                  />
+                  <button
+                    className="rounded-full border border-dashed border-[var(--outline)] px-4 py-2 text-xs font-semibold text-[var(--ink-soft)] transition hover:border-[var(--accent)] hover:text-[var(--foreground)]"
+                    onClick={() => importFileRef.current?.click()}
+                  >
+                    Import Card
+                  </button>
+                  {importMsg && (
+                    <span className="text-xs text-[var(--ink-soft)]">{importMsg}</span>
+                  )}
+                </div>
+
                 {selectedCharacter && (
                   <div className="flex gap-4 rounded-2xl border border-[var(--accent)] bg-[var(--surface)] p-4 text-sm">
                     {selectedCharacter.image && (
@@ -1380,13 +1475,20 @@ export default function Home() {
                 )}
 
                 {/* Custom submit/back buttons */}
-                <div className="flex gap-3">
+                <div className="flex flex-wrap gap-3">
                   <button
                     className="rounded-full bg-[var(--foreground)] px-6 py-3 text-sm font-semibold text-white transition hover:bg-[var(--accent-strong)]"
                     onClick={handleCustomSubmit}
                     disabled={busy}
                   >
                     {busy ? "Saving..." : "Save & Continue to Consent"}
+                  </button>
+                  <button
+                    className="rounded-full border border-[var(--outline)] px-6 py-3 text-sm font-semibold text-[var(--foreground)] transition hover:border-[var(--accent)]"
+                    onClick={handleExportAsCard}
+                    disabled={busy}
+                  >
+                    Save as Character Card
                   </button>
                   <button
                     className="rounded-full border border-[var(--outline)] px-6 py-3 text-sm font-semibold text-[var(--foreground)]"
@@ -1396,6 +1498,9 @@ export default function Home() {
                     Back
                   </button>
                 </div>
+                {exportMsg && (
+                  <p className="text-xs text-[var(--ink-soft)]">{exportMsg}</p>
+                )}
               </div>
             )}
 

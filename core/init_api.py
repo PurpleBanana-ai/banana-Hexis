@@ -7,39 +7,112 @@ from __future__ import annotations
 
 import json
 import os
+import shutil
 from pathlib import Path
 from typing import Any
 
-CHARACTERS_DIR = Path(__file__).resolve().parent.parent / "services" / "characters"
+PACKAGE_CHARACTERS_DIR = Path(__file__).resolve().parent.parent / "characters"
+USER_CHARACTERS_DIR = Path.home() / ".hexis" / "characters"
+
+# Backwards compat alias
+CHARACTERS_DIR = PACKAGE_CHARACTERS_DIR
+
+
+def _character_search_dirs() -> list[Path]:
+    """Return character directories in priority order (first wins on filename collision)."""
+    dirs: list[Path] = []
+    env_dir = os.environ.get("HEXIS_CHARACTERS_DIR")
+    if env_dir:
+        dirs.append(Path(env_dir))
+    dirs.append(USER_CHARACTERS_DIR)
+    dirs.append(PACKAGE_CHARACTERS_DIR)
+    return dirs
+
+
+def _parse_card_file(path: Path) -> dict[str, Any] | None:
+    """Parse a single character card JSON file. Returns None on error."""
+    try:
+        data = json.loads(path.read_text())
+    except (json.JSONDecodeError, OSError):
+        return None
+    card_data = data.get("data", {})
+    hexis_ext = card_data.get("extensions", {}).get("hexis", {})
+    name = hexis_ext.get("name") or card_data.get("name") or path.stem
+    return {
+        "filename": path.name,
+        "name": name,
+        "description": hexis_ext.get("description") or card_data.get("description", "")[:120],
+        "voice": hexis_ext.get("voice", ""),
+        "values": hexis_ext.get("values", []),
+        "personality": hexis_ext.get("personality_description", ""),
+        "extensions_hexis": hexis_ext,
+        "source_dir": str(path.parent),
+    }
 
 
 def load_character_cards() -> list[dict[str, Any]]:
-    """Load all character card JSON files from services/characters/.
+    """Load character card JSON files from all search directories.
+
+    Scans env override, user dir (~/.hexis/characters/), and package dir.
+    First-seen filename wins (env > user > package).
 
     Returns list of dicts with keys: filename, name, description, voice,
-    values, personality, extensions_hexis (the full hexis extension block).
+    values, personality, extensions_hexis, source_dir.
     """
+    seen: set[str] = set()
     cards: list[dict[str, Any]] = []
-    if not CHARACTERS_DIR.is_dir():
-        return cards
-    for path in sorted(CHARACTERS_DIR.glob("*.json")):
-        try:
-            data = json.loads(path.read_text())
-        except (json.JSONDecodeError, OSError):
+    for d in _character_search_dirs():
+        if not d.is_dir():
             continue
-        card_data = data.get("data", {})
-        hexis_ext = card_data.get("extensions", {}).get("hexis", {})
-        name = hexis_ext.get("name") or card_data.get("name") or path.stem
-        cards.append({
-            "filename": path.name,
-            "name": name,
-            "description": hexis_ext.get("description") or card_data.get("description", "")[:120],
-            "voice": hexis_ext.get("voice", ""),
-            "values": hexis_ext.get("values", []),
-            "personality": hexis_ext.get("personality_description", ""),
-            "extensions_hexis": hexis_ext,
-        })
+        for path in sorted(d.glob("*.json")):
+            if path.name in seen:
+                continue
+            seen.add(path.name)
+            card = _parse_card_file(path)
+            if card is not None:
+                cards.append(card)
     return cards
+
+
+def save_character_card(
+    card_data: dict[str, Any],
+    filename: str,
+    portrait_bytes: bytes | None = None,
+) -> Path:
+    """Save a character card JSON (and optional portrait) to the user dir.
+
+    Creates ~/.hexis/characters/ if needed. Returns path to saved JSON.
+    """
+    USER_CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = USER_CHARACTERS_DIR / filename
+    dest.write_text(json.dumps(card_data, indent=2, ensure_ascii=False))
+    if portrait_bytes:
+        img_name = Path(filename).stem + ".jpg"
+        (USER_CHARACTERS_DIR / img_name).write_bytes(portrait_bytes)
+    return dest
+
+
+def import_character_card(source_path: Path) -> Path:
+    """Import a character card (and matching portrait) into the user dir.
+
+    Validates that the file is valid chara_card_v2 JSON before copying.
+    Returns path to the imported file.
+    """
+    data = json.loads(source_path.read_text())
+    if not isinstance(data.get("data"), dict):
+        raise ValueError("Invalid character card: missing 'data' object")
+
+    USER_CHARACTERS_DIR.mkdir(parents=True, exist_ok=True)
+    dest = USER_CHARACTERS_DIR / source_path.name
+    shutil.copy2(source_path, dest)
+
+    # Copy matching portrait if present
+    for ext in (".jpg", ".png"):
+        portrait = source_path.with_suffix(ext)
+        if portrait.exists():
+            shutil.copy2(portrait, USER_CHARACTERS_DIR / portrait.name)
+
+    return dest
 
 
 def get_card_summary(card: dict[str, Any]) -> dict[str, str]:

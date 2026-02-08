@@ -245,11 +245,11 @@ Both the web UI and CLI share a 3-tier initialization flow:
 
 ### Character Presets
 
-Preset characters live in `services/characters/` as **chara_card_v2** JSON files with matching `.jpg` portraits (300x300). Each card includes a pre-encoded `extensions.hexis` block with Big Five traits, voice, values, worldview, and goals -- applied directly via the `init_from_character_card()` DB function without needing an LLM call.
+Preset characters live in [`characters/`](characters/README.md) as **chara_card_v2** JSON files with matching `.jpg` portraits (300x300). Each card includes a pre-encoded `extensions.hexis` block with Big Five traits, voice, values, worldview, and goals -- applied directly via the `init_from_character_card()` DB function without needing an LLM call.
 
 Available presets: Hexis, JARVIS, TARS, Samantha, GLaDOS, Cortana, Data, Ava, Joi, David, HK-47.
 
-Drop any `.json` character card (with optional matching `.jpg`) into `services/characters/` to add your own preset.
+Custom characters go in `~/.hexis/characters/` (same format, auto-merged with presets). See the [characters README](characters/README.md) for portraits, the full card format, and `hexis characters` CLI commands.
 
 ## Usage Scenarios
 
