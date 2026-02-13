@@ -13,7 +13,7 @@ import logging
 import os
 from typing import Any, Callable, Awaitable
 
-from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage
+from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage, parse_allowlist, resolve_channel_token
 from .media import Attachment
 
 logger = logging.getLogger(__name__)
@@ -22,11 +22,15 @@ DEFAULT_API_URL = "http://localhost:8080"
 
 
 def _resolve_token(config: dict[str, Any]) -> str | None:
-    """Resolve Signal phone number from config or environment."""
-    phone_env = config.get("phone_number") or "SIGNAL_PHONE_NUMBER"
-    phone = os.getenv(str(phone_env))
-    if phone:
-        return phone
+    """Resolve Signal phone number from config or environment.
+
+    Phone numbers are short strings, so we can't use the generic
+    resolve_channel_token (which requires len > 20 for raw values).
+    """
+    phone_env = config.get("phone_number") or config.get("phone_number_env") or "SIGNAL_PHONE_NUMBER"
+    token = os.getenv(str(phone_env)) if phone_env else None
+    if token:
+        return token
     raw = config.get("phone_number", "")
     if raw and str(raw).startswith("+"):
         return str(raw)
@@ -56,16 +60,7 @@ class SignalAdapter(ChannelAdapter):
 
     @staticmethod
     def _parse_allowlist(value: Any) -> set[str] | None:
-        if value is None or value == "*":
-            return None
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except Exception:
-                return {value}
-        if isinstance(value, list):
-            return {str(v) for v in value}
-        return None
+        return parse_allowlist(value)
 
     @property
     def channel_type(self) -> str:

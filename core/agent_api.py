@@ -82,6 +82,13 @@ async def _connect_with_retry(dsn: str, *, wait_seconds: int = 30) -> asyncpg.Co
     raise TimeoutError(f"Failed to connect to Postgres after {wait_seconds}s: {last_err!r}")
 
 
+def pool_sizes_from_env(default_min: int = 1, default_max: int = 5) -> tuple[int, int]:
+    """Read pool size overrides from environment, falling back to provided defaults."""
+    min_size = int(os.getenv("HEXIS_POOL_MIN_SIZE", str(default_min)))
+    max_size = int(os.getenv("HEXIS_POOL_MAX_SIZE", str(default_max)))
+    return min_size, max_size
+
+
 async def get_agent_status(dsn: str | None = None) -> dict[str, Any]:
     dsn = dsn or db_dsn_from_env()
     conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
@@ -197,7 +204,16 @@ async def get_llm_config(dsn: str | None, key: str) -> dict[str, Any]:
     return {}
 
 
-async def get_agent_profile_context(dsn: str | None = None) -> dict[str, Any]:
+async def get_agent_profile_context(dsn: str | None = None, *, pool: Any = None) -> dict[str, Any]:
+    if pool is not None:
+        async with pool.acquire() as conn:
+            value = await conn.fetchval("SELECT get_agent_profile_context()")
+            if isinstance(value, str):
+                try:
+                    return json.loads(value)
+                except Exception:
+                    return {}
+            return value or {}
     dsn = dsn or db_dsn_from_env()
     conn = await _connect_with_retry(dsn, wait_seconds=int(os.getenv("POSTGRES_WAIT_SECONDS", "30")))
     try:

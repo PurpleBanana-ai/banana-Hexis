@@ -171,6 +171,43 @@ class ChannelAdapter(ABC):
         return None
 
 
+def parse_allowlist(value: Any) -> set[str] | None:
+    """Parse an allowlist value from config. Returns None for '*' (allow all)."""
+    if value is None or value == "*":
+        return None
+    if isinstance(value, str):
+        import json
+        try:
+            value = json.loads(value)
+        except Exception:
+            return {value}
+    if isinstance(value, list):
+        return {str(v) for v in value}
+    return None
+
+
+def resolve_channel_token(
+    config: dict[str, Any],
+    key: str = "bot_token",
+    env_fallback: str = "",
+) -> str | None:
+    """Resolve a channel token/secret from config or environment.
+
+    Config stores the env var NAME, not the value. Falls back to treating
+    the config value as a raw token if it looks like one.
+    """
+    import os
+
+    token_env = config.get(key) or config.get(f"{key}_env") or env_fallback
+    token = os.getenv(str(token_env)) if token_env else None
+    if token:
+        return token
+    raw = config.get(key, "")
+    if raw and len(str(raw)) > 20:
+        return str(raw)
+    return None
+
+
 def chunk_text(text: str, max_length: int) -> list[str]:
     """
     Split text into chunks respecting the channel's max message length.

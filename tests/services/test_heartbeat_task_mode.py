@@ -234,18 +234,12 @@ class TestBuildSystemPromptBacklog:
 
 
 class TestRunAgenticHeartbeatScaling:
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_backlog_doubles_energy(self, mock_load_config, mock_agent_class):
-        mock_load_config.return_value = {
-            "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
-        }
-        mock_agent = AsyncMock()
-        mock_agent.run.return_value = MagicMock(
+    @patch("services.heartbeat_agentic.run_agent")
+    async def test_backlog_doubles_energy(self, mock_run_agent):
+        mock_run_agent.return_value = MagicMock(
             text="Done.", tool_calls_made=[], iterations=1,
             energy_spent=0, timed_out=False, stopped_reason="completed",
         )
-        mock_agent_class.return_value = mock_agent
 
         ctx = _base_context(backlog={
             "counts": {"todo": 1},
@@ -258,22 +252,16 @@ class TestRunAgenticHeartbeatScaling:
             heartbeat_id="hb-tm-001", context=ctx,
         )
 
-        config_arg = mock_agent_class.call_args[0][0]
-        assert config_arg.energy_budget == 20  # 10 * 2
+        call_kwargs = mock_run_agent.call_args[1]
+        assert call_kwargs["energy_budget"] == 20  # 10 * 2
         assert result["has_backlog_tasks"] is True
 
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_no_backlog_normal_energy(self, mock_load_config, mock_agent_class):
-        mock_load_config.return_value = {
-            "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
-        }
-        mock_agent = AsyncMock()
-        mock_agent.run.return_value = MagicMock(
+    @patch("services.heartbeat_agentic.run_agent")
+    async def test_no_backlog_normal_energy(self, mock_run_agent):
+        mock_run_agent.return_value = MagicMock(
             text="Done.", tool_calls_made=[], iterations=1,
             energy_spent=0, timed_out=False, stopped_reason="completed",
         )
-        mock_agent_class.return_value = mock_agent
 
         ctx = _base_context(backlog={"counts": {}, "actionable": []})
         ctx["energy"]["current"] = 10
@@ -283,22 +271,16 @@ class TestRunAgenticHeartbeatScaling:
             heartbeat_id="hb-tm-002", context=ctx,
         )
 
-        config_arg = mock_agent_class.call_args[0][0]
-        assert config_arg.energy_budget == 10  # unchanged
+        call_kwargs = mock_run_agent.call_args[1]
+        assert call_kwargs["energy_budget"] == 10  # unchanged
         assert result["has_backlog_tasks"] is False
 
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_backlog_extends_timeout(self, mock_load_config, mock_agent_class):
-        mock_load_config.return_value = {
-            "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
-        }
-        mock_agent = AsyncMock()
-        mock_agent.run.return_value = MagicMock(
+    @patch("services.heartbeat_agentic.run_agent")
+    async def test_backlog_extends_timeout(self, mock_run_agent):
+        mock_run_agent.return_value = MagicMock(
             text="Done.", tool_calls_made=[], iterations=1,
             energy_spent=0, timed_out=False, stopped_reason="completed",
         )
-        mock_agent_class.return_value = mock_agent
 
         ctx = _base_context(backlog={
             "counts": {"todo": 1},
@@ -310,21 +292,15 @@ class TestRunAgenticHeartbeatScaling:
             heartbeat_id="hb-tm-003", context=ctx,
         )
 
-        config_arg = mock_agent_class.call_args[0][0]
-        assert config_arg.timeout_seconds == 300.0
+        call_kwargs = mock_run_agent.call_args[1]
+        assert call_kwargs["timeout_seconds"] == 300.0
 
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_backlog_increases_max_tokens(self, mock_load_config, mock_agent_class):
-        mock_load_config.return_value = {
-            "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
-        }
-        mock_agent = AsyncMock()
-        mock_agent.run.return_value = MagicMock(
+    @patch("services.heartbeat_agentic.run_agent")
+    async def test_backlog_increases_max_tokens(self, mock_run_agent):
+        mock_run_agent.return_value = MagicMock(
             text="Done.", tool_calls_made=[], iterations=1,
             energy_spent=0, timed_out=False, stopped_reason="completed",
         )
-        mock_agent_class.return_value = mock_agent
 
         ctx = _base_context(backlog={
             "counts": {"todo": 1},
@@ -336,21 +312,15 @@ class TestRunAgenticHeartbeatScaling:
             heartbeat_id="hb-tm-004", context=ctx,
         )
 
-        config_arg = mock_agent_class.call_args[0][0]
-        assert config_arg.max_tokens == 4096
+        call_kwargs = mock_run_agent.call_args[1]
+        assert call_kwargs["max_tokens"] == 4096
 
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_checkpoint_context_appended_to_user_message(self, mock_load_config, mock_agent_class):
-        mock_load_config.return_value = {
-            "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
-        }
-        mock_agent = AsyncMock()
-        mock_agent.run.return_value = MagicMock(
+    @patch("services.heartbeat_agentic.run_agent")
+    async def test_checkpoint_context_appended_to_user_message(self, mock_run_agent):
+        mock_run_agent.return_value = MagicMock(
             text="Done.", tool_calls_made=[], iterations=1,
             energy_spent=0, timed_out=False, stopped_reason="completed",
         )
-        mock_agent_class.return_value = mock_agent
 
         ctx = _base_context(backlog={
             "counts": {"in_progress": 1},
@@ -366,8 +336,9 @@ class TestRunAgenticHeartbeatScaling:
             heartbeat_id="hb-tm-005", context=ctx,
         )
 
-        # The user_message passed to agent.run should include checkpoint context
-        user_msg = mock_agent.run.call_args[0][0]
+        # The user_message passed to run_agent should include checkpoint context
+        call_kwargs = mock_run_agent.call_args[1]
+        user_msg = call_kwargs["user_message"]
         assert "Checkpoint Resume" in user_msg
         assert "Deploy" in user_msg
         assert "Push" in user_msg
@@ -569,12 +540,20 @@ class TestTaskModePromptLoader:
 
 
 class TestHeartbeatAgentLoopWiring:
-    """Verify that planning and continuation are always on, permissions are gated."""
+    """Verify that planning and continuation are always on, permissions are gated.
 
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_planning_always_enabled(self, mock_load_config, mock_agent_class):
+    Planning and continuation are now configured inside services.agent.run_agent(),
+    so we mock at that level. Permission gating is tested by inspecting kwargs
+    passed from run_agentic_heartbeat → run_agent.
+    """
+
+    @patch("services.agent.run_subconscious_appraisal", new_callable=AsyncMock)
+    @patch("services.agent.AgentLoop")
+    @patch("services.agent.load_llm_config")
+    async def test_planning_always_enabled(self, mock_load_config, mock_agent_class, mock_sub):
         """Planning is on even without backlog tasks."""
+        from services.agent import SubconsciousOutput
+        mock_sub.return_value = SubconsciousOutput()
         mock_load_config.return_value = {
             "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
         }
@@ -585,20 +564,29 @@ class TestHeartbeatAgentLoopWiring:
         )
         mock_agent_class.return_value = mock_agent
 
+        mock_pool = MagicMock()
+        mock_conn = AsyncMock()
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+
         ctx = _base_context(backlog={"counts": {}, "actionable": []})
 
         await run_agentic_heartbeat(
-            AsyncMock(), pool=MagicMock(), registry=_mock_registry(),
+            AsyncMock(), pool=mock_pool, registry=_mock_registry(),
             heartbeat_id="hb-always-plan", context=ctx,
         )
 
         config_arg = mock_agent_class.call_args[0][0]
         assert config_arg.enable_planning is True
 
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_continuation_always_enabled(self, mock_load_config, mock_agent_class):
+    @patch("services.agent.run_subconscious_appraisal", new_callable=AsyncMock)
+    @patch("services.agent.AgentLoop")
+    @patch("services.agent.load_llm_config")
+    async def test_continuation_always_enabled(self, mock_load_config, mock_agent_class, mock_sub):
         """Continuation nudge is on even without backlog tasks."""
+        from services.agent import SubconsciousOutput
+        mock_sub.return_value = SubconsciousOutput()
         mock_load_config.return_value = {
             "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
         }
@@ -609,10 +597,16 @@ class TestHeartbeatAgentLoopWiring:
         )
         mock_agent_class.return_value = mock_agent
 
+        mock_pool = MagicMock()
+        mock_conn = AsyncMock()
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+
         ctx = _base_context(backlog={"counts": {}, "actionable": []})
 
         await run_agentic_heartbeat(
-            AsyncMock(), pool=MagicMock(), registry=_mock_registry(),
+            AsyncMock(), pool=mock_pool, registry=_mock_registry(),
             heartbeat_id="hb-always-cont", context=ctx,
         )
 
@@ -620,19 +614,13 @@ class TestHeartbeatAgentLoopWiring:
         assert config_arg.continuation_prompt is not None
         assert config_arg.max_continuations >= 1
 
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_backlog_grants_permissions(self, mock_load_config, mock_agent_class):
+    @patch("services.heartbeat_agentic.run_agent")
+    async def test_backlog_grants_permissions(self, mock_run_agent):
         """Backlog tasks grant shell + file_write permissions."""
-        mock_load_config.return_value = {
-            "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
-        }
-        mock_agent = AsyncMock()
-        mock_agent.run.return_value = MagicMock(
+        mock_run_agent.return_value = MagicMock(
             text="Done.", tool_calls_made=[], iterations=1,
             energy_spent=0, timed_out=False, stopped_reason="completed",
         )
-        mock_agent_class.return_value = mock_agent
 
         ctx = _base_context(backlog={
             "counts": {"todo": 1},
@@ -644,24 +632,19 @@ class TestHeartbeatAgentLoopWiring:
             heartbeat_id="hb-perms", context=ctx,
         )
 
-        config_arg = mock_agent_class.call_args[0][0]
-        assert config_arg.context_overrides is not None
-        assert config_arg.context_overrides.allow_shell is True
-        assert config_arg.context_overrides.allow_file_write is True
+        call_kwargs = mock_run_agent.call_args[1]
+        overrides = call_kwargs["context_overrides"]
+        assert overrides is not None
+        assert overrides.allow_shell is True
+        assert overrides.allow_file_write is True
 
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_no_backlog_no_permissions(self, mock_load_config, mock_agent_class):
+    @patch("services.heartbeat_agentic.run_agent")
+    async def test_no_backlog_no_permissions(self, mock_run_agent):
         """Without backlog tasks, no elevated permissions are granted."""
-        mock_load_config.return_value = {
-            "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
-        }
-        mock_agent = AsyncMock()
-        mock_agent.run.return_value = MagicMock(
+        mock_run_agent.return_value = MagicMock(
             text="Done.", tool_calls_made=[], iterations=1,
             energy_spent=0, timed_out=False, stopped_reason="completed",
         )
-        mock_agent_class.return_value = mock_agent
 
         ctx = _base_context(backlog={"counts": {}, "actionable": []})
 
@@ -670,13 +653,16 @@ class TestHeartbeatAgentLoopWiring:
             heartbeat_id="hb-no-perms", context=ctx,
         )
 
-        config_arg = mock_agent_class.call_args[0][0]
-        assert config_arg.context_overrides is None
+        call_kwargs = mock_run_agent.call_args[1]
+        assert call_kwargs.get("context_overrides") is None
 
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_backlog_gets_more_continuations(self, mock_load_config, mock_agent_class):
+    @patch("services.agent.run_subconscious_appraisal", new_callable=AsyncMock)
+    @patch("services.agent.AgentLoop")
+    @patch("services.agent.load_llm_config")
+    async def test_backlog_gets_more_continuations(self, mock_load_config, mock_agent_class, mock_sub):
         """Backlog tasks get 2 continuations, empty backlog gets 1."""
+        from services.agent import SubconsciousOutput
+        mock_sub.return_value = SubconsciousOutput()
         mock_load_config.return_value = {
             "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
         }
@@ -687,13 +673,19 @@ class TestHeartbeatAgentLoopWiring:
         )
         mock_agent_class.return_value = mock_agent
 
+        mock_pool = MagicMock()
+        mock_conn = AsyncMock()
+        mock_conn.fetchval = AsyncMock(return_value=None)
+        mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+
         # With backlog
         ctx_tasks = _base_context(backlog={
             "counts": {"todo": 1},
             "actionable": [{"title": "Task", "status": "todo"}],
         })
         await run_agentic_heartbeat(
-            AsyncMock(), pool=MagicMock(), registry=_mock_registry(),
+            AsyncMock(), pool=mock_pool, registry=_mock_registry(),
             heartbeat_id="hb-cont-tasks", context=ctx_tasks,
         )
         config_tasks = mock_agent_class.call_args[0][0]
@@ -701,7 +693,7 @@ class TestHeartbeatAgentLoopWiring:
         # Without backlog
         ctx_empty = _base_context(backlog={"counts": {}, "actionable": []})
         await run_agentic_heartbeat(
-            AsyncMock(), pool=MagicMock(), registry=_mock_registry(),
+            AsyncMock(), pool=mock_pool, registry=_mock_registry(),
             heartbeat_id="hb-cont-empty", context=ctx_empty,
         )
         config_empty = mock_agent_class.call_args[0][0]

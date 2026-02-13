@@ -145,3 +145,35 @@ async def load_llm_config(
             await _load_anthropic_setup_token(conn, cfg)
 
     return normalize_llm_config(cfg, default_model=default_model)
+
+
+async def resolve_llm_config(
+    pool_or_conn,
+    key: str = "llm.chat",
+    *,
+    fallback_key: str | None = "llm",
+    overrides: dict[str, Any] | None = None,
+) -> dict[str, Any]:
+    """Convenience wrapper around :func:`load_llm_config`.
+
+    Accepts either an ``asyncpg.Pool`` or an ``asyncpg.Connection``.  When a
+    pool is provided, a connection is acquired automatically.  This makes it
+    usable from both tool handlers (which have pools) and CLI paths (which
+    already hold a connection).
+
+    Optional *overrides* are merged **after** credential resolution so that
+    callers can patch fields (e.g. model) without interfering with the auth
+    flow.
+    """
+
+    async def _load(conn) -> dict[str, Any]:
+        cfg = await load_llm_config(conn, key, fallback_key=fallback_key)
+        if overrides:
+            cfg.update(overrides)
+        return cfg
+
+    # Duck-type: pools have .acquire(), connections don't.
+    if hasattr(pool_or_conn, "acquire"):
+        async with pool_or_conn.acquire() as conn:
+            return await _load(conn)
+    return await _load(pool_or_conn)

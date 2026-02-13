@@ -283,11 +283,19 @@ class ManageScheduleHandler(ToolHandler):
         # Handle once:+offset shorthand — resolve to absolute time
         if schedule_kind == "once" and "_offset" in schedule_json:
             offset = schedule_json.pop("_offset")
-            # Use SQL to compute the absolute time
+            # Validate offset format strictly (e.g. "2h", "30m", "1d")
+            import re
+            if not re.fullmatch(r"\d+[hmd]", offset):
+                return ToolResult.error_result(
+                    f"Invalid offset format: '{offset}'. Use e.g. '2h', '30m', '1d'.",
+                    ToolErrorType.INVALID_PARAMS,
+                )
+            # Use parameterized SQL to compute the absolute time
             try:
                 async with pool.acquire() as conn:
                     run_at = await conn.fetchval(
-                        f"SELECT (CURRENT_TIMESTAMP + INTERVAL '{offset}')::timestamptz"
+                        "SELECT (CURRENT_TIMESTAMP + $1::interval)::timestamptz",
+                        offset.replace("h", " hours").replace("m", " minutes").replace("d", " days"),
                     )
                     schedule_json["run_at"] = run_at.isoformat()
             except Exception as e:

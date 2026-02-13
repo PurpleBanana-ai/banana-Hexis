@@ -459,7 +459,9 @@ async def doctor_payload(
         # 8. Tools
         try:
             import asyncpg
-            pool = await asyncpg.create_pool(dsn, min_size=1, max_size=2)
+            from core.agent_api import pool_sizes_from_env
+            _min, _max = pool_sizes_from_env(1, 2)
+            pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
             try:
                 from core.tools import create_default_registry
                 from core.tools.config import load_tools_config

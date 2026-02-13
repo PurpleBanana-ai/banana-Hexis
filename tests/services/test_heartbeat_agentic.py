@@ -146,20 +146,10 @@ class TestBuildSystemPrompt:
 
 
 class TestRunAgenticHeartbeat:
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_runs_agent_loop(self, mock_load_config, mock_agent_class):
-        """run_agentic_heartbeat creates and runs an AgentLoop."""
-        mock_load_config.return_value = {
-            "provider": "openai",
-            "model": "gpt-4o",
-            "endpoint": None,
-            "api_key": "test",
-        }
-
-        # Mock the AgentLoop instance
-        mock_agent = AsyncMock()
-        mock_agent.run.return_value = MagicMock(
+    @patch("services.heartbeat_agentic.run_agent")
+    async def test_runs_agent_loop(self, mock_run_agent):
+        """run_agentic_heartbeat creates and runs an AgentLoop via run_agent."""
+        mock_run_agent.return_value = MagicMock(
             text="I reflected on my goals.",
             tool_calls_made=[{"name": "recall", "success": True, "energy_spent": 1}],
             iterations=2,
@@ -167,7 +157,6 @@ class TestRunAgenticHeartbeat:
             timed_out=False,
             stopped_reason="completed",
         )
-        mock_agent_class.return_value = mock_agent
 
         conn = AsyncMock()
         pool = MagicMock()
@@ -185,21 +174,15 @@ class TestRunAgenticHeartbeat:
         assert result["energy_spent"] == 1
         assert result["stopped_reason"] == "completed"
         assert len(result["tool_calls_made"]) == 1
-        mock_agent.run.assert_awaited_once()
+        mock_run_agent.assert_awaited_once()
 
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_energy_budget_from_context(self, mock_load_config, mock_agent_class):
+    @patch("services.heartbeat_agentic.run_agent")
+    async def test_energy_budget_from_context(self, mock_run_agent):
         """Energy budget comes from context energy.current."""
-        mock_load_config.return_value = {
-            "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
-        }
-        mock_agent = AsyncMock()
-        mock_agent.run.return_value = MagicMock(
+        mock_run_agent.return_value = MagicMock(
             text="Done.", tool_calls_made=[], iterations=1,
             energy_spent=0, timed_out=False, stopped_reason="completed",
         )
-        mock_agent_class.return_value = mock_agent
 
         conn = AsyncMock()
         pool = MagicMock()
@@ -213,23 +196,17 @@ class TestRunAgenticHeartbeat:
             heartbeat_id="hb-test-002", context=ctx,
         )
 
-        # Check that AgentLoopConfig got energy_budget=7
-        config_arg = mock_agent_class.call_args[0][0]
-        assert config_arg.energy_budget == 7
+        # Check that run_agent got energy_budget=7
+        call_kwargs = mock_run_agent.call_args[1]
+        assert call_kwargs["energy_budget"] == 7
 
-    @patch("services.heartbeat_agentic.AgentLoop")
-    @patch("services.heartbeat_agentic.load_llm_config")
-    async def test_timeout_reported(self, mock_load_config, mock_agent_class):
+    @patch("services.heartbeat_agentic.run_agent")
+    async def test_timeout_reported(self, mock_run_agent):
         """Timeout is reported in result."""
-        mock_load_config.return_value = {
-            "provider": "openai", "model": "gpt-4o", "endpoint": None, "api_key": "t",
-        }
-        mock_agent = AsyncMock()
-        mock_agent.run.return_value = MagicMock(
+        mock_run_agent.return_value = MagicMock(
             text="Timed out.", tool_calls_made=[], iterations=3,
             energy_spent=5, timed_out=True, stopped_reason="timeout",
         )
-        mock_agent_class.return_value = mock_agent
 
         conn = AsyncMock()
         pool = MagicMock()

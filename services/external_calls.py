@@ -174,7 +174,7 @@ class ExternalCallProcessor:
 
         context = call_input.get("context", {})
         heartbeat_id = call_input.get("heartbeat_id")
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         llm_config = await load_llm_config(conn, "llm.heartbeat")
 

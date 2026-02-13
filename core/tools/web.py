@@ -25,6 +25,7 @@ def _validate_url_host(url: str) -> list[str]:
     errors: list[str] = []
     if not url:
         return errors
+    import socket
     import urllib.parse
     import ipaddress
 
@@ -34,12 +35,22 @@ def _validate_url_host(url: str) -> list[str]:
         if host in ("localhost", "127.0.0.1", "0.0.0.0", "::1"):
             errors.append("Cannot fetch localhost URLs")
         if host:
+            # First check if host is already an IP literal
             try:
                 ip = ipaddress.ip_address(host)
                 if ip.is_private or ip.is_loopback or ip.is_link_local:
                     errors.append("Cannot fetch internal network URLs")
             except ValueError:
-                pass
+                # Host is a hostname — resolve it and check the resolved IP
+                try:
+                    resolved = socket.getaddrinfo(host, None, socket.AF_UNSPEC, socket.SOCK_STREAM)
+                    for family, _, _, _, sockaddr in resolved:
+                        resolved_ip = ipaddress.ip_address(sockaddr[0])
+                        if resolved_ip.is_private or resolved_ip.is_loopback or resolved_ip.is_link_local:
+                            errors.append(f"Hostname '{host}' resolves to internal IP {resolved_ip}")
+                            break
+                except socket.gaierror:
+                    errors.append(f"Cannot resolve hostname: {host}")
     except Exception:
         errors.append("Invalid URL format")
     return errors

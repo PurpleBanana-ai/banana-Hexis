@@ -48,7 +48,9 @@ class SyncToolAdapter:
             import asyncpg
             from .registry import create_default_registry
 
-            self._pool = await asyncpg.create_pool(self._dsn, min_size=1, max_size=5)
+            from core.agent_api import pool_sizes_from_env
+            _min, _max = pool_sizes_from_env(1, 5)
+            self._pool = await asyncpg.create_pool(self._dsn, min_size=_min, max_size=_max)
             self._registry = create_default_registry(self._pool)
             return self._registry
 

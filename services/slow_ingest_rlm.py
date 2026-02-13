@@ -33,7 +33,6 @@ from services.ingest import (
     IngestionPipeline,
     Section,
     _hash_text,
-    _select_mode,
     _word_count,
 )
 from services.prompt_resources import compose_personhood_prompt, load_rlm_slow_ingest_prompt
@@ -138,7 +137,7 @@ async def run_slow_ingest_chunk(
         budgets=budgets,
     )
 
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
     llm_query_fn = _make_sync_llm_query(llm_cfg, loop)
     memory_env = RLMMemoryEnv(repo, workspace, llm_query_fn=llm_query_fn)
 
@@ -322,14 +321,9 @@ async def run_slow_ingest(
             # Dedup check
             try:
                 similar = pipeline.store.recall_similar_semantic(fact, limit=3)
-                if similar and hasattr(similar, "memories"):
-                    for mem in similar.memories:
-                        if mem.similarity is not None and mem.similarity >= 0.92:
-                            break
-                    else:
-                        similar = None
                 if similar and hasattr(similar, "memories") and any(
-                    m.similarity >= 0.92 for m in similar.memories if m.similarity is not None
+                    m.similarity is not None and m.similarity >= 0.92
+                    for m in similar.memories
                 ):
                     continue
             except Exception:
@@ -497,8 +491,8 @@ async def run_hybrid_ingest(
                 section=section,
                 doc=doc,
                 appraisal=appraisal,
-                mode=IngestionMode.STANDARD,
-                max_items=pipeline.config.max_extractions_per_section,
+                mode=IngestionMode.FAST,
+                max_items=pipeline.config.max_facts_per_section,
             )
             fast_extractions[section.index] = extractions
             max_imp = max((e.importance for e in extractions), default=0.0)

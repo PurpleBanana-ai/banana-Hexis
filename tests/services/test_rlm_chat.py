@@ -19,7 +19,8 @@ class TestChatRLMFlagDefault:
 class TestRLMChatSession:
     """Unit tests for RLM chat session management."""
 
-    def test_session_cleanup(self):
+    @pytest.mark.asyncio(loop_scope="session")
+    async def test_session_cleanup(self):
         """Stale sessions are cleaned up."""
         import time
         from services.hexis_rlm import _chat_sessions, _session_last_used, _cleanup_stale_sessions, _SESSION_TTL
@@ -32,7 +33,7 @@ class TestRLMChatSession:
         _chat_sessions[session_id] = repl
         _session_last_used[session_id] = time.time() - _SESSION_TTL - 10
 
-        _cleanup_stale_sessions()
+        await _cleanup_stale_sessions()
 
         assert session_id not in _chat_sessions
         assert session_id not in _session_last_used

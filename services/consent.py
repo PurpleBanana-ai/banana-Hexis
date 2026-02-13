@@ -31,23 +31,6 @@ def _build_consent_messages() -> list[dict[str, Any]]:
     ]
 
 
-def _extract_json_payload(text: str) -> dict[str, Any]:
-    if not text:
-        return {}
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return {}
-    snippet = text[start : end + 1]
-    try:
-        doc = json.loads(snippet)
-    except Exception:
-        return {}
-    if isinstance(doc, dict):
-        return doc
-    return {}
-
-
 async def stream_consent_flow(
     *,
     llm_config: dict[str, Any],
@@ -99,8 +82,10 @@ async def stream_consent_flow(
         chunks.append(piece)
         yield {"type": "chunk", "text": piece}
 
+    from core.llm_json import extract_json_object
+
     full_text = "".join(chunks)
-    payload = _extract_json_payload(full_text)
+    payload = extract_json_object(full_text)
     payload["raw_response"] = full_text
 
     conn = await _connect_with_retry(dsn, wait_seconds=30)

@@ -11,9 +11,6 @@ from core.tools.config import ToolsConfig
 from core.tools.policy import PolicyCheckResult
 from core.tools.base import ToolHandler, ToolResult, ToolSpec, ToolCategory
 from core.tools.web import WebFetchHandler, WebSummarizeHandler
-import core.memory_tools as memory_tools
-
-
 class DummyHandler(ToolHandler):
     def __init__(self, name: str, cost: int, supports_parallel: bool = True):
         self._spec = ToolSpec(
@@ -118,31 +115,6 @@ async def test_execute_batch_parallel_energy_budget(monkeypatch):
     assert results[0].success is True
     assert results[1].success is False
     assert results[1].error_type == ToolErrorType.INSUFFICIENT_ENERGY
-
-
-@pytest.mark.core
-def test_cross_join_query_requires_psycopg2(monkeypatch):
-    monkeypatch.setattr(memory_tools, "HAS_PSYCOPG2", False)
-    with pytest.raises(RuntimeError):
-        memory_tools.cross_join_query({}, query_text="hello")
-
-
-@pytest.mark.core
-def test_memory_tool_handler_enables_autocommit(monkeypatch):
-    class DummyConn:
-        def __init__(self):
-            self.closed = False
-            self.autocommit = False
-
-    def fake_connect(*args, **kwargs):
-        return DummyConn()
-
-    monkeypatch.setattr(memory_tools, "HAS_PSYCOPG2", True)
-    monkeypatch.setattr(memory_tools, "psycopg2", SimpleNamespace(connect=fake_connect))
-
-    handler = memory_tools.MemoryToolHandler({"host": "localhost"})
-    handler.connect()
-    assert handler.conn.autocommit is True
 
 
 @pytest.mark.asyncio(loop_scope="session")

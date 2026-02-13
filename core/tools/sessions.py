@@ -32,6 +32,7 @@ _VALID_ACTIONS = {"spawn", "list", "get", "cancel"}
 
 # Track running sub-agent tasks so they can be cancelled
 _running_tasks: dict[str, asyncio.Task] = {}
+_tasks_lock = asyncio.Lock()
 
 
 async def _run_sub_agent(
@@ -183,7 +184,8 @@ async def _run_sub_agent(
             logger.debug("Failed to update sub-agent session on error", exc_info=True)
 
     finally:
-        _running_tasks.pop(session_id, None)
+        async with _tasks_lock:
+            _running_tasks.pop(session_id, None)
 
 
 class ManageSessionsHandler(ToolHandler):
@@ -311,7 +313,8 @@ class ManageSessionsHandler(ToolHandler):
             _run_sub_agent(pool, session_id_str, task_desc, energy_budget),
             name=f"sub_agent:{session_id_str[:8]}",
         )
-        _running_tasks[session_id_str] = bg_task
+        async with _tasks_lock:
+            _running_tasks[session_id_str] = bg_task
 
         return ToolResult(
             output=json.dumps({
@@ -389,9 +392,10 @@ class ManageSessionsHandler(ToolHandler):
             )
 
         # Cancel the asyncio task if still running
-        bg_task = _running_tasks.get(session_id)
-        if bg_task and not bg_task.done():
-            bg_task.cancel()
+        async with _tasks_lock:
+            bg_task = _running_tasks.get(session_id)
+            if bg_task and not bg_task.done():
+                bg_task.cancel()
 
         async with pool.acquire() as conn:
             cancelled = await conn.fetchval(

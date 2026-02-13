@@ -7,6 +7,7 @@ All operations respect workspace restrictions and file permissions.
 
 from __future__ import annotations
 
+import asyncio
 import fnmatch
 import logging
 import os
@@ -114,7 +115,8 @@ class ReadFileHandler(ToolHandler):
 
         # Check file size
         try:
-            size = path.stat().st_size
+            loop = asyncio.get_running_loop()
+            size = await loop.run_in_executor(None, lambda: path.stat().st_size)
             if size > 10 * 1024 * 1024:  # 10MB limit
                 return ToolResult.error_result(
                     f"File too large: {size:,} bytes (max 10MB)",
@@ -127,13 +129,17 @@ class ReadFileHandler(ToolHandler):
             )
 
         try:
-            with open(path, "r", encoding="utf-8", errors="replace") as f:
-                lines = f.readlines()
+            def _read_file(file_path, offset, limit):
+                with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+                    lines = f.readlines()
+                total_lines = len(lines)
+                selected_lines = lines[offset : offset + limit]
+                return selected_lines, total_lines
 
-            total_lines = len(lines)
-
-            # Apply offset and limit
-            selected_lines = lines[offset : offset + limit]
+            loop = asyncio.get_running_loop()
+            selected_lines, total_lines = await loop.run_in_executor(
+                None, _read_file, path, offset, limit
+            )
             content = "".join(selected_lines)
 
             # Truncate content if too long
@@ -258,14 +264,21 @@ class WriteFileHandler(ToolHandler):
             )
 
         try:
+            def _write_file(file_path, content, write_mode):
+                with open(file_path, write_mode, encoding="utf-8") as f:
+                    f.write(content)
+                return len(content.encode("utf-8"))
+
             write_mode = "w" if mode == "overwrite" else "a"
-            with open(path, write_mode, encoding="utf-8") as f:
-                f.write(content)
+            loop = asyncio.get_running_loop()
+            bytes_written = await loop.run_in_executor(
+                None, _write_file, path, content, write_mode
+            )
 
             return ToolResult.success_result(
                 output={
                     "path": str(path),
-                    "bytes_written": len(content.encode("utf-8")),
+                    "bytes_written": bytes_written,
                     "mode": mode,
                 },
                 display_output=f"Wrote {len(content)} chars to {path.name}",
@@ -621,35 +634,47 @@ class GrepHandler(ToolHandler):
 
                 # Skip binary files
                 try:
-                    with open(file_path, "rb") as f:
-                        chunk = f.read(1024)
-                        if b"\x00" in chunk:
-                            continue
+                    def _check_binary(fp):
+                        with open(fp, "rb") as f:
+                            chunk = f.read(1024)
+                            return b"\x00" in chunk
+
+                    loop = asyncio.get_running_loop()
+                    is_binary = await loop.run_in_executor(None, _check_binary, file_path)
+                    if is_binary:
+                        continue
                 except Exception:
                     continue
 
                 files_searched += 1
 
                 try:
-                    with open(file_path, "r", encoding="utf-8", errors="replace") as f:
-                        lines = f.readlines()
+                    def _search_file(fp, pattern, ctx_lines):
+                        with open(fp, "r", encoding="utf-8", errors="replace") as f:
+                            lines = f.readlines()
 
-                    for i, line in enumerate(lines):
-                        if regex.search(line):
-                            # Get context
-                            start = max(0, i - context_lines)
-                            end = min(len(lines), i + context_lines + 1)
-                            context_text = "".join(lines[start:end])
+                        file_matches = []
+                        for i, line in enumerate(lines):
+                            if pattern.search(line):
+                                start = max(0, i - ctx_lines)
+                                end = min(len(lines), i + ctx_lines + 1)
+                                context_text = "".join(lines[start:end])
+                                file_matches.append({
+                                    "file": str(fp),
+                                    "line_number": i + 1,
+                                    "line": line.rstrip("\n"),
+                                    "context": context_text if ctx_lines > 0 else None,
+                                })
+                        return file_matches
 
-                            matches.append({
-                                "file": str(file_path),
-                                "line_number": i + 1,
-                                "line": line.rstrip("\n"),
-                                "context": context_text if context_lines > 0 else None,
-                            })
+                    loop = asyncio.get_running_loop()
+                    file_matches = await loop.run_in_executor(
+                        None, _search_file, file_path, regex, context_lines
+                    )
+                    matches.extend(file_matches)
 
-                            if len(matches) >= max_matches:
-                                break
+                    if len(matches) >= max_matches:
+                        break
 
                 except Exception:
                     continue  # Skip files that can't be read

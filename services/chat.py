@@ -1,19 +1,18 @@
 from __future__ import annotations
 
 import json
+import logging
 from datetime import datetime, timezone
 from typing import Any, AsyncIterator
 
-from core.agent_api import db_dsn_from_env, get_agent_profile_context
-from core.cognitive_memory_api import CognitiveMemory, MemoryType, format_context_for_prompt
-from core.agent_loop import AgentEvent, AgentLoop, AgentLoopConfig
+from core.agent_api import db_dsn_from_env, get_agent_profile_context, pool_sizes_from_env
+from core.agent_loop import AgentEvent
+from core.cognitive_memory_api import CognitiveMemory, MemoryType
 from core.llm import normalize_llm_config
 from core.tools import create_default_registry, ToolContext, ToolExecutionContext, ToolRegistry
-from services.prompt_resources import (
-    compose_personhood_prompt,
-    load_channel_context_prompt,
-    load_conversation_prompt,
-)
+from services.agent import run_agent, stream_agent
+
+logger = logging.getLogger(__name__)
 
 
 async def _build_system_prompt(
@@ -22,41 +21,10 @@ async def _build_system_prompt(
     *,
     is_group: bool = False,
 ) -> str:
-    prompt = load_conversation_prompt().strip()
-
-    # Add channel context for group chats
-    if is_group:
-        channel_ctx = load_channel_context_prompt().strip()
-        prompt += "\n\n" + channel_ctx
-
-    # Add dynamic tool descriptions if registry available
-    if registry is not None:
-        try:
-            specs = await registry.get_specs(ToolContext.CHAT)
-            if specs:
-                tool_lines = []
-                for spec in specs:
-                    func = spec.get("function", {})
-                    name = func.get("name", "")
-                    desc = func.get("description", "")
-                    tool_lines.append(f"- **{name}**: {desc}")
-                prompt += "\n\n## Available Tools\n\n" + "\n".join(tool_lines)
-        except Exception:
-            pass  # Fall back to no tool descriptions
-
-    # Use reduced personhood modules for group contexts
-    personhood_kind = "group" if is_group else "conversation"
-    try:
-        prompt = (
-            prompt
-            + "\n\n----- PERSONHOOD MODULES (conversation grounding) -----\n\n"
-            + compose_personhood_prompt(personhood_kind)
-        )
-    except Exception:
-        pass
-    if agent_profile:
-        prompt = prompt + "\n\n## Agent Profile\n" + json.dumps(agent_profile, separators=(", ", ": "))
-    return prompt
+    from services.agent import build_system_prompt
+    return await build_system_prompt(
+        "chat", registry, agent_profile, is_group=is_group,
+    )
 
 
 def _estimate_importance(user_message: str, assistant_message: str) -> float:
@@ -175,14 +143,20 @@ async def chat_turn(
     history = history or []
 
     # Check if RLM is enabled for chat
+    use_rlm = False
     try:
-        import asyncpg
-        _conn = await asyncpg.connect(dsn)
-        try:
-            use_rlm_raw = await _conn.fetchval("SELECT get_config_bool('chat.use_rlm')")
-            use_rlm = bool(use_rlm_raw)
-        finally:
-            await _conn.close()
+        if pool is not None:
+            async with pool.acquire() as _conn:
+                use_rlm_raw = await _conn.fetchval("SELECT get_config_bool('chat.use_rlm')")
+                use_rlm = bool(use_rlm_raw)
+        else:
+            import asyncpg
+            _conn = await asyncpg.connect(dsn)
+            try:
+                use_rlm_raw = await _conn.fetchval("SELECT get_config_bool('chat.use_rlm')")
+                use_rlm = bool(use_rlm_raw)
+            finally:
+                await _conn.close()
     except Exception:
         use_rlm = False
 
@@ -197,12 +171,20 @@ async def chat_turn(
         )
         assistant_text = result["response"]
         # Still form memory from the turn
-        async with CognitiveMemory.connect(dsn) as mem_client:
+        if pool is not None:
+            mem_client = CognitiveMemory(pool)
             await _remember_conversation(
                 mem_client,
                 user_message=user_message,
                 assistant_message=assistant_text,
             )
+        else:
+            async with CognitiveMemory.connect(dsn) as mem_client:
+                await _remember_conversation(
+                    mem_client,
+                    user_message=user_message,
+                    assistant_message=assistant_text,
+                )
         new_history = list(history)
         new_history.append({"role": "user", "content": user_message})
         new_history.append({"role": "assistant", "content": assistant_text})
@@ -213,51 +195,28 @@ async def chat_turn(
 
     own_pool = pool is None
     if own_pool:
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+        _min, _max = pool_sizes_from_env(1, 3)
+        pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
 
     try:
         registry = create_default_registry(pool)
+        agent_profile = await get_agent_profile_context(pool=pool)
 
-        agent_profile = await get_agent_profile_context(dsn)
-        system_prompt = await _build_system_prompt(agent_profile, registry, is_group=is_group)
+        loop_result = await run_agent(
+            pool,
+            registry,
+            user_message=user_message,
+            mode="chat",
+            history=history,
+            session_id=session_id,
+            agent_profile=agent_profile,
+            is_group=is_group,
+            dsn=dsn,
+            max_iterations=max_tool_iterations,
+        )
+        assistant_text = loop_result.text
 
         async with CognitiveMemory.connect(dsn) as mem_client:
-            context = await mem_client.hydrate(
-                user_message,
-                memory_limit=memory_limit,
-                include_partial=True,
-                include_identity=True,
-                include_worldview=True,
-                include_emotional_state=True,
-                include_goals=True,
-                include_drives=True,
-            )
-            if context.memories:
-                await mem_client.touch_memories([m.id for m in context.memories])
-
-            memory_context = format_context_for_prompt(context, max_memories=memory_limit)
-            if memory_context:
-                enriched_user_message = f"{memory_context}\n\n[USER MESSAGE]\n{user_message}"
-            else:
-                enriched_user_message = user_message
-
-            loop_config = AgentLoopConfig(
-                tool_context=ToolContext.CHAT,
-                system_prompt=system_prompt,
-                llm_config=normalized,
-                registry=registry,
-                pool=pool,
-                energy_budget=None,
-                max_iterations=max_tool_iterations + 1,
-                timeout_seconds=120.0,
-                temperature=0.7,
-                max_tokens=1200,
-                session_id=session_id,
-            )
-            agent = AgentLoop(loop_config)
-            loop_result = await agent.run(enriched_user_message, history=history)
-            assistant_text = loop_result.text
-
             await _remember_conversation(mem_client, user_message=user_message, assistant_message=assistant_text)
 
         new_history = list(history)
@@ -284,79 +243,50 @@ async def stream_chat_turn(
     """
     Streaming variant of chat_turn().
 
-    Yields text chunks as they arrive from the AgentLoop. During tool-use
-    cycles, text is emitted per-iteration (not token-by-token). Token-level
-    streaming will be added in a future phase via stream_chat_completion.
-
-    The caller receives the same enriched conversation flow (hydrate +
-    tools + memory formation) — just delivered as a stream.
+    Yields text chunks as they arrive from the unified agent runner. The
+    caller receives the same enriched conversation flow (hydrate +
+    subconscious + tools + memory formation) — just delivered as a stream.
     """
     dsn = dsn or db_dsn_from_env()
-    normalized = normalize_llm_config(llm_config)
     history = history or []
 
-    # Create or use provided pool for tool registry
     import asyncpg
 
     own_pool = pool is None
     if own_pool:
-        pool = await asyncpg.create_pool(dsn, min_size=1, max_size=3)
+        _min, _max = pool_sizes_from_env(1, 3)
+        pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
 
     try:
         registry = create_default_registry(pool)
+        agent_profile = await get_agent_profile_context(pool=pool)
 
-        agent_profile = await get_agent_profile_context(dsn)
-        system_prompt = await _build_system_prompt(agent_profile, registry, is_group=is_group)
+        collected: list[str] = []
+        async for event in stream_agent(
+            pool,
+            registry,
+            user_message=user_message,
+            mode="chat",
+            history=history,
+            session_id=session_id,
+            agent_profile=agent_profile,
+            is_group=is_group,
+            dsn=dsn,
+        ):
+            if event.event == AgentEvent.TEXT_DELTA:
+                text = event.data.get("text", "")
+                if text:
+                    collected.append(text)
+                    yield text
 
-        async with CognitiveMemory.connect(dsn) as mem_client:
-            context = await mem_client.hydrate(
-                user_message,
-                memory_limit=memory_limit,
-                include_partial=True,
-                include_identity=True,
-                include_worldview=True,
-                include_emotional_state=True,
-                include_goals=True,
-                include_drives=True,
-            )
-            if context.memories:
-                await mem_client.touch_memories([m.id for m in context.memories])
-
-            memory_context = format_context_for_prompt(context, max_memories=memory_limit)
-            if memory_context:
-                enriched_user_message = f"{memory_context}\n\n[USER MESSAGE]\n{user_message}"
-            else:
-                enriched_user_message = user_message
-
-            loop_config = AgentLoopConfig(
-                tool_context=ToolContext.CHAT,
-                system_prompt=system_prompt,
-                llm_config=normalized,
-                registry=registry,
-                pool=pool,
-                energy_budget=None,
-                max_iterations=max_tool_iterations + 1,
-                timeout_seconds=120.0,
-                temperature=0.7,
-                max_tokens=1200,
-                session_id=session_id,
-            )
-
-            agent = AgentLoop(loop_config)
-            collected: list[str] = []
-            async for event in agent.stream(enriched_user_message, history=history):
-                if event.event == AgentEvent.TEXT_DELTA:
-                    text = event.data.get("text", "")
-                    if text:
-                        collected.append(text)
-                        yield text
-
-            full_text = collected[-1] if collected else ""
-            await _remember_conversation(
-                mem_client,
-                user_message=user_message,
-                assistant_message=full_text,
-            )
+        full_text = "".join(collected)
+        if full_text:
+            async with CognitiveMemory.connect(dsn) as mem_client:
+                await _remember_conversation(
+                    mem_client,
+                    user_message=user_message,
+                    assistant_message=full_text,
+                )
     finally:
         if own_pool:
             await pool.close()

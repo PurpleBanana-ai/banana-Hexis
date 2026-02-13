@@ -9,9 +9,11 @@ pytestmark = [pytest.mark.asyncio(loop_scope="session"), pytest.mark.core]
 
 
 async def test_extract_json_payload_handles_noise():
+    from core.llm_json import extract_json_object
+
     payload = {"decision": "consent", "signature": "sig", "memories": []}
     text = f"noise\n{json.dumps(payload)}\ntrailing"
-    extracted = consent_mod._extract_json_payload(text)  # noqa: SLF001
+    extracted = extract_json_object(text)
     assert extracted["decision"] == "consent"
     assert extracted["signature"] == "sig"
 

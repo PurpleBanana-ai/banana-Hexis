@@ -184,10 +184,10 @@ RETURNS vector[] AS $$
 	    );
 	    max_batch_size := COALESCE(
 	        NULLIF((SELECT (value #>> '{}')::int FROM config WHERE key = 'embedding.max_batch_size'), 0),
-	        8
+	        total  -- send all at once; let the embedding server handle internal batching
 	    );
 	    IF max_batch_size < 1 THEN
-	        max_batch_size := 8;
+	        max_batch_size := total;
 	    END IF;
 
 	    batch_start := 1;

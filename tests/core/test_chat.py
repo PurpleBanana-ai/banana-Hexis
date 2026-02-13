@@ -21,6 +21,13 @@ async def test_build_system_prompt_includes_profile():
 
 
 async def test_chat_turn_basic_flow(monkeypatch, db_pool):
+    # Disable RLM so the test exercises the AgentLoop path
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO config (key, value, description) VALUES ('chat.use_rlm', 'false', 'test override') "
+            "ON CONFLICT (key) DO UPDATE SET value = 'false'"
+        )
+
     class DummyMem:
         def __init__(self):
             self.remembered = []
@@ -55,7 +62,7 @@ async def test_chat_turn_basic_flow(monkeypatch, db_pool):
 
     monkeypatch.setattr(chat_mod.CognitiveMemory, "connect", fake_connect)
     monkeypatch.setattr("core.agent_loop.chat_completion", fake_chat_completion)
-    async def fake_agent_profile(_dsn):
+    async def fake_agent_profile(_dsn=None, **_kwargs):
         return {}
 
     monkeypatch.setattr(chat_mod, "get_agent_profile_context", fake_agent_profile)
@@ -73,6 +80,13 @@ async def test_chat_turn_basic_flow(monkeypatch, db_pool):
 
 
 async def test_chat_turn_tool_loop(monkeypatch, db_pool):
+    # Disable RLM so the test exercises the AgentLoop path
+    async with db_pool.acquire() as conn:
+        await conn.execute(
+            "INSERT INTO config (key, value, description) VALUES ('chat.use_rlm', 'false', 'test override') "
+            "ON CONFLICT (key) DO UPDATE SET value = 'false'"
+        )
+
     class DummyMem:
         async def hydrate(self, *_args, **_kwargs):
             return HydratedContext(
@@ -107,7 +121,7 @@ async def test_chat_turn_tool_loop(monkeypatch, db_pool):
 
     monkeypatch.setattr(chat_mod.CognitiveMemory, "connect", fake_connect)
     monkeypatch.setattr("core.agent_loop.chat_completion", fake_chat_completion)
-    async def fake_agent_profile(_dsn):
+    async def fake_agent_profile(_dsn=None, **_kwargs):
         return {}
 
     monkeypatch.setattr(chat_mod, "get_agent_profile_context", fake_agent_profile)

@@ -422,21 +422,23 @@ async def run_heartbeat_decision(
 # Session management for persistent multi-turn chat
 _chat_sessions: dict[str, HexisLocalREPL] = {}
 _session_last_used: dict[str, float] = {}
+_session_lock = asyncio.Lock()
 _SESSION_TTL = 300  # 5 minutes
 
 
-def _cleanup_stale_sessions() -> None:
+async def _cleanup_stale_sessions() -> None:
     """Remove chat sessions idle longer than TTL."""
     now = time.time()
-    stale = [
-        sid for sid, ts in _session_last_used.items()
-        if now - ts > _SESSION_TTL
-    ]
-    for sid in stale:
-        session = _chat_sessions.pop(sid, None)
-        if session:
-            session.cleanup()
-        _session_last_used.pop(sid, None)
+    async with _session_lock:
+        stale = [
+            sid for sid, ts in _session_last_used.items()
+            if now - ts > _SESSION_TTL
+        ]
+        for sid in stale:
+            session = _chat_sessions.pop(sid, None)
+            if session:
+                session.cleanup()
+            _session_last_used.pop(sid, None)
 
 
 async def run_chat_turn(
@@ -455,11 +457,11 @@ async def run_chat_turn(
 
     Returns a dict with keys: response, history, metrics.
     """
-    _cleanup_stale_sessions()
+    await _cleanup_stale_sessions()
 
     time_start = time.perf_counter()
     llm_cfg = normalize_llm_config(llm_config)
-    loop = asyncio.get_event_loop()
+    loop = asyncio.get_running_loop()
 
     # Create memory repo
     repo = MemoryRepo(dsn)
@@ -470,22 +472,23 @@ async def run_chat_turn(
 
     # Get or create REPL session
     repl: HexisLocalREPL
-    if session_id and session_id in _chat_sessions:
-        repl = _chat_sessions[session_id]
-        # Add new user message as context
-        repl.load_context(user_message, index=repl._context_count)
-    else:
-        repl = HexisLocalREPL()
-        repl.setup(
-            context_payload=user_message,
-            memory_env=memory_env,
-            llm_query_fn=llm_query_fn,
-        )
-        if session_id:
-            _chat_sessions[session_id] = repl
+    async with _session_lock:
+        if session_id and session_id in _chat_sessions:
+            repl = _chat_sessions[session_id]
+            # Add new user message as context
+            repl.load_context(user_message, index=repl._context_count)
+        else:
+            repl = HexisLocalREPL()
+            repl.setup(
+                context_payload=user_message,
+                memory_env=memory_env,
+                llm_query_fn=llm_query_fn,
+            )
+            if session_id:
+                _chat_sessions[session_id] = repl
 
-    if session_id:
-        _session_last_used[session_id] = time.time()
+        if session_id:
+            _session_last_used[session_id] = time.time()
 
     # Build system prompt
     system_prompt = load_rlm_chat_prompt()

@@ -8,6 +8,7 @@ Implements the ingestion flow described in ToDo/ingest.md.
 from __future__ import annotations
 
 import argparse
+import asyncio
 import hashlib
 import json
 import os
@@ -20,15 +21,6 @@ from enum import Enum
 from pathlib import Path
 from typing import Any, Callable, Optional
 from uuid import UUID
-
-try:
-    import requests
-except ImportError:
-    print("Installing requests...")
-    import subprocess
-
-    subprocess.check_call([sys.executable, "-m", "pip", "install", "requests", "--break-system-packages", "-q"])
-    import requests
 
 from core.cognitive_memory_api import (
     CognitiveMemorySync,
@@ -43,11 +35,13 @@ from core.cognitive_memory_api import (
 
 
 class IngestionMode(str, Enum):
-    AUTO = "auto"
-    DEEP = "deep"
-    STANDARD = "standard"
-    SHALLOW = "shallow"
-    ARCHIVE = "archive"
+    """Ingestion mode taxonomy:
+
+    FAST   -- chunk, appraise, extract facts (default)
+    SLOW   -- RLM conscious reading per chunk
+    HYBRID -- fast triage then selective RLM on high-signal chunks
+    """
+
     FAST = "fast"
     SLOW = "slow"
     HYBRID = "hybrid"
@@ -57,12 +51,12 @@ class IngestionMode(str, Enum):
 class Config:
     """Pipeline configuration."""
 
-    # LLM Settings
-    llm_endpoint: str = "http://localhost:11434/v1"
-    llm_model: str = "llama3.2"
-    llm_api_key: str = "not-needed"
+    # LLM Settings -- a fully-resolved llm_config dict (from resolve_llm_config / load_llm_config)
+    llm_config: dict[str, Any] | None = None
 
-    # Database Settings
+    # Database Settings (unified -- pass a DSN string)
+    dsn: str | None = None
+    # Legacy DB fields (used when dsn is None -- standalone CLI)
     db_host: str = "localhost"
     db_port: int = 43815
     db_name: str = "hexis_memory"
@@ -70,11 +64,10 @@ class Config:
     db_password: str = "password"
 
     # Mode
-    mode: IngestionMode = IngestionMode.AUTO
+    mode: IngestionMode = IngestionMode.FAST
 
-    # Mode thresholds (word counts)
+    # Internal threshold: docs <= this word count get per-section appraisal
     deep_max_words: int = 2000
-    standard_max_words: int = 20000
 
     # Chunking
     max_section_chars: int = 2000
@@ -209,26 +202,14 @@ def _word_count(text: str) -> int:
 def _normalize_mode(mode: IngestionMode | str | None) -> IngestionMode:
     if isinstance(mode, IngestionMode):
         return mode
-    raw = str(mode or "auto").strip().lower()
+    raw = str(mode or "fast").strip().lower()
+    # Legacy modes all collapse to FAST
+    if raw in ("auto", "standard", "deep", "shallow", "archive"):
+        return IngestionMode.FAST
     for item in IngestionMode:
         if raw == item.value:
             return item
-    return IngestionMode.AUTO
-
-
-def _select_mode(config: Config, words: int) -> IngestionMode:
-    if config.mode in (IngestionMode.FAST, IngestionMode.SLOW, IngestionMode.HYBRID):
-        # FAST maps to STANDARD pipeline; SLOW and HYBRID pass through
-        if config.mode == IngestionMode.FAST:
-            return IngestionMode.STANDARD
-        return config.mode
-    if config.mode != IngestionMode.AUTO:
-        return config.mode
-    if words <= config.deep_max_words:
-        return IngestionMode.DEEP
-    if words <= config.standard_max_words:
-        return IngestionMode.STANDARD
-    return IngestionMode.ARCHIVE
+    return IngestionMode.FAST
 
 
 def _decay_rate_for_intensity(intensity: float, base: float = 0.01) -> float:
@@ -243,8 +224,16 @@ def _decay_rate_for_intensity(intensity: float, base: float = 0.01) -> float:
 
 def _infer_source_type(file_path: Path) -> str:
     suffix = file_path.suffix.lower()
-    if suffix in {".pdf", ".md", ".markdown", ".txt", ".text", ".rtf", ".docx"}:
+    if suffix in {".pdf", ".md", ".markdown", ".txt", ".text", ".rtf", ".docx", ".tex", ".bib", ".epub"}:
         return "document"
+    if suffix == ".pptx":
+        return "presentation"
+    if suffix in {".xlsx", ".xls"}:
+        return "spreadsheet"
+    if suffix in {".eml", ".mbox"}:
+        return "email"
+    if suffix == ".ipynb":
+        return "code"
     if suffix in CodeReader.LANGUAGE_MAP:
         return "code"
     if suffix in {".json", ".yaml", ".yml", ".csv", ".xml"}:
@@ -642,12 +631,376 @@ class VideoReader(DocumentReader):
             return f"[Video: {file_path.name}]\n[Transcription failed: {e}]"
 
 
+class DocxReader(DocumentReader):
+    """Reader for Microsoft Word .docx files."""
+
+    EXTENSIONS = {".docx"}
+
+    @classmethod
+    def read(cls, file_path: Path) -> str:
+        try:
+            import docx
+        except ImportError:
+            raise RuntimeError(
+                "DOCX reader requires python-docx: pip install hexis[readers]"
+            )
+
+        doc = docx.Document(file_path)
+        parts: list[str] = []
+        for para in doc.paragraphs:
+            text = para.text.strip()
+            if text:
+                parts.append(text)
+        for table in doc.tables:
+            for row in table.rows:
+                cells = [cell.text.strip() for cell in row.cells]
+                parts.append("\t".join(cells))
+        return f"[Format: DOCX]\n[File: {file_path.name}]\n\n" + "\n".join(parts)
+
+
+class RtfReader(DocumentReader):
+    """Reader for RTF files."""
+
+    EXTENSIONS = {".rtf"}
+
+    @classmethod
+    def read(cls, file_path: Path) -> str:
+        try:
+            from striprtf.striprtf import rtf_to_text
+        except ImportError:
+            raise RuntimeError(
+                "RTF reader requires striprtf: pip install hexis[readers]"
+            )
+
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            raw = f.read()
+        text = rtf_to_text(raw)
+        return f"[Format: RTF]\n[File: {file_path.name}]\n\n{text}"
+
+
+class LatexReader(DocumentReader):
+    """Reader for LaTeX .tex and .bib files (regex-based, no deps)."""
+
+    EXTENSIONS = {".tex", ".bib"}
+
+    @classmethod
+    def read(cls, file_path: Path) -> str:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            content = f.read()
+
+        suffix = file_path.suffix.lower()
+        if suffix == ".bib":
+            return cls._read_bib(content, file_path)
+        return cls._read_tex(content, file_path)
+
+    @classmethod
+    def _read_tex(cls, content: str, file_path: Path) -> str:
+        # Strip non-content environments
+        for env in ("figure", "tikzpicture", "table", "lstlisting"):
+            content = re.sub(
+                rf"\\begin\{{{env}\}}.*?\\end\{{{env}\}}",
+                "",
+                content,
+                flags=re.DOTALL,
+            )
+        # Strip comments
+        content = re.sub(r"(?m)%.*$", "", content)
+        # Strip \command{...} but keep content inside braces for text commands
+        content = re.sub(r"\\(?:textbf|textit|emph|underline)\{([^}]*)\}", r"\1", content)
+        # Strip remaining commands (keep braced content)
+        content = re.sub(r"\\[a-zA-Z]+\*?(?:\[[^\]]*\])*\{([^}]*)\}", r"\1", content)
+        # Strip standalone commands
+        content = re.sub(r"\\[a-zA-Z]+\*?(?:\[[^\]]*\])*", "", content)
+        # Clean up braces
+        content = content.replace("{", "").replace("}", "")
+        # Collapse whitespace
+        content = re.sub(r"\n{3,}", "\n\n", content).strip()
+        return f"[Format: LaTeX]\n[File: {file_path.name}]\n\n{content}"
+
+    @classmethod
+    def _read_bib(cls, content: str, file_path: Path) -> str:
+        entries: list[str] = []
+        for match in re.finditer(
+            r"@\w+\{([^,]+),\s*(.*?)\n\}", content, flags=re.DOTALL
+        ):
+            key = match.group(1).strip()
+            body = match.group(2)
+            fields: dict[str, str] = {}
+            for fm in re.finditer(r"(\w+)\s*=\s*\{([^}]*)\}", body):
+                fields[fm.group(1).lower()] = fm.group(2).strip()
+            parts = [f"[{key}]"]
+            for field_name in ("author", "title", "year", "abstract"):
+                if field_name in fields:
+                    parts.append(f"  {field_name.title()}: {fields[field_name]}")
+            entries.append("\n".join(parts))
+        return (
+            f"[Format: BibTeX]\n[File: {file_path.name}]\n[Entries: {len(entries)}]\n\n"
+            + "\n\n".join(entries)
+        )
+
+
+class EmailReader(DocumentReader):
+    """Reader for .eml and .mbox email files (stdlib only)."""
+
+    EXTENSIONS = {".eml", ".mbox"}
+
+    @classmethod
+    def read(cls, file_path: Path) -> str:
+        suffix = file_path.suffix.lower()
+        if suffix == ".mbox":
+            return cls._read_mbox(file_path)
+        return cls._read_eml(file_path)
+
+    @classmethod
+    def _read_eml(cls, file_path: Path) -> str:
+        import email
+        import email.policy
+
+        with open(file_path, "rb") as f:
+            msg = email.message_from_bytes(f.read(), policy=email.policy.default)
+        return cls._format_message(msg)
+
+    @classmethod
+    def _read_mbox(cls, file_path: Path) -> str:
+        import mailbox
+
+        mbox = mailbox.mbox(str(file_path))
+        parts: list[str] = []
+        for i, msg in enumerate(mbox):
+            parts.append(f"--- Message {i + 1} ---")
+            parts.append(cls._format_message(msg))
+        if not parts:
+            return f"[Email]\n[File: {file_path.name}]\n[Empty mailbox]"
+        return "\n\n".join(parts)
+
+    @classmethod
+    def _format_message(cls, msg: Any) -> str:
+        subject = str(msg.get("Subject", "(no subject)"))
+        from_addr = str(msg.get("From", ""))
+        to_addr = str(msg.get("To", ""))
+        date = str(msg.get("Date", ""))
+
+        body = ""
+        if msg.is_multipart():
+            for part in msg.walk():
+                ct = part.get_content_type()
+                if ct == "text/plain":
+                    payload = part.get_payload(decode=True)
+                    if payload:
+                        body = payload.decode("utf-8", errors="replace")
+                        break
+            if not body:
+                for part in msg.walk():
+                    ct = part.get_content_type()
+                    if ct == "text/html":
+                        payload = part.get_payload(decode=True)
+                        if payload:
+                            body = re.sub(r"<[^>]+>", "", payload.decode("utf-8", errors="replace"))
+                            break
+        else:
+            payload = msg.get_payload(decode=True)
+            if payload:
+                body = payload.decode("utf-8", errors="replace")
+            elif isinstance(msg.get_payload(), str):
+                body = msg.get_payload()
+
+        header = f"[Email]\n[Subject: {subject}]\n[From: {from_addr}]\n[To: {to_addr}]\n[Date: {date}]"
+        return f"{header}\n\n{body.strip()}"
+
+
+class EpubReader(DocumentReader):
+    """Reader for EPUB e-book files."""
+
+    EXTENSIONS = {".epub"}
+
+    @classmethod
+    def read(cls, file_path: Path) -> str:
+        try:
+            import ebooklib
+            from ebooklib import epub
+        except ImportError:
+            raise RuntimeError(
+                "EPUB reader requires ebooklib and beautifulsoup4: pip install hexis[readers]"
+            )
+
+        try:
+            from bs4 import BeautifulSoup
+        except ImportError:
+            raise RuntimeError(
+                "EPUB reader requires beautifulsoup4: pip install hexis[readers]"
+            )
+
+        book = epub.read_epub(str(file_path), options={"ignore_ncx": True})
+        title = book.get_metadata("DC", "title")
+        title_str = title[0][0] if title else file_path.stem
+        author = book.get_metadata("DC", "creator")
+        author_str = author[0][0] if author else "Unknown"
+
+        parts: list[str] = []
+        for item in book.get_items_of_type(ebooklib.ITEM_DOCUMENT):
+            soup = BeautifulSoup(item.get_body_content(), "html.parser")
+            text = soup.get_text(separator="\n", strip=True)
+            if text.strip():
+                parts.append(text)
+
+        header = f"[Format: EPUB]\n[Title: {title_str}]\n[Author: {author_str}]"
+        return f"{header}\n\n" + "\n\n".join(parts)
+
+
+class PptxReader(DocumentReader):
+    """Reader for PowerPoint .pptx files."""
+
+    EXTENSIONS = {".pptx"}
+
+    @classmethod
+    def read(cls, file_path: Path) -> str:
+        try:
+            from pptx import Presentation
+        except ImportError:
+            raise RuntimeError(
+                "PPTX reader requires python-pptx: pip install hexis[readers]"
+            )
+
+        prs = Presentation(str(file_path))
+        parts: list[str] = []
+        for i, slide in enumerate(prs.slides):
+            slide_texts: list[str] = []
+            for shape in slide.shapes:
+                if shape.has_text_frame:
+                    for para in shape.text_frame.paragraphs:
+                        text = para.text.strip()
+                        if text:
+                            slide_texts.append(text)
+            if slide_texts:
+                parts.append(f"[Slide {i + 1}]\n" + "\n".join(slide_texts))
+
+        header = f"[Format: PPTX]\n[File: {file_path.name}]\n[Slides: {len(prs.slides)}]"
+        return f"{header}\n\n" + "\n\n".join(parts)
+
+
+class XlsxReader(DocumentReader):
+    """Reader for Excel .xlsx/.xls files."""
+
+    EXTENSIONS = {".xlsx", ".xls"}
+
+    MAX_ROWS_PER_SHEET = 500
+
+    @classmethod
+    def read(cls, file_path: Path) -> str:
+        try:
+            import openpyxl
+        except ImportError:
+            raise RuntimeError(
+                "XLSX reader requires openpyxl: pip install hexis[readers]"
+            )
+
+        wb = openpyxl.load_workbook(str(file_path), read_only=True, data_only=True)
+        parts: list[str] = []
+        for sheet_name in wb.sheetnames:
+            ws = wb[sheet_name]
+            rows: list[str] = []
+            for i, row in enumerate(ws.iter_rows(values_only=True)):
+                if i >= cls.MAX_ROWS_PER_SHEET:
+                    rows.append(f"... (truncated at {cls.MAX_ROWS_PER_SHEET} rows)")
+                    break
+                cells = [str(c) if c is not None else "" for c in row]
+                rows.append("\t".join(cells))
+            parts.append(f"[Sheet: {sheet_name}]\n" + "\n".join(rows))
+        wb.close()
+
+        header = f"[Format: XLSX]\n[File: {file_path.name}]\n[Sheets: {len(wb.sheetnames)}]"
+        return f"{header}\n\n" + "\n\n".join(parts)
+
+
+class NotebookReader(DocumentReader):
+    """Reader for Jupyter .ipynb notebooks (stdlib json only)."""
+
+    EXTENSIONS = {".ipynb"}
+
+    @classmethod
+    def read(cls, file_path: Path) -> str:
+        with open(file_path, "r", encoding="utf-8", errors="replace") as f:
+            nb = json.loads(f.read())
+
+        cells = nb.get("cells", [])
+        kernel = (
+            nb.get("metadata", {}).get("kernelspec", {}).get("language", "python")
+        )
+
+        parts: list[str] = []
+        for cell in cells:
+            cell_type = cell.get("cell_type", "")
+            source = "".join(cell.get("source", []))
+            if not source.strip():
+                continue
+            if cell_type == "markdown":
+                parts.append(source)
+            elif cell_type == "code":
+                parts.append(f"```{kernel}\n{source}\n```")
+
+        header = f"[Format: Jupyter Notebook]\n[File: {file_path.name}]\n[Cells: {len(cells)}]"
+        return f"{header}\n\n" + "\n\n".join(parts)
+
+
+class RssReader(DocumentReader):
+    """Reader for RSS/Atom feeds (URL-based, not file-based)."""
+
+    @classmethod
+    def read(cls, url: str) -> str:  # type: ignore[override]
+        try:
+            import feedparser
+        except ImportError:
+            raise RuntimeError(
+                "RSS reader requires feedparser: pip install hexis[readers]"
+            )
+
+        feed = feedparser.parse(url)
+        if not feed.entries:
+            return ""
+
+        feed_title = feed.feed.get("title", url)
+        parts: list[str] = [f"[Format: RSS/Atom]\n[Feed: {feed_title}]\n[Entries: {len(feed.entries)}]"]
+        for entry in feed.entries:
+            title = entry.get("title", "(no title)")
+            link = entry.get("link", "")
+            summary = entry.get("summary", "")
+            published = entry.get("published", "")
+            # Strip HTML from summary
+            summary = re.sub(r"<[^>]+>", "", summary)
+            entry_parts = [f"## {title}"]
+            if published:
+                entry_parts.append(f"Published: {published}")
+            if link:
+                entry_parts.append(f"Link: {link}")
+            if summary:
+                entry_parts.append(summary)
+            parts.append("\n".join(entry_parts))
+
+        return "\n\n".join(parts)
+
+
 def get_reader(file_path: Path) -> DocumentReader:
     suffix = file_path.suffix.lower()
     if suffix == ".pdf":
         return PDFReader()
     if suffix in [".md", ".markdown"]:
         return MarkdownReader()
+    if suffix in DocxReader.EXTENSIONS:
+        return DocxReader()
+    if suffix in RtfReader.EXTENSIONS:
+        return RtfReader()
+    if suffix in LatexReader.EXTENSIONS:
+        return LatexReader()
+    if suffix in EmailReader.EXTENSIONS:
+        return EmailReader()
+    if suffix in EpubReader.EXTENSIONS:
+        return EpubReader()
+    if suffix in PptxReader.EXTENSIONS:
+        return PptxReader()
+    if suffix in XlsxReader.EXTENSIONS:
+        return XlsxReader()
+    if suffix in NotebookReader.EXTENSIONS:
+        return NotebookReader()
     if suffix in DataReader.DATA_EXTENSIONS:
         return DataReader()
     if suffix in ImageReader.IMAGE_EXTENSIONS:
@@ -675,6 +1028,14 @@ class Sectioner:
         suffix = file_path.suffix.lower()
         if suffix in [".md", ".markdown"]:
             return self._split_markdown(content)
+        if suffix == ".pptx":
+            return self._split_on_delimiter(content, r"\[Slide \d+\]")
+        if suffix in {".xlsx", ".xls"}:
+            return self._split_on_delimiter(content, r"\[Sheet: [^\]]+\]")
+        if suffix == ".ipynb":
+            return self._split_notebook(content)
+        if suffix in {".eml", ".mbox"}:
+            return self._split_on_delimiter(content, r"--- Message \d+ ---")
         return self._split_text(content)
 
     def _split_markdown(self, content: str) -> list[Section]:
@@ -733,45 +1094,98 @@ class Sectioner:
             chunks = overlapped
         return [Section(title=f"Section {i + 1}", content=chunk, index=i) for i, chunk in enumerate(chunks)]
 
+    def _split_on_delimiter(self, content: str, pattern: str) -> list[Section]:
+        """Split content on a regex delimiter pattern, keeping the delimiter with its section."""
+        parts = re.split(f"({pattern})", content)
+        sections: list[Section] = []
+        current_title = "Header"
+        current_content = ""
+        for part in parts:
+            if re.match(pattern, part):
+                if current_content.strip():
+                    sections.append(Section(title=current_title, content=current_content.strip(), index=len(sections)))
+                current_title = part.strip().strip("[]").strip("-").strip()
+                current_content = ""
+            else:
+                current_content += part
+        if current_content.strip():
+            sections.append(Section(title=current_title, content=current_content.strip(), index=len(sections)))
+        if not sections:
+            return [Section(title="Document", content=content, index=0)]
+        return sections
+
+    def _split_notebook(self, content: str) -> list[Section]:
+        """Split notebook content on cell boundaries (triple-backtick blocks and text)."""
+        parts = re.split(r"(```\w*\n.*?```)", content, flags=re.DOTALL)
+        sections: list[Section] = []
+        for part in parts:
+            text = part.strip()
+            if not text:
+                continue
+            if text.startswith("```"):
+                title = f"Code Cell {len(sections) + 1}"
+            else:
+                title = f"Cell {len(sections) + 1}"
+            sections.append(Section(title=title, content=text, index=len(sections)))
+        if not sections:
+            return [Section(title="Notebook", content=content, index=0)]
+        return sections
+
 
 # =========================================================================
 # LLM CLIENT
 # =========================================================================
 
 
-class LLMClient:
+class IngestLLM:
+    """Thin LLM wrapper for the ingestion pipeline.
+
+    Uses core.llm.chat_completion() under the hood, supporting all
+    configured providers (OpenAI, Anthropic, Codex, Gemini, etc.).
+    """
+
     def __init__(self, config: Config):
-        self.config = config
-        self.endpoint = config.llm_endpoint.rstrip("/")
+        from core.llm import normalize_llm_config
+
+        self._cfg = normalize_llm_config(config.llm_config)
         self.call_count = 0
 
     def complete(self, messages: list[dict[str, str]], temperature: float = 0.3) -> str:
+        """Sync completion -- uses asyncio.run() for the standalone CLI path."""
+        return asyncio.run(self.acomplete(messages, temperature=temperature))
+
+    async def acomplete(self, messages: list[dict[str, str]], temperature: float = 0.3) -> str:
+        """Async completion via core.llm."""
+        from core.llm import chat_completion
+
         self.call_count += 1
-        payload = {
-            "model": self.config.llm_model,
-            "messages": messages,
-            "temperature": temperature,
-        }
-        headers = {"Content-Type": "application/json"}
-        if self.config.llm_api_key and self.config.llm_api_key != "not-needed":
-            headers["Authorization"] = f"Bearer {self.config.llm_api_key}"
-        resp = requests.post(
-            f"{self.endpoint}/chat/completions",
-            json=payload,
-            headers=headers,
-            timeout=180,
+        result = await chat_completion(
+            provider=self._cfg["provider"],
+            model=self._cfg["model"],
+            endpoint=self._cfg.get("endpoint"),
+            api_key=self._cfg.get("api_key"),
+            messages=messages,
+            temperature=temperature,
+            max_tokens=1200,
+            auth_mode=self._cfg.get("auth_mode"),
         )
-        if resp.status_code != 200:
-            raise RuntimeError(f"LLM request failed: {resp.status_code} - {resp.text}")
-        return resp.json()["choices"][0]["message"]["content"]
+        return result.get("content", "")
 
     def complete_json(self, messages: list[dict[str, str]], temperature: float = 0.2) -> dict[str, Any]:
         text = self.complete(messages, temperature=temperature)
+        return self._parse_json(text)
+
+    async def acomplete_json(self, messages: list[dict[str, str]], temperature: float = 0.2) -> dict[str, Any]:
+        """Async version of complete_json() for use with asyncio.gather()."""
+        text = await self.acomplete(messages, temperature=temperature)
+        return self._parse_json(text)
+
+    @staticmethod
+    def _parse_json(text: str) -> dict[str, Any]:
         json_text = text.strip()
         match = re.search(r"```(?:json)?\s*(.*?)\s*```", json_text, re.DOTALL)
         if match:
             json_text = match.group(1).strip()
-        # Try to find object
         if not json_text.startswith("{"):
             start = json_text.find("{")
             if start != -1:
@@ -789,10 +1203,11 @@ class LLMClient:
 
 
 class Appraiser:
-    def __init__(self, llm: LLMClient):
+    def __init__(self, llm: IngestLLM):
         self.llm = llm
 
-    def appraise(self, *, content: str, context: dict[str, Any], mode: IngestionMode) -> Appraisal:
+    @staticmethod
+    def _build_messages(content: str, context: dict[str, Any]) -> list[dict[str, str]]:
         system = (
             "You are Hexis' subconscious appraisal system."
             " Provide a brief, honest emotional assessment of the content."
@@ -809,10 +1224,10 @@ class Appraiser:
             " goal_relevance (array of {goal, strength}), worldview_tension (0..1), curiosity (0..1),"
             " summary (2-3 sentences)."
         )
-        raw = self.llm.complete_json(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.2,
-        )
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    @staticmethod
+    def _parse(raw: dict[str, Any]) -> Appraisal:
         return Appraisal(
             valence=float(raw.get("valence", 0.0) or 0.0),
             arousal=float(raw.get("arousal", 0.3) or 0.3),
@@ -824,25 +1239,30 @@ class Appraiser:
             summary=str(raw.get("summary", "") or ""),
         )
 
+    def appraise(self, *, content: str, context: dict[str, Any], mode: IngestionMode) -> Appraisal:
+        msgs = self._build_messages(content, context)
+        raw = self.llm.complete_json(msgs, temperature=0.2)
+        return self._parse(raw)
+
+    async def aappraise(self, *, content: str, context: dict[str, Any], mode: IngestionMode) -> Appraisal:
+        """Async version for use with asyncio.gather()."""
+        msgs = self._build_messages(content, context)
+        raw = await self.llm.acomplete_json(msgs, temperature=0.2)
+        return self._parse(raw)
+
 
 class KnowledgeExtractor:
-    def __init__(self, llm: LLMClient):
+    def __init__(self, llm: IngestLLM):
         self.llm = llm
 
-    def extract(
-        self,
-        *,
-        section: Section,
-        doc: DocumentInfo,
-        appraisal: Appraisal,
-        mode: IngestionMode,
-        max_items: int,
-    ) -> list[Extraction]:
+    @staticmethod
+    def _build_messages(
+        section: Section, doc: DocumentInfo, appraisal: Appraisal, mode: IngestionMode, max_items: int,
+    ) -> list[dict[str, str]]:
         system = (
             "You extract standalone knowledge worth remembering."
             " Be selective. Return STRICT JSON only."
         )
-        guidance = ""
         if doc.source_type == "code":
             guidance = (
                 "Focus on what the code does, key interfaces, behaviors, patterns,"
@@ -872,10 +1292,10 @@ class KnowledgeExtractor:
             + str(max_items)
             + " items."
         )
-        raw = self.llm.complete_json(
-            [{"role": "system", "content": system}, {"role": "user", "content": user}],
-            temperature=0.3,
-        )
+        return [{"role": "system", "content": system}, {"role": "user", "content": user}]
+
+    @staticmethod
+    def _parse(raw: dict[str, Any], max_items: int) -> list[Extraction]:
         items = raw.get("items") if isinstance(raw, dict) else None
         if not isinstance(items, list):
             return []
@@ -901,6 +1321,33 @@ class KnowledgeExtractor:
             )
         return out
 
+    def extract(
+        self,
+        *,
+        section: Section,
+        doc: DocumentInfo,
+        appraisal: Appraisal,
+        mode: IngestionMode,
+        max_items: int,
+    ) -> list[Extraction]:
+        msgs = self._build_messages(section, doc, appraisal, mode, max_items)
+        raw = self.llm.complete_json(msgs, temperature=0.3)
+        return self._parse(raw, max_items)
+
+    async def aextract(
+        self,
+        *,
+        section: Section,
+        doc: DocumentInfo,
+        appraisal: Appraisal,
+        mode: IngestionMode,
+        max_items: int,
+    ) -> list[Extraction]:
+        """Async version for use with asyncio.gather()."""
+        msgs = self._build_messages(section, doc, appraisal, mode, max_items)
+        raw = await self.llm.acomplete_json(msgs, temperature=0.3)
+        return self._parse(raw, max_items)
+
 
 # =========================================================================
 # STORAGE
@@ -915,10 +1362,13 @@ class MemoryStore:
     def connect(self) -> None:
         if self.client is not None:
             return
-        dsn = (
-            f"postgresql://{self.config.db_user}:{self.config.db_password}"
-            f"@{self.config.db_host}:{self.config.db_port}/{self.config.db_name}"
-        )
+        if self.config.dsn:
+            dsn = self.config.dsn
+        else:
+            dsn = (
+                f"postgresql://{self.config.db_user}:{self.config.db_password}"
+                f"@{self.config.db_host}:{self.config.db_port}/{self.config.db_name}"
+            )
         self.client = CognitiveMemorySync.connect(dsn, min_size=1, max_size=5)
 
     def close(self) -> None:
@@ -1046,6 +1496,56 @@ class MemoryStore:
             concept,
             strength,
         )
+
+    def link_concepts_batch(self, pairs: list[tuple[str, str]], strength: float = 1.0) -> None:
+        """Link multiple (memory_id, concept) pairs in a single batch call."""
+        if not pairs:
+            return
+        if self.client is None:
+            self.connect()
+        assert self.client is not None
+
+        async def _run():
+            async with self.client._async._pool.acquire() as conn:
+                await conn.executemany(
+                    "SELECT link_memory_to_concept($1::uuid, $2::text, $3::float)",
+                    [(mid, concept, strength) for mid, concept in pairs],
+                )
+
+        self.client._loop.run_until_complete(_run())
+
+    def connect_memories_batch(self, edges: list[tuple[str, str, "RelationshipType", float]]) -> None:
+        """Create multiple memory relationships in a single batch call."""
+        if not edges:
+            return
+        if self.client is None:
+            self.connect()
+        assert self.client is not None
+        from core.cognitive_memory_api import RelationshipInput
+        rels = [
+            RelationshipInput(
+                from_id=UUID(from_id),
+                to_id=UUID(to_id),
+                relationship_type=rel_type,
+                confidence=conf,
+            )
+            for from_id, to_id, rel_type, conf in edges
+        ]
+        self.client.connect_batch(rels)
+
+    def prefetch_embeddings(self, texts: list[str]) -> int:
+        """Pre-warm embedding cache for a batch of texts.
+
+        Calls the SQL ``prefetch_embeddings()`` function which batches HTTP
+        requests to the embedding service (default batch size 8) and caches
+        results.  Subsequent ``recall_similar_semantic`` / ``create_semantic_memory``
+        calls for the same content become cache hits.
+        """
+        if not texts:
+            return 0
+        if self.client is None:
+            self.connect()
+        return self._fetchval("SELECT prefetch_embeddings($1::text[])", texts) or 0
 
     def recall_similar_semantic(self, query: str, limit: int = 5):
         if self.client is None:
@@ -1182,6 +1682,14 @@ class IngestionPipeline:
     SUPPORTED_EXTENSIONS = (
         # Documents
         {".md", ".markdown", ".txt", ".text", ".pdf"}
+        | DocxReader.EXTENSIONS
+        | RtfReader.EXTENSIONS
+        | LatexReader.EXTENSIONS
+        | EmailReader.EXTENSIONS
+        | EpubReader.EXTENSIONS
+        | PptxReader.EXTENSIONS
+        | XlsxReader.EXTENSIONS
+        | NotebookReader.EXTENSIONS
         # Code
         | set(CodeReader.LANGUAGE_MAP.keys())
         # Data
@@ -1196,7 +1704,7 @@ class IngestionPipeline:
         self.config = config
         self.config.mode = _normalize_mode(self.config.mode)
         self.sectioner = Sectioner(config.max_section_chars, config.chunk_overlap)
-        self.llm = LLMClient(config)
+        self.llm = IngestLLM(config)
         self.appraiser = Appraiser(self.llm)
         self.extractor = KnowledgeExtractor(self.llm)
         self.store = MemoryStore(config)
@@ -1233,7 +1741,7 @@ class IngestionPipeline:
 
         title = _extract_title(content, file_path)
         words = _word_count(content)
-        mode = _select_mode(self.config, words)
+        mode = self.config.mode
         source_type = _infer_source_type(file_path)
         content_hash = _hash_text(content)
 
@@ -1261,33 +1769,21 @@ class IngestionPipeline:
         if self.config.verbose:
             _emit(self.config, f"  Mode: {mode.value} | Words: {words} | Sections: {len(sections)}")
 
-        # Archive mode: register encounter only
-        if mode == IngestionMode.ARCHIVE:
-            encounter_id = self._create_archive_encounter(doc)
-            self.stats["files_processed"] += 1
-            self.stats["memories_created"] += 1 if encounter_id else 0
-
-            # Store metrics for archive mode
-            metrics.memory_count = 1 if encounter_id else 0
-            metrics.llm_calls = self.llm.call_count - llm_calls_start
-            metrics.duration_seconds = time.time() - metrics.start_time
-            self.store.store_metrics(metrics)
-
-            return 1 if encounter_id else 0
-
         # Slow/hybrid mode: delegate to RLM-based ingestion
         if mode in (IngestionMode.SLOW, IngestionMode.HYBRID):
             count = self._run_rlm_ingest(mode, doc, sections, metrics, llm_calls_start)
             return count
 
-        # Appraise (overall for standard/shallow; per section for deep)
+        # FAST mode: small docs (<=deep_max_words) get per-section appraisal;
+        # larger docs get a single doc-level appraisal. All sections processed.
         base_context = self._build_appraisal_context(doc)
+        use_deep = words <= self.config.deep_max_words
+
         overall_appraisal = None
-        if mode in (IngestionMode.STANDARD, IngestionMode.SHALLOW):
+        if not use_deep:
             sample = self._sample_content(content)
             overall_appraisal = self.appraiser.appraise(content=sample, context=base_context, mode=mode)
             self.store.set_affective_state(overall_appraisal)
-            # Update metrics with appraisal
             metrics.appraisal_valence = overall_appraisal.valence
             metrics.appraisal_arousal = overall_appraisal.arousal
             metrics.appraisal_emotion = overall_appraisal.primary_emotion
@@ -1299,43 +1795,61 @@ class IngestionPipeline:
         total_extractions = 0
         dedup_count = 0
 
-        for section in sections:
-            if _should_cancel(self.config):
-                raise RuntimeError("Ingestion cancelled")
-            if self._skip_section(section.title):
-                continue
-            appraisal = overall_appraisal
-            if mode == IngestionMode.DEEP:
-                sample = self._sample_content(section.content)
-                appraisal = self.appraiser.appraise(content=sample, context=base_context, mode=mode)
+        # -- Phase 1: parallel LLM extraction --
+        active_sections = [s for s in sections if not self._skip_section(s.title)]
+
+        if _should_cancel(self.config):
+            raise RuntimeError("Ingestion cancelled")
+
+        max_items = self.config.max_facts_per_section
+
+        if use_deep:
+            # Small docs: each section gets its own appraisal + extraction
+            async def _parallel_deep() -> list[tuple[Appraisal, list[Extraction]]]:
+                async def _appraise_and_extract(s: Section) -> tuple[Appraisal, list[Extraction]]:
+                    sample = self._sample_content(s.content)
+                    apr = await self.appraiser.aappraise(content=sample, context=base_context, mode=mode)
+                    exts = await self.extractor.aextract(
+                        section=s, doc=doc, appraisal=apr, mode=mode, max_items=max_items,
+                    )
+                    return apr, exts
+                return await asyncio.gather(*[_appraise_and_extract(s) for s in active_sections])
+
+            deep_results = asyncio.run(_parallel_deep())
+
+            for section, (appraisal, extractions) in zip(active_sections, deep_results):
                 self.store.set_affective_state(appraisal)
-                # Track last appraisal for deep mode
                 metrics.appraisal_valence = appraisal.valence
                 metrics.appraisal_arousal = appraisal.arousal
                 metrics.appraisal_emotion = appraisal.primary_emotion
                 metrics.appraisal_intensity = appraisal.intensity
-            if mode == IngestionMode.SHALLOW:
-                # Only use the first section for shallow extraction
-                if section.index > 0:
-                    break
-            if appraisal is None:
-                appraisal = Appraisal()
-            max_items = self.config.max_facts_per_section
-            if mode == IngestionMode.SHALLOW:
-                max_items = max(3, min(5, max_items))
-            extractions = self.extractor.extract(
-                section=section,
-                doc=doc,
-                appraisal=appraisal,
-                mode=mode,
-                max_items=max_items,
-            )
-            if not extractions:
-                continue
-            total_extractions += len(extractions)
-            new_memories = self._create_semantic_memories(doc, encounter_id, appraisal, extractions)
-            dedup_count += len(extractions) - len(new_memories)
-            created_ids.extend(new_memories)
+                if not extractions:
+                    continue
+                total_extractions += len(extractions)
+                new_memories = self._create_semantic_memories(doc, encounter_id, appraisal, extractions)
+                dedup_count += len(extractions) - len(new_memories)
+                created_ids.extend(new_memories)
+        else:
+            # Larger docs: shared appraisal, parallel extraction only
+            appraisal = overall_appraisal if overall_appraisal is not None else Appraisal()
+
+            async def _parallel_extract() -> list[list[Extraction]]:
+                return await asyncio.gather(*[
+                    self.extractor.aextract(
+                        section=s, doc=doc, appraisal=appraisal, mode=mode, max_items=max_items,
+                    )
+                    for s in active_sections
+                ])
+
+            section_extractions = asyncio.run(_parallel_extract())
+
+            for section, extractions in zip(active_sections, section_extractions):
+                if not extractions:
+                    continue
+                total_extractions += len(extractions)
+                new_memories = self._create_semantic_memories(doc, encounter_id, appraisal, extractions)
+                dedup_count += len(extractions) - len(new_memories)
+                created_ids.extend(new_memories)
 
         if self.config.verbose:
             _emit(self.config, f"  Created {len(created_ids)} semantic memories")
@@ -1353,14 +1867,33 @@ class IngestionPipeline:
 
         return len(created_ids)
 
-    def ingest_directory(self, dir_path: Path, recursive: bool = True) -> int:
+    GIT_IGNORE_DIRS = {
+        ".git", "node_modules", "__pycache__", ".venv", "venv",
+        ".env", "dist", "build", ".tox", ".mypy_cache",
+        ".pytest_cache", "vendor", ".bundle", ".next", "coverage",
+    }
+
+    def ingest_directory(
+        self,
+        dir_path: Path,
+        recursive: bool = True,
+        exclude_dirs: set[str] | None = None,
+    ) -> int:
         if _should_cancel(self.config):
             raise RuntimeError("Ingestion cancelled")
         if not dir_path.exists() or not dir_path.is_dir():
             _emit(self.config, f"Directory not found: {dir_path}")
             return 0
         pattern = "**/*" if recursive else "*"
-        files = [f for f in dir_path.glob(pattern) if f.is_file() and f.suffix.lower() in self.SUPPORTED_EXTENSIONS]
+        files = [
+            f for f in dir_path.glob(pattern)
+            if f.is_file()
+            and f.suffix.lower() in self.SUPPORTED_EXTENSIONS
+            and (
+                exclude_dirs is None
+                or not any(part in exclude_dirs for part in f.relative_to(dir_path).parts)
+            )
+        ]
         if self.config.verbose:
             _emit(self.config, f"Found {len(files)} files to process")
         total = 0
@@ -1379,15 +1912,25 @@ class IngestionPipeline:
         try:
             content = WebReader.read(url)
             metrics.source_size_bytes = len(content.encode("utf-8"))
-        except Exception as exc:
-            _emit(self.config, f"  Error fetching URL: {exc}")
-            self.stats["errors"] += 1
-            metrics.errors.append(str(exc))
-            return 0
+        except Exception:
+            # Fallback: try as RSS/Atom feed
+            try:
+                content = RssReader.read(url)
+                if content:
+                    metrics.source_size_bytes = len(content.encode("utf-8"))
+                    if self.config.verbose:
+                        _emit(self.config, "  Fetched as RSS/Atom feed")
+                else:
+                    raise RuntimeError("No RSS entries found")
+            except Exception as exc2:
+                _emit(self.config, f"  Error fetching URL: {exc2}")
+                self.stats["errors"] += 1
+                metrics.errors.append(str(exc2))
+                return 0
 
         content_hash = _hash_text(content)
         words = _word_count(content)
-        mode = _select_mode(self.config, words)
+        mode = self.config.mode
 
         # Extract title from content header if not provided
         if not title:
@@ -1422,59 +1965,69 @@ class IngestionPipeline:
         if self.config.verbose:
             _emit(self.config, f"  Mode: {mode.value} | Words: {words} | Sections: {len(sections)}")
 
-        if mode == IngestionMode.ARCHIVE:
-            encounter_id = self._create_archive_encounter(doc)
-            self.stats["files_processed"] += 1
-            self.stats["memories_created"] += 1 if encounter_id else 0
-            metrics.memory_count = 1 if encounter_id else 0
-            metrics.llm_calls = self.llm.call_count - llm_calls_start
-            metrics.duration_seconds = time.time() - metrics.start_time
-            self.store.store_metrics(metrics)
-            return 1 if encounter_id else 0
-
+        # FAST mode: small docs get per-section appraisal, larger get doc-level
         base_context = self._build_appraisal_context(doc)
-        sample = self._sample_content(content)
-        appraisal = self.appraiser.appraise(content=sample, context=base_context, mode=mode)
-        self.store.set_affective_state(appraisal)
+        use_deep = words <= self.config.deep_max_words
 
-        metrics.appraisal_valence = appraisal.valence
-        metrics.appraisal_arousal = appraisal.arousal
-        metrics.appraisal_emotion = appraisal.primary_emotion
-        metrics.appraisal_intensity = appraisal.intensity
+        if use_deep:
+            overall_appraisal = None
+        else:
+            sample = self._sample_content(content)
+            overall_appraisal = self.appraiser.appraise(content=sample, context=base_context, mode=mode)
+            self.store.set_affective_state(overall_appraisal)
+            metrics.appraisal_valence = overall_appraisal.valence
+            metrics.appraisal_arousal = overall_appraisal.arousal
+            metrics.appraisal_emotion = overall_appraisal.primary_emotion
+            metrics.appraisal_intensity = overall_appraisal.intensity
 
-        encounter_id = self._create_encounter_memory(doc, appraisal, mode)
+        encounter_id = self._create_encounter_memory(doc, overall_appraisal, mode)
 
         created_ids: list[str] = []
         total_extractions = 0
         dedup_count = 0
 
-        for section in sections:
-            if self._skip_section(section.title):
-                continue
-            section_appraisal = appraisal
-            if mode == IngestionMode.DEEP:
-                sample = self._sample_content(section.content)
-                section_appraisal = self.appraiser.appraise(content=sample, context=base_context, mode=mode)
+        active_sections = [s for s in sections if not self._skip_section(s.title)]
+        max_items = self.config.max_facts_per_section
+
+        if use_deep:
+            async def _parallel_deep() -> list[tuple[Appraisal, list[Extraction]]]:
+                async def _appraise_and_extract(s: Section) -> tuple[Appraisal, list[Extraction]]:
+                    sample = self._sample_content(s.content)
+                    apr = await self.appraiser.aappraise(content=sample, context=base_context, mode=mode)
+                    exts = await self.extractor.aextract(
+                        section=s, doc=doc, appraisal=apr, mode=mode, max_items=max_items,
+                    )
+                    return apr, exts
+                return await asyncio.gather(*[_appraise_and_extract(s) for s in active_sections])
+
+            deep_results = asyncio.run(_parallel_deep())
+
+            for section, (section_appraisal, extractions) in zip(active_sections, deep_results):
                 self.store.set_affective_state(section_appraisal)
-            if mode == IngestionMode.SHALLOW and section.index > 0:
-                break
+                if extractions:
+                    total_extractions += len(extractions)
+                    new_memories = self._create_semantic_memories(doc, encounter_id, section_appraisal, extractions)
+                    dedup_count += len(extractions) - len(new_memories)
+                    created_ids.extend(new_memories)
+        else:
+            appraisal = overall_appraisal if overall_appraisal is not None else Appraisal()
 
-            max_items = self.config.max_facts_per_section
-            if mode == IngestionMode.SHALLOW:
-                max_items = max(3, min(5, max_items))
+            async def _parallel_extract() -> list[list[Extraction]]:
+                return await asyncio.gather(*[
+                    self.extractor.aextract(
+                        section=s, doc=doc, appraisal=appraisal, mode=mode, max_items=max_items,
+                    )
+                    for s in active_sections
+                ])
 
-            extractions = self.extractor.extract(
-                section=section,
-                doc=doc,
-                appraisal=section_appraisal,
-                mode=mode,
-                max_items=max_items,
-            )
-            if extractions:
-                total_extractions += len(extractions)
-                new_memories = self._create_semantic_memories(doc, encounter_id, section_appraisal, extractions)
-                dedup_count += len(extractions) - len(new_memories)
-                created_ids.extend(new_memories)
+            section_extractions = asyncio.run(_parallel_extract())
+
+            for section, extractions in zip(active_sections, section_extractions):
+                if extractions:
+                    total_extractions += len(extractions)
+                    new_memories = self._create_semantic_memories(doc, encounter_id, appraisal, extractions)
+                    dedup_count += len(extractions) - len(new_memories)
+                    created_ids.extend(new_memories)
 
         if self.config.verbose:
             _emit(self.config, f"  Created {len(created_ids)} semantic memories")
@@ -1534,7 +2087,7 @@ class IngestionPipeline:
             "source_type": doc.source_type,
             "source_ref": doc.content_hash,
             "word_count": doc.word_count,
-            "mode": IngestionMode.ARCHIVE.value,
+            "mode": "archived",
             "awaiting_processing": True,
         }
         importance = max(self.config.min_importance_floor or 0.0, 0.2)
@@ -1590,6 +2143,23 @@ class IngestionPipeline:
     ) -> list[str]:
         created: list[str] = []
         source = self._source_payload(doc)
+
+        # Pre-warm embedding cache: batch all extraction texts into a single
+        # call so subsequent per-extraction recall + create are cache hits.
+        texts_to_embed = [
+            ext.content
+            for ext in extractions
+            if ext.confidence >= self.config.min_confidence_threshold
+        ]
+        if texts_to_embed:
+            self.store.prefetch_embeddings(texts_to_embed)
+
+        # Collect deferred work for batch execution after the per-item loop
+        concept_pairs: list[tuple[str, str]] = []
+        worldview_hints: dict[str, str | list] = {}  # hint_key -> raw hint
+        deferred_worldview_edges: list[tuple[str, str | list, str, float]] = []  # (memory_id, hint, rel_type_name, confidence)
+        deferred_edges: list[tuple[str, str, RelationshipType, float]] = []
+
         for ext in extractions:
             if ext.confidence < self.config.min_confidence_threshold:
                 continue
@@ -1627,50 +2197,64 @@ class IngestionPipeline:
             )
             created.append(memory_id)
 
-            # Link extracted concepts to the knowledge graph
+            # Collect concept links for batch
             for concept in ext.concepts:
-                try:
-                    self.store.link_concept(memory_id, concept.strip())
-                except Exception:
-                    pass
+                concept_pairs.append((memory_id, concept.strip()))
 
-            # Create supports/contradicts edges to worldview memories
+            # Collect worldview edge hints (deduplicated lookup later)
             if ext.supports:
-                worldview_id = self._find_worldview_by_content(ext.supports)
-                if worldview_id:
-                    try:
-                        self.store.connect_memories(
-                            memory_id, worldview_id, RelationshipType.SUPPORTS, confidence=ext.confidence
-                        )
-                    except Exception:
-                        pass
+                hint_key = str(ext.supports) if isinstance(ext.supports, list) else ext.supports
+                worldview_hints[hint_key] = ext.supports
+                deferred_worldview_edges.append((memory_id, ext.supports, "SUPPORTS", ext.confidence))
 
             if ext.contradicts:
-                worldview_id = self._find_worldview_by_content(ext.contradicts)
-                if worldview_id:
-                    try:
-                        self.store.connect_memories(
-                            memory_id, worldview_id, RelationshipType.CONTRADICTS, confidence=ext.confidence
-                        )
-                    except Exception:
-                        pass
+                hint_key = str(ext.contradicts) if isinstance(ext.contradicts, list) else ext.contradicts
+                worldview_hints[hint_key] = ext.contradicts
+                deferred_worldview_edges.append((memory_id, ext.contradicts, "CONTRADICTS", ext.confidence))
 
             if encounter_id:
-                try:
-                    self.store.connect_memories(memory_id, encounter_id, RelationshipType.DERIVED_FROM, confidence=0.9)
-                except Exception:
-                    pass
+                deferred_edges.append((memory_id, encounter_id, RelationshipType.DERIVED_FROM, 0.9))
             if match and match[1] == "related":
-                try:
-                    self.store.connect_memories(memory_id, str(match[0].id), RelationshipType.ASSOCIATED, confidence=0.6)
-                except Exception:
-                    pass
+                deferred_edges.append((memory_id, str(match[0].id), RelationshipType.ASSOCIATED, 0.6))
             self._apply_decay(memory_id, intensity=appraisal.intensity)
+
+        # --- Batch flush phase ---
+
+        # 1. Batch concept linking
+        if concept_pairs:
+            try:
+                self.store.link_concepts_batch(concept_pairs)
+            except Exception:
+                pass
+
+        # 2. Batch worldview lookups (deduplicated)
+        worldview_cache: dict[str, str | None] = {}
+        for hint_key, hint_val in worldview_hints.items():
+            if hint_key not in worldview_cache:
+                worldview_cache[hint_key] = self._find_worldview_by_content(hint_val)
+
+        # 3. Resolve worldview edges and add to deferred_edges
+        for memory_id, hint, rel_type_name, confidence in deferred_worldview_edges:
+            hint_key = str(hint) if isinstance(hint, list) else hint
+            worldview_id = worldview_cache.get(hint_key)
+            if worldview_id:
+                rel_type = RelationshipType.SUPPORTS if rel_type_name == "SUPPORTS" else RelationshipType.CONTRADICTS
+                deferred_edges.append((memory_id, worldview_id, rel_type, confidence))
+
+        # 4. Batch relationship creation
+        if deferred_edges:
+            try:
+                self.store.connect_memories_batch(deferred_edges)
+            except Exception:
+                pass
+
         return created
 
-    def _find_worldview_by_content(self, hint: str) -> str | None:
+    def _find_worldview_by_content(self, hint) -> str | None:
         """Find a worldview memory matching the given hint."""
-        if not hint or not hint.strip():
+        if isinstance(hint, list):
+            hint = " ".join(str(h) for h in hint if h) if hint else ""
+        if not hint or not isinstance(hint, str) or not hint.strip():
             return None
         try:
             results = self.store.client.recall(
@@ -1703,56 +2287,39 @@ class IngestionPipeline:
         Used by ingest_file() when mode is SLOW or HYBRID.
         """
         import asyncio as _asyncio
+        import concurrent.futures
 
         from services.slow_ingest_rlm import run_hybrid_ingest, run_slow_ingest
 
-        dsn = (
-            f"postgresql://{self.config.db_user}:{self.config.db_password}"
-            f"@{self.config.db_host}:{self.config.db_port}/{self.config.db_name}"
-        )
-        llm_cfg = {
-            "endpoint": self.config.llm_endpoint,
-            "model": self.config.llm_model,
-            "api_key": self.config.llm_api_key,
-        }
+        if self.config.dsn:
+            dsn = self.config.dsn
+        else:
+            dsn = (
+                f"postgresql://{self.config.db_user}:{self.config.db_password}"
+                f"@{self.config.db_host}:{self.config.db_port}/{self.config.db_name}"
+            )
+        llm_cfg = self.llm._cfg
 
         runner = run_slow_ingest if mode == IngestionMode.SLOW else run_hybrid_ingest
+        coro = runner(
+            pipeline=self,
+            doc=doc,
+            sections=sections,
+            llm_config=llm_cfg,
+            dsn=dsn,
+        )
 
+        # Run async coroutine from sync context. If an event loop is already
+        # running (e.g. called from ingest_api thread), offload to a fresh
+        # thread with its own loop; otherwise use asyncio.run() directly.
         try:
-            loop = _asyncio.get_event_loop()
-            if loop.is_running():
-                import concurrent.futures
-                with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
-                    result = pool.submit(
-                        _asyncio.run,
-                        runner(
-                            pipeline=self,
-                            doc=doc,
-                            sections=sections,
-                            llm_config=llm_cfg,
-                            dsn=dsn,
-                        ),
-                    ).result()
-            else:
-                result = loop.run_until_complete(
-                    runner(
-                        pipeline=self,
-                        doc=doc,
-                        sections=sections,
-                        llm_config=llm_cfg,
-                        dsn=dsn,
-                    )
-                )
+            _asyncio.get_running_loop()
+            # Already inside an event loop -- run in a separate thread.
+            with concurrent.futures.ThreadPoolExecutor(max_workers=1) as pool:
+                result = pool.submit(_asyncio.run, coro).result()
         except RuntimeError:
-            result = _asyncio.run(
-                runner(
-                    pipeline=self,
-                    doc=doc,
-                    sections=sections,
-                    llm_config=llm_cfg,
-                    dsn=dsn,
-                )
-            )
+            # No running loop -- safe to use asyncio.run().
+            result = _asyncio.run(coro)
 
         count = result.get("memories_created", 0)
         self.stats["files_processed"] += 1
@@ -1832,7 +2399,7 @@ class IngestionPipeline:
                 if path.exists():
                     # Re-ingest the file with the current mode (not archive)
                     original_mode = self.config.mode
-                    self.config.mode = IngestionMode.STANDARD
+                    self.config.mode = IngestionMode.FAST
                     try:
                         # Mark as processed first to avoid duplicate detection
                         self.store._fetchval(
@@ -1934,7 +2501,7 @@ class ArchivedContentProcessor:
                 if path.exists():
                     self.pipeline.store.mark_archived_processed(memory_id)
                     original_mode = self.config.mode
-                    self.config.mode = IngestionMode.STANDARD
+                    self.config.mode = IngestionMode.FAST
                     try:
                         self.pipeline.ingest_file(path)
                     finally:
@@ -1998,9 +2565,10 @@ def _get_db_env_defaults() -> dict[str, Any]:
 
 def _add_common_args(parser: argparse.ArgumentParser, env_defaults: dict[str, Any]) -> None:
     """Add common arguments shared across subcommands."""
-    parser.add_argument("--endpoint", "-e", default="http://localhost:11434/v1", help="LLM endpoint")
-    parser.add_argument("--model", "-m", default="llama3.2", help="LLM model name")
-    parser.add_argument("--api-key", default="not-needed", help="LLM API key")
+    parser.add_argument("--endpoint", "-e", default=None, help="LLM endpoint (overrides DB config)")
+    parser.add_argument("--model", "-m", default=None, help="LLM model name (overrides DB config)")
+    parser.add_argument("--api-key", default=None, help="LLM API key (overrides DB config)")
+    parser.add_argument("--provider", default=None, help="LLM provider (overrides DB config)")
 
     parser.add_argument("--db-host", default=env_defaults["db_host"], help="Database host")
     parser.add_argument("--db-port", type=int, default=env_defaults["db_port"], help="Database port")
@@ -2011,12 +2579,62 @@ def _add_common_args(parser: argparse.ArgumentParser, env_defaults: dict[str, An
     parser.add_argument("--quiet", "-q", action="store_true", help="Suppress verbose output")
 
 
+def _load_llm_config_from_db(args: argparse.Namespace) -> dict[str, Any] | None:
+    """Load fully-resolved LLM config using the same path as `hexis chat`.
+
+    Uses core.llm_config.load_llm_config() which handles provider-specific
+    credential loading (OAuth tokens for Codex, etc.).
+    """
+    import asyncio
+
+    import asyncpg
+
+    async def _load() -> dict[str, Any] | None:
+        try:
+            dsn = (
+                f"postgresql://{args.db_user}:{args.db_password}"
+                f"@{args.db_host}:{args.db_port}/{args.db_name}"
+            )
+            conn = await asyncpg.connect(dsn)
+            try:
+                from core.llm_config import load_llm_config
+
+                cfg = await load_llm_config(conn, "llm.chat", fallback_key="llm")
+                return cfg
+            finally:
+                await conn.close()
+        except Exception:
+            return None
+
+    return asyncio.run(_load())
+
+
 def _build_config_from_args(args: argparse.Namespace) -> Config:
-    """Build Config from parsed arguments."""
+    """Build Config from parsed arguments.
+
+    Priority: CLI flags > DB config (with full credential resolution) > defaults.
+    """
+    # Load fully-resolved config from DB (handles OAuth, etc.)
+    db_llm = _load_llm_config_from_db(args) or {}
+
+    # CLI overrides (only if explicitly set — None means "not provided")
+    cli_endpoint = getattr(args, "endpoint", None)
+    cli_model = getattr(args, "model", None)
+    cli_api_key = getattr(args, "api_key", None)
+    cli_provider = getattr(args, "provider", None)
+
+    llm_config: dict[str, Any] = dict(db_llm)
+    if cli_endpoint:
+        llm_config["endpoint"] = cli_endpoint
+    if cli_model:
+        llm_config["model"] = cli_model
+    if cli_api_key:
+        llm_config["api_key"] = cli_api_key
+    if cli_provider:
+        llm_config["provider"] = cli_provider
+
     return Config(
-        llm_endpoint=getattr(args, "endpoint", "http://localhost:11434/v1"),
-        llm_model=getattr(args, "model", "llama3.2"),
-        llm_api_key=getattr(args, "api_key", "not-needed"),
+        llm_config=llm_config,
         db_host=args.db_host,
         db_port=args.db_port,
         db_name=args.db_name,
@@ -2040,6 +2658,8 @@ def _cmd_ingest(args: argparse.Namespace) -> None:
             count = _ingest_stdin(pipeline, args)
         elif args.url:
             count = _ingest_url(pipeline, args)
+        elif getattr(args, "github", None):
+            count = _ingest_github(pipeline, args)
         elif args.file:
             count = pipeline.ingest_file(args.file)
         elif args.input:
@@ -2067,7 +2687,7 @@ def _ingest_stdin(pipeline: IngestionPipeline, args: argparse.Namespace) -> int:
     # Create a virtual DocumentInfo
     content_hash = _hash_text(content)
     words = _word_count(content)
-    mode = _select_mode(pipeline.config, words)
+    mode = pipeline.config.mode
 
     source_type_map = {
         "text": "document",
@@ -2099,35 +2719,31 @@ def _ingest_stdin(pipeline: IngestionPipeline, args: argparse.Namespace) -> int:
     _emit(pipeline.config, f"Processing stdin: {title}")
     _emit(pipeline.config, f"  Mode: {mode.value} | Words: {words} | Sections: {len(sections)}")
 
-    if mode == IngestionMode.ARCHIVE:
-        encounter_id = pipeline._create_archive_encounter(doc)
-        pipeline.stats["files_processed"] += 1
-        pipeline.stats["memories_created"] += 1 if encounter_id else 0
-        return 1 if encounter_id else 0
-
-    # Appraise and process
+    # FAST mode: small docs get per-section appraisal, larger get doc-level
     base_context = pipeline._build_appraisal_context(doc)
-    sample = pipeline._sample_content(content)
-    appraisal = pipeline.appraiser.appraise(content=sample, context=base_context, mode=mode)
-    pipeline.store.set_affective_state(appraisal)
+    use_deep = words <= pipeline.config.deep_max_words
 
-    encounter_id = pipeline._create_encounter_memory(doc, appraisal, mode)
+    if use_deep:
+        overall_appraisal = None
+    else:
+        sample = pipeline._sample_content(content)
+        overall_appraisal = pipeline.appraiser.appraise(content=sample, context=base_context, mode=mode)
+        pipeline.store.set_affective_state(overall_appraisal)
+
+    encounter_id = pipeline._create_encounter_memory(doc, overall_appraisal, mode)
 
     created_ids: list[str] = []
     for section in sections:
         if pipeline._skip_section(section.title):
             continue
-        section_appraisal = appraisal
-        if mode == IngestionMode.DEEP:
+        if use_deep:
             sample = pipeline._sample_content(section.content)
             section_appraisal = pipeline.appraiser.appraise(content=sample, context=base_context, mode=mode)
             pipeline.store.set_affective_state(section_appraisal)
-        if mode == IngestionMode.SHALLOW and section.index > 0:
-            break
+        else:
+            section_appraisal = overall_appraisal if overall_appraisal is not None else Appraisal()
 
         max_items = pipeline.config.max_facts_per_section
-        if mode == IngestionMode.SHALLOW:
-            max_items = max(3, min(5, max_items))
 
         extractions = pipeline.extractor.extract(
             section=section,
@@ -2149,6 +2765,42 @@ def _ingest_url(pipeline: IngestionPipeline, args: argparse.Namespace) -> int:
     """Ingest content from a URL."""
     title = getattr(args, "title", None)
     return pipeline.ingest_url(args.url, title=title)
+
+
+def _ingest_github(pipeline: IngestionPipeline, args: argparse.Namespace) -> int:
+    """Clone a GitHub repo to a temp dir and ingest its contents."""
+    import shutil
+    import subprocess
+    import tempfile
+
+    repo = args.github.strip()
+    # Accept owner/repo shorthand
+    if "/" in repo and not repo.startswith("http"):
+        repo = f"https://github.com/{repo}"
+
+    tmpdir = tempfile.mkdtemp(prefix="hexis_git_")
+    try:
+        cmd = ["git", "clone", "--depth", "1"]
+        branch = getattr(args, "branch", None)
+        if branch:
+            cmd.extend(["--branch", branch])
+        cmd.extend([repo, tmpdir])
+
+        _emit(pipeline.config, f"Cloning {repo} ...")
+        subprocess.check_call(cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE)
+
+        count = pipeline.ingest_directory(
+            Path(tmpdir),
+            recursive=True,
+            exclude_dirs=IngestionPipeline.GIT_IGNORE_DIRS,
+        )
+        _emit(pipeline.config, f"Ingested {count} memories from {repo}")
+        return count
+    except subprocess.CalledProcessError as e:
+        _emit(pipeline.config, f"Git clone failed: {e}")
+        return 0
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def _cmd_status(args: argparse.Namespace) -> None:
@@ -2245,8 +2897,8 @@ Subcommands:
   process  Process archived content that hasn't been fully engaged
 
 Examples:
-  %(prog)s ingest --file doc.md --mode deep
-  %(prog)s ingest --input ./docs --mode shallow
+  %(prog)s ingest --file doc.md --mode fast
+  %(prog)s ingest --input ./docs --mode slow
   %(prog)s ingest --url https://example.com/article
   echo "Some text" | %(prog)s ingest --stdin --stdin-type text
   %(prog)s status --pending
@@ -2264,12 +2916,14 @@ Examples:
     input_group.add_argument("--input", "-i", type=Path, help="Directory to ingest")
     input_group.add_argument("--url", "-u", type=str, help="URL to fetch and ingest")
     input_group.add_argument("--stdin", action="store_true", help="Read content from stdin")
+    input_group.add_argument("--github", "-g", type=str, help="GitHub repo URL or owner/repo to clone and ingest")
 
+    ingest_p.add_argument("--branch", type=str, default=None, help="Branch to clone (default: repo default)")
     ingest_p.add_argument("--stdin-type", choices=["text", "markdown", "code", "json", "yaml", "data"], default="text", help="Content type for stdin input")
     ingest_p.add_argument("--stdin-title", type=str, help="Title for stdin content")
     ingest_p.add_argument("--title", type=str, help="Override document title")
 
-    ingest_p.add_argument("--mode", default="auto", choices=[m.value for m in IngestionMode], help="Ingestion mode")
+    ingest_p.add_argument("--mode", default="fast", choices=[m.value for m in IngestionMode], help="Ingestion mode")
     ingest_p.add_argument("--no-recursive", action="store_true", help="Don't recurse into subdirectories")
     ingest_p.add_argument("--min-importance", type=float, help="Minimum importance floor")
     ingest_p.add_argument("--permanent", action="store_true", help="Mark memories as permanent (no decay)")
@@ -2303,8 +2957,8 @@ Examples:
         return
 
     if args.subcommand == "ingest":
-        if not (args.file or args.input or args.url or args.stdin):
-            print("Error: One of --file, --input, --url, or --stdin is required")
+        if not (args.file or args.input or args.url or args.stdin or getattr(args, "github", None)):
+            print("Error: One of --file, --input, --url, --stdin, or --github is required")
             return
         _cmd_ingest(args)
     elif args.subcommand == "status":

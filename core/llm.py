@@ -2,10 +2,13 @@ from __future__ import annotations
 
 import base64
 import json
+import logging
 import os
 from typing import Any, AsyncIterator
 
 import httpx
+
+logger = logging.getLogger(__name__)
 
 try:
     import openai
@@ -39,6 +42,70 @@ OPENAI_COMPATIBLE = {
 # OpenAI Codex (ChatGPT subscription) backend
 _CODEX_DEFAULT_BASE_URL = "https://chatgpt.com/backend-api"
 _CODEX_JWT_CLAIM_PATH = "https://api.openai.com/auth"
+
+# OpenAI client cache: (api_key, base_url, provider) -> client
+_openai_clients: dict[tuple[str, str, str], Any] = {}
+
+# LLM retry configuration
+_LLM_MAX_RETRIES = 3
+_LLM_RETRY_BACKOFF_BASE = 2  # seconds
+
+
+async def _retry_on_transient(coro_factory, *, max_retries: int = _LLM_MAX_RETRIES) -> Any:
+    """Retry an LLM call on transient errors (rate limits, server errors, network)."""
+    import asyncio as _asyncio
+
+    last_exc = None
+    for attempt in range(max_retries):
+        try:
+            return await coro_factory()
+        except Exception as exc:
+            last_exc = exc
+            exc_str = str(exc).lower()
+            status = getattr(exc, 'status_code', None) or getattr(exc, 'status', None)
+            is_transient = (
+                status in (429, 502, 503, 529)
+                or 'rate' in exc_str
+                or 'overloaded' in exc_str
+                or 'timeout' in exc_str
+                or 'connection' in exc_str
+                or isinstance(exc, (ConnectionError, TimeoutError, OSError))
+            )
+            if is_transient and attempt < max_retries - 1:
+                wait = _LLM_RETRY_BACKOFF_BASE ** attempt
+                logger.warning(
+                    "LLM call failed (attempt %d/%d), retrying in %ds: %s",
+                    attempt + 1, max_retries, wait, exc,
+                )
+                await _asyncio.sleep(wait)
+                continue
+            raise
+    raise last_exc  # Should not reach here, but just in case
+
+
+def _get_openai_client(api_key: str | None, base_url: str | None, provider: str, default_headers: dict[str, Any] | None = None) -> Any:
+    """Get or create a cached OpenAI client."""
+    if openai is None:
+        raise RuntimeError("openai package is required for OpenAI-compatible providers.")
+
+    # Include headers in cache key to handle cases like github-copilot
+    headers_key = tuple(sorted((default_headers or {}).items())) if default_headers else ()
+    cache_key = (api_key or "", base_url or "", provider, headers_key)
+    if cache_key in _openai_clients:
+        return _openai_clients[cache_key]
+
+    client_kwargs: dict[str, Any] = {"api_key": api_key, "base_url": base_url}
+    if default_headers:
+        client_kwargs["default_headers"] = default_headers
+
+    client = openai.AsyncOpenAI(**client_kwargs)
+    _openai_clients[cache_key] = client
+    return client
+
+
+def _clear_openai_client_cache() -> None:
+    """Clear the OpenAI client cache. Useful for testing."""
+    _openai_clients.clear()
 
 
 def _b64url_decode(raw: str) -> bytes:
@@ -204,7 +271,35 @@ async def _codex_responses_completion(
         "user-agent": f"hexis (python; {os.uname().sysname if hasattr(os, 'uname') else 'unknown'})",
     }
 
+    import asyncio as _asyncio
+    import ssl as _ssl
+
+    _MAX_RETRIES = 3
     timeout = httpx.Timeout(connect=30.0, read=120.0, write=30.0, pool=30.0)
+
+    for attempt in range(_MAX_RETRIES):
+        try:
+            return await _codex_responses_attempt(
+                url=url, headers=headers, payload=payload,
+                timeout=timeout, on_text_delta=on_text_delta,
+            )
+        except (_ssl.SSLError, httpx.RemoteProtocolError, httpx.ReadError) as exc:
+            if attempt < _MAX_RETRIES - 1:
+                wait = 2 ** attempt
+                await _asyncio.sleep(wait)
+                continue
+            raise RuntimeError(f"OpenAI Codex request failed after {_MAX_RETRIES} retries: {exc}") from exc
+
+
+async def _codex_responses_attempt(
+    *,
+    url: str,
+    headers: dict[str, str],
+    payload: dict[str, Any],
+    timeout: Any,
+    on_text_delta: Any | None = None,
+) -> dict[str, Any]:
+    """Single attempt at a Codex Responses API streaming call."""
     async with httpx.AsyncClient(timeout=timeout) as client:
         async with client.stream("POST", url, headers=headers, json=payload) as resp:
             if resp.status_code < 200 or resp.status_code >= 300:
@@ -279,6 +374,7 @@ async def _codex_responses_completion(
                     try:
                         args = json.loads(args_str) if isinstance(args_str, str) and args_str else {}
                     except Exception:
+                        logger.debug("Failed to parse tool arguments: %r", str(args_str)[:200])
                         args = {}
                     tool_calls.append({
                         "id": call_id,
@@ -424,6 +520,7 @@ def _extract_responses_result(response: Any) -> dict[str, Any]:
             try:
                 args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
             except Exception:
+                logger.debug("Failed to parse tool arguments: %r", str(raw_args)[:200])
                 args = {}
             tool_calls.append({
                 "id": getattr(item, "call_id", None),
@@ -479,6 +576,15 @@ def resolve_api_key(api_key_env: str | None) -> str | None:
 
 
 def normalize_llm_config(config: dict[str, Any] | None, *, default_model: str = "gpt-4o") -> dict[str, Any]:
+    """Normalize a raw LLM config dict (provider aliases, env-var API keys, endpoint defaults).
+
+    .. warning::
+        This function does **not** run provider-specific credential loaders
+        (OAuth token refresh for Codex, Copilot, Gemini CLI, etc.).  Entry
+        points that need fully-resolved credentials should use
+        :func:`core.llm_config.resolve_llm_config` or
+        :func:`core.llm_config.load_llm_config` instead.
+    """
     config = config or {}
     provider = normalize_provider(str(config.get("provider") or "openai"))
     model = str(config.get("model") or default_model)
@@ -531,6 +637,7 @@ def _openai_tool_calls(raw_calls: list[Any]) -> list[dict[str, Any]]:
         try:
             args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
         except Exception:
+            logger.debug("Failed to parse tool arguments: %r", str(raw_args)[:200])
             args = {}
         tool_calls.append({"id": getattr(call, "id", None), "name": name, "arguments": args})
     return tool_calls
@@ -641,6 +748,7 @@ def _messages_to_gemini_contents(messages: list[dict[str, Any]]) -> list[Any]:
                     try:
                         args = json.loads(raw_args) if raw_args else {}
                     except Exception:
+                        logger.debug("Failed to parse tool arguments: %r", raw_args[:200])
                         args = {}
                 elif isinstance(raw_args, dict):
                     args = raw_args
@@ -780,6 +888,7 @@ async def _responses_stream_completion(
                     try:
                         args = json.loads(raw_args) if isinstance(raw_args, str) else raw_args
                     except Exception:
+                        logger.debug("Failed to parse tool arguments: %r", str(raw_args)[:200])
                         args = {}
                     tc_accum[getattr(item, "id", "")] = {
                         "call_id": getattr(item, "call_id", None),
@@ -840,37 +949,38 @@ async def chat_completion(
             tools=gemini_tools or None,
             tool_config=tool_config,
         )
-        response = await client.aio.models.generate_content(
-            model=model,
-            contents=contents,
-            config=config,
-        )
 
-        content = getattr(response, "text", "") or ""
-        tool_calls: list[dict[str, Any]] = []
-        for call in getattr(response, "function_calls", None) or []:
-            tool_calls.append({
-                "id": getattr(call, "id", None),
-                "name": getattr(call, "name", "") or "",
-                "arguments": getattr(call, "args", None) or {},
-            })
-        return {"content": content, "tool_calls": tool_calls, "raw": response}
+        async def _do_gemini_completion():
+            response = await client.aio.models.generate_content(
+                model=model,
+                contents=contents,
+                config=config,
+            )
+            content = getattr(response, "text", "") or ""
+            tool_calls: list[dict[str, Any]] = []
+            for call in getattr(response, "function_calls", None) or []:
+                tool_calls.append({
+                    "id": getattr(call, "id", None),
+                    "name": getattr(call, "name", "") or "",
+                    "arguments": getattr(call, "args", None) or {},
+                })
+            return {"content": content, "tool_calls": tool_calls, "raw": response}
+
+        return await _retry_on_transient(_do_gemini_completion)
 
     if provider in OPENAI_COMPATIBLE:
-        if openai is None:
-            raise RuntimeError("openai package is required for OpenAI-compatible providers.")
-        client_kwargs: dict[str, Any] = {"api_key": api_key, "base_url": endpoint}
+        default_headers = None
         if provider == "github-copilot":
             from core.auth.github_copilot import COPILOT_REQUEST_HEADERS
-            client_kwargs["default_headers"] = COPILOT_REQUEST_HEADERS
-        client = openai.AsyncOpenAI(**client_kwargs)
+            default_headers = COPILOT_REQUEST_HEADERS
+        client = _get_openai_client(api_key, endpoint, provider, default_headers)
 
         # Try Responses API first, fall back to Chat Completions
         if _should_try_responses(endpoint):
             try:
-                result = await _responses_completion(
+                result = await _retry_on_transient(lambda: _responses_completion(
                     client, model, messages, tools, temperature, max_tokens, response_format,
-                )
+                ))
                 _cache_responses_support(endpoint, True)
                 return result
             except Exception as exc:
@@ -890,11 +1000,15 @@ async def chat_completion(
             payload["tool_choice"] = "auto"
         if response_format:
             payload["response_format"] = response_format
-        response = await client.chat.completions.create(**payload)
-        message = response.choices[0].message
-        content = message.content or ""
-        tool_calls = _openai_tool_calls(message.tool_calls or [])
-        return {"content": content, "tool_calls": tool_calls, "raw": response}
+
+        async def _do_chat_completion():
+            response = await client.chat.completions.create(**payload)
+            message = response.choices[0].message
+            content = message.content or ""
+            tool_calls = _openai_tool_calls(message.tool_calls or [])
+            return {"content": content, "tool_calls": tool_calls, "raw": response}
+
+        return await _retry_on_transient(_do_chat_completion)
 
     if provider == "openai-codex":
         return await _codex_responses_completion(
@@ -912,7 +1026,7 @@ async def chat_completion(
         if auth_mode == "setup-token":
             from core.providers.anthropic_http import anthropic_http_completion
             system_prompt, rest = _extract_system_prompt(messages)
-            return await anthropic_http_completion(
+            return await _retry_on_transient(lambda: anthropic_http_completion(
                 endpoint=endpoint or "https://api.anthropic.com",
                 api_key=api_key or "",
                 model=model,
@@ -921,28 +1035,32 @@ async def chat_completion(
                 auth_mode="setup-token",
                 max_tokens=max_tokens,
                 system_prompt=system_prompt or None,
-            )
+            ))
         if anthropic is None:
             raise RuntimeError("anthropic package is required for Anthropic provider.")
         client = anthropic.AsyncAnthropic(api_key=api_key)
         system_prompt, rest = _extract_system_prompt(messages)
         anthropic_tools = _anthropic_tools(tools)
-        response = await client.messages.create(
-            model=model,
-            system=system_prompt or None,
-            messages=rest,
-            tools=anthropic_tools or None,
-            max_tokens=max_tokens,
-            temperature=temperature,
-        )
-        text_parts: list[str] = []
-        tool_calls: list[dict[str, Any]] = []
-        for block in response.content or []:
-            if block.type == "text":
-                text_parts.append(block.text)
-            if block.type == "tool_use":
-                tool_calls.append({"id": block.id, "name": block.name, "arguments": block.input})
-        return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": response}
+
+        async def _do_anthropic_completion():
+            response = await client.messages.create(
+                model=model,
+                system=system_prompt or None,
+                messages=rest,
+                tools=anthropic_tools or None,
+                max_tokens=max_tokens,
+                temperature=temperature,
+            )
+            text_parts: list[str] = []
+            tool_calls: list[dict[str, Any]] = []
+            for block in response.content or []:
+                if block.type == "text":
+                    text_parts.append(block.text)
+                if block.type == "tool_use":
+                    tool_calls.append({"id": block.id, "name": block.name, "arguments": block.input})
+            return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": response}
+
+        return await _retry_on_transient(_do_anthropic_completion)
 
     if provider == "minimax-portal":
         from core.providers.anthropic_http import anthropic_http_completion
@@ -1030,56 +1148,57 @@ async def stream_chat_completion(
             tool_config=tool_config,
         )
 
-        # Track emitted text so we can compute deltas if the stream is cumulative.
-        emitted: str = ""
-        calls_by_id: dict[str, dict[str, Any]] = {}
+        async def _do_gemini_stream():
+            # Track emitted text so we can compute deltas if the stream is cumulative.
+            emitted: str = ""
+            calls_by_id: dict[str, dict[str, Any]] = {}
 
-        async for chunk in client.aio.models.generate_content_stream(
-            model=model,
-            contents=contents,
-            config=config,
-        ):
-            text = getattr(chunk, "text", "") or ""
-            if text:
-                if text.startswith(emitted):
-                    delta = text[len(emitted) :]
-                    emitted = text
-                else:
-                    delta = text
-                    emitted += text
-                if delta and on_text_delta:
-                    import asyncio
+            async for chunk in client.aio.models.generate_content_stream(
+                model=model,
+                contents=contents,
+                config=config,
+            ):
+                text = getattr(chunk, "text", "") or ""
+                if text:
+                    if text.startswith(emitted):
+                        delta = text[len(emitted) :]
+                        emitted = text
+                    else:
+                        delta = text
+                        emitted += text
+                    if delta and on_text_delta:
+                        import asyncio
 
-                    result = on_text_delta(delta)
-                    if asyncio.iscoroutine(result):
-                        await result
+                        result = on_text_delta(delta)
+                        if asyncio.iscoroutine(result):
+                            await result
 
-            for call in getattr(chunk, "function_calls", None) or []:
-                call_id = getattr(call, "id", None) or ""
-                calls_by_id[str(call_id)] = {
-                    "id": call_id or None,
-                    "name": getattr(call, "name", "") or "",
-                    "arguments": getattr(call, "args", None) or {},
-                }
+                for call in getattr(chunk, "function_calls", None) or []:
+                    call_id = getattr(call, "id", None) or ""
+                    calls_by_id[str(call_id)] = {
+                        "id": call_id or None,
+                        "name": getattr(call, "name", "") or "",
+                        "arguments": getattr(call, "args", None) or {},
+                    }
 
-        tool_calls = [v for k, v in calls_by_id.items() if k]
-        return {"content": emitted, "tool_calls": tool_calls, "raw": None}
+            tool_calls = [v for k, v in calls_by_id.items() if k]
+            return {"content": emitted, "tool_calls": tool_calls, "raw": None}
+
+        return await _retry_on_transient(_do_gemini_stream)
 
     if provider in OPENAI_COMPATIBLE:
-        if openai is None:
-            raise RuntimeError("openai package is required for OpenAI-compatible providers.")
-        client_kwargs: dict[str, Any] = {"api_key": api_key, "base_url": endpoint}
+        default_headers = None
         if provider == "github-copilot":
             from core.auth.github_copilot import COPILOT_REQUEST_HEADERS
-            client_kwargs["default_headers"] = COPILOT_REQUEST_HEADERS
-        client = openai.AsyncOpenAI(**client_kwargs)
+            default_headers = COPILOT_REQUEST_HEADERS
+        client = _get_openai_client(api_key, endpoint, provider, default_headers)
 
         # Try Responses API first, fall back to Chat Completions
         if _should_try_responses(endpoint):
             try:
-                result = await _responses_stream_completion(
+                result = await _retry_on_transient(lambda: _responses_stream_completion(
                     client, model, messages, tools, temperature, max_tokens, on_text_delta,
-                )
+                ))
                 _cache_responses_support(endpoint, True)
                 return result
             except Exception as exc:
@@ -1098,50 +1217,55 @@ async def stream_chat_completion(
         if tools:
             payload["tools"] = tools
             payload["tool_choice"] = "auto"
-        response = await client.chat.completions.create(**payload)
 
-        content_parts: list[str] = []
-        # Accumulate tool calls: index -> {id, name, arguments_parts}
-        tc_accum: dict[int, dict[str, Any]] = {}
+        async def _do_stream_completion():
+            response = await client.chat.completions.create(**payload)
 
-        async for event in response:
-            delta = event.choices[0].delta
-            if delta and delta.content:
-                content_parts.append(delta.content)
-                if on_text_delta:
-                    import asyncio
-                    result = on_text_delta(delta.content)
-                    if asyncio.iscoroutine(result):
-                        await result
-            if delta and delta.tool_calls:
-                for tc_delta in delta.tool_calls:
-                    idx = tc_delta.index
-                    if idx not in tc_accum:
-                        tc_accum[idx] = {
-                            "id": getattr(tc_delta, "id", None),
-                            "name": None,
-                            "arguments_parts": [],
-                        }
-                    if tc_delta.id:
-                        tc_accum[idx]["id"] = tc_delta.id
-                    fn = getattr(tc_delta, "function", None)
-                    if fn:
-                        if getattr(fn, "name", None):
-                            tc_accum[idx]["name"] = fn.name
-                        if getattr(fn, "arguments", None):
-                            tc_accum[idx]["arguments_parts"].append(fn.arguments)
+            content_parts: list[str] = []
+            # Accumulate tool calls: index -> {id, name, arguments_parts}
+            tc_accum: dict[int, dict[str, Any]] = {}
 
-        # Build final tool calls
-        tool_calls: list[dict[str, Any]] = []
-        for idx in sorted(tc_accum.keys()):
-            tc = tc_accum[idx]
-            raw_args = "".join(tc["arguments_parts"])
-            try:
-                args = json.loads(raw_args) if raw_args else {}
-            except Exception:
-                args = {}
-            tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
-        return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
+            async for event in response:
+                delta = event.choices[0].delta
+                if delta and delta.content:
+                    content_parts.append(delta.content)
+                    if on_text_delta:
+                        import asyncio
+                        result = on_text_delta(delta.content)
+                        if asyncio.iscoroutine(result):
+                            await result
+                if delta and delta.tool_calls:
+                    for tc_delta in delta.tool_calls:
+                        idx = tc_delta.index
+                        if idx not in tc_accum:
+                            tc_accum[idx] = {
+                                "id": getattr(tc_delta, "id", None),
+                                "name": None,
+                                "arguments_parts": [],
+                            }
+                        if tc_delta.id:
+                            tc_accum[idx]["id"] = tc_delta.id
+                        fn = getattr(tc_delta, "function", None)
+                        if fn:
+                            if getattr(fn, "name", None):
+                                tc_accum[idx]["name"] = fn.name
+                            if getattr(fn, "arguments", None):
+                                tc_accum[idx]["arguments_parts"].append(fn.arguments)
+
+            # Build final tool calls
+            tool_calls: list[dict[str, Any]] = []
+            for idx in sorted(tc_accum.keys()):
+                tc = tc_accum[idx]
+                raw_args = "".join(tc["arguments_parts"])
+                try:
+                    args = json.loads(raw_args) if raw_args else {}
+                except Exception:
+                    logger.debug("Failed to parse tool arguments: %r", raw_args[:200])
+                    args = {}
+                tool_calls.append({"id": tc["id"], "name": tc["name"], "arguments": args})
+            return {"content": "".join(content_parts), "tool_calls": tool_calls, "raw": None}
+
+        return await _retry_on_transient(_do_stream_completion)
 
     if provider == "openai-codex":
         return await _codex_responses_completion(
@@ -1159,7 +1283,7 @@ async def stream_chat_completion(
         if auth_mode == "setup-token":
             from core.providers.anthropic_http import stream_anthropic_http_completion
             system_prompt, rest = _extract_system_prompt(messages)
-            return await stream_anthropic_http_completion(
+            return await _retry_on_transient(lambda: stream_anthropic_http_completion(
                 endpoint=endpoint or "https://api.anthropic.com",
                 api_key=api_key or "",
                 model=model,
@@ -1169,7 +1293,7 @@ async def stream_chat_completion(
                 max_tokens=max_tokens,
                 system_prompt=system_prompt or None,
                 on_text_delta=on_text_delta,
-            )
+            ))
         if anthropic is None:
             raise RuntimeError("anthropic package is required for Anthropic provider.")
         client = anthropic.AsyncAnthropic(api_key=api_key)
@@ -1185,43 +1309,48 @@ async def stream_chat_completion(
             sdk_kwargs["system"] = system_prompt
         if anthropic_tools:
             sdk_kwargs["tools"] = anthropic_tools
-        async with client.messages.stream(**sdk_kwargs) as stream:
-            text_parts: list[str] = []
-            tool_calls: list[dict[str, Any]] = []
-            current_tool: dict[str, Any] | None = None
 
-            async for event in stream:
-                if hasattr(event, "type"):
-                    if event.type == "content_block_start":
-                        block = event.content_block
-                        if block.type == "tool_use":
-                            current_tool = {"id": block.id, "name": block.name, "arguments_json": ""}
-                    elif event.type == "content_block_delta":
-                        delta = event.delta
-                        if delta.type == "text_delta":
-                            text_parts.append(delta.text)
-                            if on_text_delta:
-                                import asyncio
-                                result = on_text_delta(delta.text)
-                                if asyncio.iscoroutine(result):
-                                    await result
-                        elif delta.type == "input_json_delta" and current_tool is not None:
-                            current_tool["arguments_json"] += delta.partial_json
-                    elif event.type == "content_block_stop":
-                        if current_tool is not None:
-                            raw_args = current_tool["arguments_json"]
-                            try:
-                                args = json.loads(raw_args) if raw_args else {}
-                            except Exception:
-                                args = {}
-                            tool_calls.append({
-                                "id": current_tool["id"],
-                                "name": current_tool["name"],
-                                "arguments": args,
-                            })
-                            current_tool = None
+        async def _do_anthropic_stream():
+            async with client.messages.stream(**sdk_kwargs) as stream:
+                text_parts: list[str] = []
+                tool_calls: list[dict[str, Any]] = []
+                current_tool: dict[str, Any] | None = None
 
-            return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": None}
+                async for event in stream:
+                    if hasattr(event, "type"):
+                        if event.type == "content_block_start":
+                            block = event.content_block
+                            if block.type == "tool_use":
+                                current_tool = {"id": block.id, "name": block.name, "arguments_json": ""}
+                        elif event.type == "content_block_delta":
+                            delta = event.delta
+                            if delta.type == "text_delta":
+                                text_parts.append(delta.text)
+                                if on_text_delta:
+                                    import asyncio
+                                    result = on_text_delta(delta.text)
+                                    if asyncio.iscoroutine(result):
+                                        await result
+                            elif delta.type == "input_json_delta" and current_tool is not None:
+                                current_tool["arguments_json"] += delta.partial_json
+                        elif event.type == "content_block_stop":
+                            if current_tool is not None:
+                                raw_args = current_tool["arguments_json"]
+                                try:
+                                    args = json.loads(raw_args) if raw_args else {}
+                                except Exception:
+                                    logger.debug("Failed to parse tool arguments: %r", raw_args[:200])
+                                    args = {}
+                                tool_calls.append({
+                                    "id": current_tool["id"],
+                                    "name": current_tool["name"],
+                                    "arguments": args,
+                                })
+                                current_tool = None
+
+                return {"content": "".join(text_parts), "tool_calls": tool_calls, "raw": None}
+
+        return await _retry_on_transient(_do_anthropic_stream)
 
     if provider == "minimax-portal":
         from core.providers.anthropic_http import stream_anthropic_http_completion
@@ -1273,20 +1402,29 @@ async def stream_text_completion(
     endpoint = normalize_endpoint(provider, endpoint)
 
     if provider in OPENAI_COMPATIBLE:
-        if openai is None:
-            raise RuntimeError("openai package is required for OpenAI-compatible providers.")
-        client = openai.AsyncOpenAI(api_key=api_key, base_url=endpoint)
-        response = await client.chat.completions.create(
-            model=model,
-            messages=messages,
-            temperature=temperature,
-            max_tokens=max_tokens,
-            stream=True,
-        )
-        async for event in response:
-            delta = event.choices[0].delta
-            if delta and delta.content:
-                yield delta.content
+        client = _get_openai_client(api_key, endpoint, provider)
+
+        async def _do_text_stream():
+            response = await client.chat.completions.create(
+                model=model,
+                messages=messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                stream=True,
+            )
+            async for event in response:
+                delta = event.choices[0].delta
+                if delta and delta.content:
+                    yield delta.content
+
+        # Note: We can't wrap a generator with retry logic the same way,
+        # but we retry the initial request
+        async def _start_stream():
+            return _do_text_stream()
+
+        stream = await _retry_on_transient(_start_stream)
+        async for chunk in stream:
+            yield chunk
         return
 
     if provider == "gemini":

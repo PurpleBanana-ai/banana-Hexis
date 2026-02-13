@@ -219,11 +219,24 @@ class ToolExecutionContext:
         return os.path.normpath(path)
 
     def is_path_allowed(self, path: str) -> bool:
-        """Check if a path is within allowed workspace."""
+        """Check if a path is within allowed workspace.
+
+        When workspace_path is set, restricts access to that directory tree.
+        When workspace_path is not set, restricts to the user's home directory
+        and /tmp as a safety baseline.
+        """
         import os
 
         if not self.workspace_path:
-            return True  # No restriction
+            # Restrict to home directory and /tmp when no workspace is configured
+            target = os.path.realpath(os.path.abspath(path))
+            home = os.path.expanduser("~")
+            allowed_roots = [os.path.realpath(home), "/tmp"]
+            return any(
+                os.path.commonpath([target, root]) == root
+                for root in allowed_roots
+                if os.path.isdir(root)
+            )
 
         resolved = self.resolve_path(path)
         workspace = os.path.realpath(os.path.abspath(self.workspace_path))
@@ -333,7 +346,7 @@ class SyncToolHandler(ToolHandler):
         """Run sync method in executor."""
         import asyncio
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         return await loop.run_in_executor(
             None,
             self.execute_sync,

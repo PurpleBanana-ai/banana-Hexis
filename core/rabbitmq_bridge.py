@@ -2,11 +2,14 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import time
 from typing import Any
 
 import requests
+
+logger = logging.getLogger(__name__)
 
 
 RABBITMQ_MANAGEMENT_URL = os.getenv("RABBITMQ_MANAGEMENT_URL", "http://rabbitmq:15672").rstrip("/")
@@ -52,7 +55,8 @@ class RabbitMQBridge:
                 )
                 if r.status_code not in (200, 201, 204):
                     raise RuntimeError(f"rabbitmq queue declare {q!r} HTTP {r.status_code}: {r.text[:200]}")
-        except Exception:
+        except Exception as e:
+            logger.warning("RabbitMQ ensure_ready failed: %s", e)
             return
 
     async def publish_outbox_payloads(self, payloads: list[dict[str, Any]]) -> int:
@@ -78,7 +82,8 @@ class RabbitMQBridge:
                 if not ok:
                     raise RuntimeError(f"publish not routed: HTTP {resp.status_code} body={resp.text[:200]}")
                 published += 1
-            except Exception:
+            except Exception as e:
+                logger.warning("Failed to publish outbox message: %s", e)
                 return published
 
         return published
@@ -109,7 +114,8 @@ class RabbitMQBridge:
             msgs = resp.json()
             if not isinstance(msgs, list):
                 return 0
-        except Exception:
+        except Exception as e:
+            logger.warning("Failed to poll inbox messages: %s", e)
             return 0
 
         ingested = 0
@@ -122,8 +128,8 @@ class RabbitMQBridge:
                     content = parsed["content"]
                 else:
                     content = parsed
-            except Exception:
-                pass
+            except Exception as e:
+                logger.debug("Failed to parse inbox message payload: %s", e)
 
             try:
                 async with self.pool.acquire() as conn:
@@ -135,7 +141,8 @@ class RabbitMQBridge:
                         "UPDATE heartbeat_state SET last_user_contact = CURRENT_TIMESTAMP WHERE id = 1"
                     )
                 ingested += 1
-            except Exception:
+            except Exception as e:
+                logger.warning("Failed to ingest inbox message to working memory: %s", e)
                 return ingested
 
         return ingested

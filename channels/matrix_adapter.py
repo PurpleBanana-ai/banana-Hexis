@@ -13,7 +13,7 @@ import logging
 import os
 from typing import Any, Callable, Awaitable
 
-from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage
+from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage, parse_allowlist, resolve_channel_token
 from .media import Attachment
 
 logger = logging.getLogger(__name__)
@@ -21,14 +21,7 @@ logger = logging.getLogger(__name__)
 
 def _resolve_token(config: dict[str, Any], key: str, env_fallback: str) -> str | None:
     """Resolve a token from config (env var name) or direct environment."""
-    token_env = config.get(key) or env_fallback
-    token = os.getenv(str(token_env))
-    if token:
-        return token
-    raw = config.get(key, "")
-    if raw and len(str(raw)) > 10:
-        return str(raw)
-    return None
+    return resolve_channel_token(config, key, env_fallback)
 
 
 class MatrixAdapter(ChannelAdapter):
@@ -55,16 +48,7 @@ class MatrixAdapter(ChannelAdapter):
 
     @staticmethod
     def _parse_allowlist(value: Any) -> set[str] | None:
-        if value is None or value == "*":
-            return None
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except Exception:
-                return {value}
-        if isinstance(value, list):
-            return {str(v) for v in value}
-        return None
+        return parse_allowlist(value)
 
     @property
     def channel_type(self) -> str:
@@ -253,7 +237,7 @@ class MatrixAdapter(ChannelAdapter):
         try:
             await self._client.room_typing(channel_id, typing_state=True, timeout=5000)
         except Exception:
-            pass
+            logger.debug("Silent exception in MatrixAdapter", exc_info=True)
 
     async def edit_message(
         self,

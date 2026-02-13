@@ -7,7 +7,6 @@ from __future__ import annotations
 import asyncio
 import logging
 import os
-import subprocess
 from typing import Any
 from pathlib import Path
 from datetime import datetime, timezone
@@ -409,23 +408,23 @@ async def clone_instance(
     try:
         # Pipe dump to restore
         logger.info(f"Cloning database {source.database} to {target_db}...")
-        dump_proc = subprocess.Popen(
-            dump_cmd,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
+        dump_proc = await asyncio.create_subprocess_exec(
+            *dump_cmd,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             env=env,
         )
-        restore_proc = subprocess.Popen(
-            restore_cmd,
+        restore_proc = await asyncio.create_subprocess_exec(
+            *restore_cmd,
             stdin=dump_proc.stdout,
-            stderr=subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
             env=env,
         )
         if dump_proc.stdout:
             dump_proc.stdout.close()
 
-        _, restore_stderr = restore_proc.communicate()
-        dump_proc.wait()
+        _, restore_stderr = await restore_proc.communicate()
+        await dump_proc.wait()
 
         # pg_restore returns non-zero even on warnings, so we check for actual errors
         if restore_proc.returncode != 0:

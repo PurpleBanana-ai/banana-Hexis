@@ -393,6 +393,11 @@ class AgentLoop:
 
             # Process tool calls
             for call in tool_calls:
+                # Check energy before each tool call
+                if cfg.energy_budget is not None and self._energy_spent >= cfg.energy_budget:
+                    # Skip remaining tools - budget exhausted mid-iteration
+                    break
+
                 tool_name = call.get("name", "")
                 arguments = call.get("arguments", {})
                 call_id = call.get("id") or str(uuid.uuid4())
@@ -568,8 +573,8 @@ class AgentLoop:
             ctx.allow_file_write = overrides.allow_file_write
             if tc.workspace_path:
                 ctx.workspace_path = tc.workspace_path
-        except Exception:
-            pass
+        except Exception as e:
+            logger.debug("Failed to apply config overrides: %s", e)
 
         # Apply runtime overrides from AgentLoopConfig (additive only — can
         # grant permissions but never revoke what the DB config granted)

@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import json
 import uuid
-import warnings
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -175,7 +174,7 @@ class TestBuildSystemPrompt:
         from services.chat import _build_system_prompt
 
         # Even if personhood compose fails, prompt should still work
-        with patch("services.chat.compose_personhood_prompt", side_effect=Exception("missing")):
+        with patch("services.agent.compose_personhood_prompt", side_effect=Exception("missing")):
             prompt = await _build_system_prompt({})
             assert "Hexis in live conversation" in prompt
 
@@ -449,6 +448,20 @@ class TestAuditTrailHook:
 class TestChatTurnWithRegistry:
     """Tests that chat_turn correctly uses the registry for tool dispatch."""
 
+    @pytest.fixture(autouse=True)
+    async def _disable_rlm(self, db_pool):
+        """Disable RLM so tests exercise the AgentLoop path."""
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "INSERT INTO config (key, value, description) VALUES ('chat.use_rlm', 'false', 'test override') "
+                "ON CONFLICT (key) DO UPDATE SET value = 'false'"
+            )
+        yield
+        async with db_pool.acquire() as conn:
+            await conn.execute(
+                "UPDATE config SET value = 'true' WHERE key = 'chat.use_rlm'"
+            )
+
     async def test_chat_turn_no_tools(self, db_pool):
         """Chat turn with no tool calls returns LLM response."""
         from services.chat import chat_turn
@@ -458,7 +471,7 @@ class TestChatTurnWithRegistry:
         with (
             patch("core.agent_loop.chat_completion", new_callable=AsyncMock, return_value=mock_response),
             patch("services.chat.get_agent_profile_context", new_callable=AsyncMock, return_value={}),
-            patch("services.chat.format_context_for_prompt", return_value=""),
+            patch("core.cognitive_memory_api.format_context_for_prompt", return_value=""),
             patch("services.chat.CognitiveMemory") as MockMem,
         ):
             mock_mem_instance = AsyncMock()
@@ -506,7 +519,7 @@ class TestChatTurnWithRegistry:
         with (
             patch("core.agent_loop.chat_completion", side_effect=mock_chat_completion),
             patch("services.chat.get_agent_profile_context", new_callable=AsyncMock, return_value={}),
-            patch("services.chat.format_context_for_prompt", return_value=""),
+            patch("core.cognitive_memory_api.format_context_for_prompt", return_value=""),
             patch("services.chat.CognitiveMemory") as MockMem,
         ):
             mock_mem_instance = AsyncMock()
@@ -545,7 +558,7 @@ class TestChatTurnWithRegistry:
         with (
             patch("core.agent_loop.chat_completion", side_effect=always_tool),
             patch("services.chat.get_agent_profile_context", new_callable=AsyncMock, return_value={}),
-            patch("services.chat.format_context_for_prompt", return_value=""),
+            patch("core.cognitive_memory_api.format_context_for_prompt", return_value=""),
             patch("services.chat.CognitiveMemory") as MockMem,
         ):
             mock_mem_instance = AsyncMock()
@@ -576,7 +589,7 @@ class TestChatTurnWithRegistry:
         with (
             patch("core.agent_loop.chat_completion", new_callable=AsyncMock, return_value=mock_response),
             patch("services.chat.get_agent_profile_context", new_callable=AsyncMock, return_value={}),
-            patch("services.chat.format_context_for_prompt", return_value=""),
+            patch("core.cognitive_memory_api.format_context_for_prompt", return_value=""),
             patch("services.chat.CognitiveMemory") as MockMem,
         ):
             mock_mem_instance = AsyncMock()
@@ -645,36 +658,6 @@ class TestChatToolAuditIntegration:
         assert row["tool_context"] == "chat"
         assert row["session_id"] == "integration-test"
         assert row["success"] is True
-
-
-# ============================================================================
-# Deprecation: services/tooling.py
-# ============================================================================
-
-
-class TestToolingDeprecation:
-    def test_get_tool_definitions_warns(self):
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            from services.tooling import get_tool_definitions
-
-            get_tool_definitions()
-            deprecation_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
-            assert len(deprecation_warnings) >= 1
-            assert "deprecated" in str(deprecation_warnings[0].message).lower()
-
-    async def test_execute_tool_warns(self):
-        with warnings.catch_warnings(record=True) as w:
-            warnings.simplefilter("always")
-            from services.tooling import execute_tool
-
-            mock_mem = AsyncMock()
-            mock_mem.recall = AsyncMock(return_value=MagicMock(memories=[]))
-            mock_mem.touch_memories = AsyncMock()
-
-            await execute_tool("recall", {"query": "test"}, mem_client=mock_mem)
-            deprecation_warnings = [x for x in w if issubclass(x.category, DeprecationWarning)]
-            assert len(deprecation_warnings) >= 1
 
 
 # ============================================================================

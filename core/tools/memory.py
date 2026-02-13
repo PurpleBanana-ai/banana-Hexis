@@ -29,23 +29,24 @@ class RecallHandler(ToolHandler):
         return ToolSpec(
             name="recall",
             description=(
-                "Search memories by semantic similarity. Use this to find memories "
-                "related to a topic, concept, or question. Returns the most relevant "
-                "memories based on meaning, not just keyword matching."
+                "Search memories by semantic similarity and/or structured filters. "
+                "Use this to find memories related to a topic, concept, or question. "
+                "Supports filtering by source, date range, concept graph, and metadata. "
+                "Can be used with just filters (no query) for targeted retrieval."
             ),
             parameters={
                 "type": "object",
                 "properties": {
                     "query": {
                         "type": "string",
-                        "description": "Natural language query describing what you want to remember.",
+                        "description": "Natural language query describing what you want to remember. Optional if using filters.",
                     },
                     "limit": {
                         "type": "integer",
-                        "description": "Maximum number of memories to return (default: 5, max: 20)",
+                        "description": "Maximum number of memories to return (default: 5, max: 50)",
                         "default": 5,
                         "minimum": 1,
-                        "maximum": 20,
+                        "maximum": 50,
                     },
                     "memory_types": {
                         "type": "array",
@@ -68,8 +69,28 @@ class RecallHandler(ToolHandler):
                         "minimum": 0.0,
                         "maximum": 1.0,
                     },
+                    "source_path": {
+                        "type": "string",
+                        "description": "Filter by source path (partial match). E.g., 'hexis/db' for all DB schema memories.",
+                    },
+                    "source_kind": {
+                        "type": "string",
+                        "description": "Filter by source kind. E.g., 'code', 'conversation', 'web', 'document'.",
+                    },
+                    "created_after": {
+                        "type": "string",
+                        "description": "Only memories created after this ISO date (e.g. '2025-01-15').",
+                    },
+                    "created_before": {
+                        "type": "string",
+                        "description": "Only memories created before this ISO date.",
+                    },
+                    "concept": {
+                        "type": "string",
+                        "description": "Find memories linked to this concept in the knowledge graph.",
+                    },
                 },
-                "required": ["query"],
+                "required": [],
             },
             category=ToolCategory.MEMORY,
             energy_cost=1,
@@ -81,12 +102,29 @@ class RecallHandler(ToolHandler):
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolResult:
-        from core.cognitive_memory_api import CognitiveMemory, MemoryType
+        from core.cognitive_memory_api import MemoryType
+        from datetime import datetime, timezone
 
-        query = arguments["query"]
-        limit = min(arguments.get("limit", 5), 20)
+        query = arguments.get("query")
+        limit = min(arguments.get("limit", 5), 50)
         memory_types_raw = arguments.get("memory_types")
         min_importance = arguments.get("min_importance", 0.0)
+        source_path = arguments.get("source_path")
+        source_kind = arguments.get("source_kind")
+        created_after_raw = arguments.get("created_after")
+        created_before_raw = arguments.get("created_before")
+        concept = arguments.get("concept")
+
+        # Must have at least a query or a filter
+        has_filters = any([
+            memory_types_raw, source_path, source_kind,
+            created_after_raw, created_before_raw, concept,
+        ])
+        if not query and not has_filters:
+            return ToolResult.error_result(
+                "Provide at least a query or one filter (memory_types, source_path, source_kind, created_after, created_before, concept).",
+                ToolErrorType.INVALID_PARAMS,
+            )
 
         # Parse memory types
         memory_types = None
@@ -99,27 +137,62 @@ class RecallHandler(ToolHandler):
                     ToolErrorType.INVALID_PARAMS,
                 )
 
+        # Parse date filters
+        created_after = None
+        created_before = None
         try:
-            # Get connection from registry's pool
+            if created_after_raw:
+                created_after = datetime.fromisoformat(created_after_raw).replace(tzinfo=timezone.utc) if "+" not in created_after_raw and "Z" not in created_after_raw else datetime.fromisoformat(created_after_raw.replace("Z", "+00:00"))
+            if created_before_raw:
+                created_before = datetime.fromisoformat(created_before_raw).replace(tzinfo=timezone.utc) if "+" not in created_before_raw and "Z" not in created_before_raw else datetime.fromisoformat(created_before_raw.replace("Z", "+00:00"))
+        except ValueError as e:
+            return ToolResult.error_result(
+                f"Invalid date format: {e}. Use ISO format (e.g. '2025-01-15').",
+                ToolErrorType.INVALID_PARAMS,
+            )
+
+        try:
             async with context.registry.pool.acquire() as conn:
                 type_filter = [t.value for t in memory_types] if memory_types else None
                 rows = await conn.fetch(
-                    "SELECT * FROM recall_memories_filtered($1, $2, $3::memory_type[], $4)",
+                    """SELECT * FROM recall_memories_structured(
+                        $1, $2, $3::memory_type[], $4,
+                        $5, $6, $7, $8, $9, $10::jsonb
+                    )""",
                     query,
                     limit,
                     type_filter,
                     min_importance,
+                    source_path,
+                    source_kind,
+                    created_after,
+                    created_before,
+                    concept,
+                    None,  # metadata_filter
                 )
 
                 memories = []
                 for row in rows:
-                    memories.append({
+                    mem = {
                         "memory_id": str(row["memory_id"]),
                         "content": row["content"],
                         "type": str(row["memory_type"]),
-                        "similarity": float(row["score"]),
-                        "importance": float(row["importance"]),
-                    })
+                        "score": float(row["score"]) if row["score"] is not None else 0.0,
+                        "importance": float(row["importance"]) if row["importance"] is not None else 0.0,
+                    }
+                    if row.get("source_attribution"):
+                        sa = row["source_attribution"]
+                        if isinstance(sa, str):
+                            import json
+                            try:
+                                sa = json.loads(sa)
+                            except Exception:
+                                sa = {}
+                        if isinstance(sa, dict) and sa.get("kind"):
+                            mem["source_kind"] = sa["kind"]
+                        if isinstance(sa, dict) and sa.get("ref"):
+                            mem["source_ref"] = sa["ref"]
+                    memories.append(mem)
 
                 # Touch accessed memories
                 if memories:
@@ -129,9 +202,10 @@ class RecallHandler(ToolHandler):
                         memory_ids,
                     )
 
+            display_query = query or "(filters only)"
             return ToolResult.success_result(
-                output={"memories": memories, "count": len(memories), "query": query},
-                display_output=f"Found {len(memories)} memories for '{query}'",
+                output={"memories": memories, "count": len(memories), "query": display_query},
+                display_output=f"Found {len(memories)} memories for '{display_query}'",
             )
 
         except Exception as e:
@@ -208,12 +282,11 @@ class RememberHandler(ToolHandler):
                     importance,
                 )
 
-                # Link concepts
-                for concept in concepts:
-                    await conn.execute(
+                # Link concepts in batch
+                if concepts:
+                    await conn.executemany(
                         "SELECT link_memory_to_concept($1::uuid, $2)",
-                        memory_id,
-                        concept,
+                        [(memory_id, c) for c in concepts],
                     )
 
             return ToolResult.success_result(
@@ -916,7 +989,12 @@ class QueueUserMessageHandler(ToolHandler):
 
 
 def create_memory_tools() -> list[ToolHandler]:
-    """Create all memory tool handlers."""
+    """Create memory tool handlers.
+
+    Note: Goal management is handled by core/tools/goals.py (manage_goals).
+    Schedule management is handled by core/tools/cron.py (manage_schedule).
+    Those unified tools replace the individual create_goal, schedule_task, etc.
+    """
     return [
         RecallHandler(),
         RememberHandler(),
@@ -924,10 +1002,5 @@ def create_memory_tools() -> list[ToolHandler]:
         ExploreConceptHandler(),
         GetProceduresHandler(),
         GetStrategiesHandler(),
-        CreateGoalHandler(),
-        ScheduleTaskHandler(),
-        ListScheduledTasksHandler(),
-        UpdateScheduledTaskHandler(),
-        DeleteScheduledTaskHandler(),
         QueueUserMessageHandler(),
     ]

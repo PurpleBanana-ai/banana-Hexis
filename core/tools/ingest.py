@@ -8,7 +8,6 @@ from __future__ import annotations
 
 import asyncio
 import logging
-import os
 from pathlib import Path
 from typing import Any
 
@@ -25,48 +24,25 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 
-def _build_ingest_config(**overrides: Any) -> "Config":
-    """Build an ingestion Config from environment variables.
+async def _build_ingest_config(pool, **overrides: Any) -> "Config":
+    """Build an ingestion Config with fully-resolved LLM credentials.
 
-    Follows the same pattern as the CLI's _get_db_env_defaults().
+    Uses :func:`core.llm_config.resolve_llm_config` so that OAuth/token-refresh
+    providers (Codex, Copilot, Gemini CLI, etc.) work correctly.
     """
-    from services.ingest import Config, IngestionMode
+    from core.agent_api import db_dsn_from_env
+    from core.llm_config import resolve_llm_config
+    from services.ingest import Config
 
-    env_port_raw = os.getenv("POSTGRES_PORT")
-    try:
-        env_port = int(env_port_raw) if env_port_raw else 43815
-    except ValueError:
-        env_port = 43815
+    dsn = db_dsn_from_env()
+    llm_config = await resolve_llm_config(pool, "llm.chat", fallback_key="llm")
 
-    defaults = {
-        "db_host": os.getenv("POSTGRES_HOST", "localhost"),
-        "db_port": env_port,
-        "db_name": os.getenv("POSTGRES_DB", "hexis_memory"),
-        "db_user": os.getenv("POSTGRES_USER", "hexis_user"),
-        "db_password": os.getenv("POSTGRES_PASSWORD", "hexis_password"),
-        "llm_endpoint": os.getenv("LLM_ENDPOINT", "http://localhost:11434/v1"),
-        "llm_model": os.getenv("LLM_MODEL", "llama3.2"),
-        "llm_api_key": os.getenv("LLM_API_KEY", "not-needed"),
+    defaults: dict[str, Any] = {
+        "dsn": dsn,
+        "llm_config": llm_config,
     }
     defaults.update(overrides)
     return Config(**defaults)
-
-
-def _build_dsn(config: "Config") -> str:
-    """Build a PostgreSQL DSN from Config."""
-    return (
-        f"postgresql://{config.db_user}:{config.db_password}"
-        f"@{config.db_host}:{config.db_port}/{config.db_name}"
-    )
-
-
-def _build_llm_config(config: "Config") -> dict[str, Any]:
-    """Build LLM config dict from Config."""
-    return {
-        "endpoint": config.llm_endpoint,
-        "model": config.llm_model,
-        "api_key": config.llm_api_key,
-    }
 
 
 class FastIngestHandler(ToolHandler):
@@ -127,12 +103,14 @@ class FastIngestHandler(ToolHandler):
                 ToolErrorType.FILE_NOT_FOUND,
             )
 
-        config = _build_ingest_config(mode=IngestionMode.STANDARD)
+        pool = context.registry.pool
+        config = await _build_ingest_config(pool, mode=IngestionMode.FAST)
         pipeline = IngestionPipeline(config)
 
         try:
-            loop = asyncio.get_event_loop()
-            count = await loop.run_in_executor(None, pipeline.ingest_file, file_path)
+            count = await asyncio.get_running_loop().run_in_executor(
+                None, pipeline.ingest_file, file_path
+            )
 
             return ToolResult.success_result(
                 {
@@ -204,6 +182,7 @@ class SlowIngestHandler(ToolHandler):
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolResult:
+        from core.agent_api import db_dsn_from_env
         from services.ingest import (
             DocumentInfo,
             IngestionMode,
@@ -224,16 +203,15 @@ class SlowIngestHandler(ToolHandler):
                 ToolErrorType.FILE_NOT_FOUND,
             )
 
-        config = _build_ingest_config(mode=IngestionMode.SLOW)
+        pool = context.registry.pool
+        config = await _build_ingest_config(pool, mode=IngestionMode.SLOW)
         pipeline = IngestionPipeline(config)
 
         try:
-            # Read content
             reader = get_reader(file_path)
             content = reader.read(file_path)
             content_hash = _hash_text(content)
 
-            # Build document info
             title = arguments.get("title") or file_path.stem
             doc = DocumentInfo(
                 title=title,
@@ -244,13 +222,11 @@ class SlowIngestHandler(ToolHandler):
                 file_type=file_path.suffix.lower(),
             )
 
-            # Section content
             sectioner = Sectioner(config.max_section_chars, config.chunk_overlap)
             sections = sectioner.split(content, file_path)
 
-            # Run slow ingest
-            dsn = _build_dsn(config)
-            llm_cfg = _build_llm_config(config)
+            dsn = config.dsn or db_dsn_from_env()
+            llm_cfg = pipeline.llm._cfg
 
             result = await run_slow_ingest(
                 pipeline=pipeline,
@@ -331,6 +307,7 @@ class HybridIngestHandler(ToolHandler):
         arguments: dict[str, Any],
         context: ToolExecutionContext,
     ) -> ToolResult:
+        from core.agent_api import db_dsn_from_env
         from services.ingest import (
             DocumentInfo,
             IngestionMode,
@@ -351,7 +328,8 @@ class HybridIngestHandler(ToolHandler):
                 ToolErrorType.FILE_NOT_FOUND,
             )
 
-        config = _build_ingest_config(mode=IngestionMode.HYBRID)
+        pool = context.registry.pool
+        config = await _build_ingest_config(pool, mode=IngestionMode.HYBRID)
         pipeline = IngestionPipeline(config)
 
         try:
@@ -372,8 +350,8 @@ class HybridIngestHandler(ToolHandler):
             sectioner = Sectioner(config.max_section_chars, config.chunk_overlap)
             sections = sectioner.split(content, file_path)
 
-            dsn = _build_dsn(config)
-            llm_cfg = _build_llm_config(config)
+            dsn = config.dsn or db_dsn_from_env()
+            llm_cfg = pipeline.llm._cfg
 
             result = await run_hybrid_ingest(
                 pipeline=pipeline,
@@ -407,10 +385,118 @@ class HybridIngestHandler(ToolHandler):
             pipeline.close()
 
 
+class GitIngestHandler(ToolHandler):
+    """Ingest a GitHub repository by cloning and processing its files."""
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="git_ingest",
+            description=(
+                "Clone a GitHub repository and ingest its contents into memory. "
+                "Accepts a full URL (https://github.com/owner/repo) or shorthand "
+                "(owner/repo). Filters out common junk directories (.git, node_modules, etc.)."
+            ),
+            parameters={
+                "type": "object",
+                "properties": {
+                    "url": {
+                        "type": "string",
+                        "description": "GitHub repo URL or owner/repo shorthand.",
+                    },
+                    "branch": {
+                        "type": "string",
+                        "description": "Branch to clone (default: repo default branch).",
+                    },
+                },
+                "required": ["url"],
+            },
+            category=ToolCategory.INGEST,
+            energy_cost=4,
+            is_read_only=False,
+        )
+
+    def validate(self, arguments: dict[str, Any]) -> list[str]:
+        errors = []
+        url = arguments.get("url", "")
+        if not url or not str(url).strip():
+            errors.append("url cannot be empty")
+        return errors
+
+    async def execute(
+        self,
+        arguments: dict[str, Any],
+        context: ToolExecutionContext,
+    ) -> ToolResult:
+        import shutil
+        import subprocess
+        import tempfile
+
+        from services.ingest import IngestionMode, IngestionPipeline
+
+        repo = str(arguments["url"]).strip()
+        if "/" in repo and not repo.startswith("http"):
+            repo = f"https://github.com/{repo}"
+
+        branch = arguments.get("branch")
+
+        pool = context.registry.pool
+        config = await _build_ingest_config(pool, mode=IngestionMode.FAST)
+        pipeline = IngestionPipeline(config)
+        tmpdir = tempfile.mkdtemp(prefix="hexis_git_")
+
+        try:
+            cmd = ["git", "clone", "--depth", "1"]
+            if branch:
+                cmd.extend(["--branch", str(branch)])
+            cmd.extend([repo, tmpdir])
+
+            await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: subprocess.check_call(
+                    cmd, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE
+                ),
+            )
+
+            count = await asyncio.get_running_loop().run_in_executor(
+                None,
+                lambda: pipeline.ingest_directory(
+                    Path(tmpdir),
+                    recursive=True,
+                    exclude_dirs=IngestionPipeline.GIT_IGNORE_DIRS,
+                ),
+            )
+
+            return ToolResult.success_result(
+                {
+                    "memories_created": count,
+                    "repo": repo,
+                    "branch": branch,
+                },
+                display_output=f"Ingested {repo}: {count} memories created.",
+            )
+        except subprocess.CalledProcessError as e:
+            logger.error("git_ingest clone failed: %s", e)
+            return ToolResult.error_result(
+                f"Git clone failed: {e}",
+                ToolErrorType.EXECUTION_FAILED,
+            )
+        except Exception as e:
+            logger.error("git_ingest failed: %s", e)
+            return ToolResult.error_result(
+                f"Git ingestion failed: {e}",
+                ToolErrorType.EXECUTION_FAILED,
+            )
+        finally:
+            pipeline.close()
+            shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def create_ingest_tools() -> list[ToolHandler]:
     """Create all ingestion tool handlers."""
     return [
         FastIngestHandler(),
         SlowIngestHandler(),
         HybridIngestHandler(),
+        GitIngestHandler(),
     ]

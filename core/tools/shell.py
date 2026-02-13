@@ -30,7 +30,7 @@ SAFE_COMMANDS = {
     "ls", "pwd", "cat", "head", "tail", "grep", "find", "wc", "date", "echo",
     "whoami", "hostname", "uname", "env", "printenv", "which", "type",
     "file", "stat", "du", "df", "tree", "less", "more", "sort", "uniq",
-    "cut", "tr", "sed", "awk", "diff", "comm", "join", "xargs",
+    "cut", "tr", "diff", "comm", "join",
     "basename", "dirname", "realpath", "readlink",
     # Git read-only
     "git status", "git log", "git show", "git diff", "git branch",
@@ -134,26 +134,40 @@ class ShellHandler(ToolHandler):
             if blocked in command_lower:
                 return False, f"Command contains blocked pattern: {blocked}"
 
-        # Check for dangerous patterns
+        # Normalize the command for evasion-resistant checks:
+        # remove backslash escapes, collapse whitespace, strip env/command prefixes
+        import re
+        normalized = re.sub(r"\\(.)", r"\1", command_lower)  # remove backslash escapes
+        normalized = re.sub(r"\s+", " ", normalized).strip()  # collapse whitespace
+
+        # Block common evasion patterns
         dangerous_patterns = [
-            ("> /dev/", "Cannot write to /dev/"),
-            ("curl | sh", "Piping curl to shell is blocked"),
-            ("wget | sh", "Piping wget to shell is blocked"),
-            ("curl | bash", "Piping curl to bash is blocked"),
-            ("| bash", "Piping to bash is discouraged"),
-            ("&& rm -rf", "Chained rm -rf is blocked"),
+            (r"rm\s+.*-\s*r\s*.*-\s*f|rm\s+.*-\s*f\s*.*-\s*r|rm\s+-rf", "rm -rf variant is blocked"),
+            (r">\s*/dev/", "Cannot write to /dev/"),
+            (r"curl\s.*\|\s*(sh|bash)", "Piping curl to shell is blocked"),
+            (r"wget\s.*\|\s*(sh|bash)", "Piping wget to shell is blocked"),
+            (r"\|\s*bash", "Piping to bash is discouraged"),
+            (r"\$\(.*rm\b", "Command substitution with rm is blocked"),
+            (r"`.*rm\b", "Backtick substitution with rm is blocked"),
+            (r"eval\s", "eval is blocked"),
+            (r"base64\s.*-d.*\|\s*(sh|bash)", "Encoded shell execution is blocked"),
         ]
 
         for pattern, reason in dangerous_patterns:
-            if pattern in command_lower:
+            if re.search(pattern, normalized):
                 return False, reason
 
         # If safe_commands_only, check whitelist
         if self.safe_commands_only:
-            first_word = command.split()[0] if command.split() else ""
+            # Parse the actual command, ignoring shell metacharacters
+            try:
+                tokens = shlex.split(command)
+            except ValueError:
+                tokens = command.split()
+            first_word = tokens[0] if tokens else ""
             if first_word not in SAFE_COMMANDS:
                 # Check for compound commands like "git status"
-                first_two = " ".join(command.split()[:2])
+                first_two = " ".join(tokens[:2]) if len(tokens) >= 2 else first_word
                 if first_two not in SAFE_COMMANDS:
                     return False, f"Command '{first_word}' not in safe commands list"
 

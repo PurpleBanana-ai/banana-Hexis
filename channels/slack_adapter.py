@@ -12,7 +12,7 @@ import logging
 import os
 from typing import Any, Callable, Awaitable
 
-from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage
+from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage, parse_allowlist, resolve_channel_token
 from .media import Attachment
 
 logger = logging.getLogger(__name__)
@@ -20,14 +20,7 @@ logger = logging.getLogger(__name__)
 
 def _resolve_token(config: dict[str, Any], key: str, env_fallback: str) -> str | None:
     """Resolve a token from config (env var name) or direct environment."""
-    token_env = config.get(key) or env_fallback
-    token = os.getenv(str(token_env))
-    if token:
-        return token
-    raw = config.get(key, "")
-    if raw and len(str(raw)) > 20:
-        return str(raw)
-    return None
+    return resolve_channel_token(config, key, env_fallback)
 
 
 class SlackAdapter(ChannelAdapter):
@@ -55,17 +48,7 @@ class SlackAdapter(ChannelAdapter):
     @staticmethod
     def _parse_allowlist(value: Any) -> set[str] | None:
         """Parse an allowlist value. Returns None for '*' (allow all)."""
-        if value is None or value == "*":
-            return None
-        if isinstance(value, str):
-            import json
-            try:
-                value = json.loads(value)
-            except Exception:
-                return {value}
-        if isinstance(value, list):
-            return {str(v) for v in value}
-        return None
+        return parse_allowlist(value)
 
     @property
     def channel_type(self) -> str:
@@ -183,7 +166,7 @@ class SlackAdapter(ChannelAdapter):
             profile = user_info.get("user", {}).get("profile", {})
             sender_name = profile.get("display_name") or profile.get("real_name") or user_id
         except Exception:
-            pass
+            logger.debug("Silent exception in SlackAdapter", exc_info=True)
 
         # Convert Slack file attachments
         attachments: list[Attachment] = []

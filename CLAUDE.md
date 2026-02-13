@@ -147,6 +147,7 @@ hexis mcp                 # Start MCP server
 - **Heartbeat gating**: Heartbeat is blocked until `agent.is_configured=true` (set via `hexis init`)
 - **Consent flow**: Agent signs consent before first LLM use; consent is final and only ends via self-termination
 - **Pause/terminate**: Heartbeat pauses must include a detailed reason queued to the outbox; self-termination must queue a last will to the outbox
+- **Never revert or discard files without asking**: Do NOT run `git checkout`, `git restore`, `rm`, or any other destructive/irreversible file operation without explicit user confirmation first. Always ask before reverting, deleting, or overwriting files that have uncommitted changes.
 
 ## Architecture Principles
 

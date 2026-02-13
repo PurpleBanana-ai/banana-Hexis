@@ -11,10 +11,12 @@ pytestmark = pytest.mark.core
 
 @pytest.fixture(autouse=True)
 def _reset_responses_cache():
-    """Clear the per-endpoint Responses API capability cache between tests."""
+    """Clear the per-endpoint Responses API capability cache and OpenAI client cache between tests."""
     llm._endpoint_responses_support.clear()
+    llm._clear_openai_client_cache()
     yield
     llm._endpoint_responses_support.clear()
+    llm._clear_openai_client_cache()
 
 
 def test_normalize_provider_variants():

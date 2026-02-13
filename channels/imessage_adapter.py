@@ -14,7 +14,7 @@ import os
 import time
 from typing import Any, Callable, Awaitable
 
-from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage
+from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage, parse_allowlist, resolve_channel_token
 from .media import Attachment
 
 logger = logging.getLogger(__name__)
@@ -25,13 +25,7 @@ POLL_INTERVAL = 2  # seconds
 
 def _resolve_config(config: dict[str, Any], key: str, env_fallback: str) -> str | None:
     """Resolve a value from config or environment."""
-    val = config.get(key) or os.getenv(env_fallback)
-    if val:
-        return str(val)
-    raw = config.get(key, "")
-    if raw and len(str(raw)) > 5:
-        return str(raw)
-    return None
+    return resolve_channel_token(config, key, env_fallback)
 
 
 class IMessageAdapter(ChannelAdapter):
@@ -60,16 +54,7 @@ class IMessageAdapter(ChannelAdapter):
 
     @staticmethod
     def _parse_allowlist(value: Any) -> set[str] | None:
-        if value is None or value == "*":
-            return None
-        if isinstance(value, str):
-            try:
-                value = json.loads(value)
-            except Exception:
-                return {value}
-        if isinstance(value, list):
-            return {str(v) for v in value}
-        return None
+        return parse_allowlist(value)
 
     @property
     def channel_type(self) -> str:
@@ -282,7 +267,7 @@ class IMessageAdapter(ChannelAdapter):
             ) as resp:
                 pass  # Best effort
         except Exception:
-            pass
+            logger.debug("Silent exception in IMessageAdapter", exc_info=True)
 
     async def send_media(
         self,

@@ -12,7 +12,7 @@ import logging
 import os
 from typing import Any, Callable, Awaitable
 
-from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage
+from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage, parse_allowlist, resolve_channel_token
 from .media import Attachment
 
 logger = logging.getLogger(__name__)
@@ -20,14 +20,7 @@ logger = logging.getLogger(__name__)
 
 def _resolve_token(config: dict[str, Any]) -> str | None:
     """Resolve Telegram bot token from config (env var name) or environment."""
-    token_env = config.get("bot_token") or config.get("bot_token_env") or "TELEGRAM_BOT_TOKEN"
-    token = os.getenv(str(token_env))
-    if token:
-        return token
-    raw = config.get("bot_token", "")
-    if raw and ":" in str(raw) and len(str(raw)) > 20:
-        return str(raw)
-    return None
+    return resolve_channel_token(config, "bot_token", "TELEGRAM_BOT_TOKEN")
 
 
 class TelegramAdapter(ChannelAdapter):
@@ -55,17 +48,7 @@ class TelegramAdapter(ChannelAdapter):
     @staticmethod
     def _parse_allowlist(value: Any) -> set[str] | None:
         """Parse an allowlist value. Returns None for '*' (allow all)."""
-        if value is None or value == "*":
-            return None
-        if isinstance(value, str):
-            import json
-            try:
-                value = json.loads(value)
-            except Exception:
-                return {value}
-        if isinstance(value, list):
-            return {str(v) for v in value}
-        return None
+        return parse_allowlist(value)
 
     @property
     def channel_type(self) -> str:
@@ -295,7 +278,7 @@ class TelegramAdapter(ChannelAdapter):
                 action="typing",
             )
         except Exception:
-            pass
+            logger.debug("Silent exception in TelegramAdapter", exc_info=True)
 
     async def edit_message(
         self, channel_id: str, message_id: str, text: str,

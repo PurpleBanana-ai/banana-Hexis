@@ -382,6 +382,35 @@ BEGIN
     LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
+CREATE OR REPLACE FUNCTION explore_clusters_with_samples(
+    p_query TEXT,
+    p_cluster_limit INT DEFAULT 3,
+    p_sample_limit INT DEFAULT 3
+) RETURNS TABLE (
+    cluster_id UUID,
+    cluster_name TEXT,
+    cluster_type cluster_type,
+    cluster_similarity FLOAT,
+    memory_id UUID,
+    content TEXT,
+    memory_type memory_type,
+    membership_strength FLOAT
+) AS $$
+BEGIN
+    RETURN QUERY
+    SELECT
+        sc.id,
+        sc.name,
+        sc.cluster_type,
+        sc.similarity,
+        sm.memory_id,
+        sm.content,
+        sm.memory_type,
+        sm.membership_strength
+    FROM search_clusters_by_query(p_query, p_cluster_limit) sc
+    LEFT JOIN LATERAL get_cluster_sample_memories(sc.id, p_sample_limit) sm ON true;
+END;
+$$ LANGUAGE plpgsql STABLE;
 CREATE OR REPLACE FUNCTION find_related_concepts_for_memories(
     p_memory_ids UUID[],
     p_exclude TEXT DEFAULT '',

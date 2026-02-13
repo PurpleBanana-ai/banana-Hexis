@@ -21,18 +21,19 @@ from contextlib import asynccontextmanager
 from typing import Any, AsyncIterator, Literal
 
 import asyncpg
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel
+from starlette.middleware.base import BaseHTTPMiddleware
 
-from core.agent_api import db_dsn_from_env, get_agent_profile_context
-from core.agent_loop import AgentEvent, AgentLoop, AgentLoopConfig
+from core.agent_api import db_dsn_from_env, get_agent_profile_context, pool_sizes_from_env
+from core.agent_loop import AgentEvent
 from core.cli_api import status_payload_rich
-from core.cognitive_memory_api import CognitiveMemory, format_context_for_prompt
-from core.llm_config import load_llm_config
-from core.tools import ToolContext, create_default_registry
-from services.chat import _build_system_prompt, _remember_conversation
+from core.cognitive_memory_api import CognitiveMemory
+from core.tools import create_default_registry
+from services.agent import stream_agent
+from services.chat import _remember_conversation
 
 logger = logging.getLogger(__name__)
 
@@ -51,7 +52,8 @@ def _dsn() -> str:
 async def lifespan(app: FastAPI):
     global _pool
     dsn = _dsn()
-    _pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
+    _min, _max = pool_sizes_from_env(2, 10)
+    _pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
     logger.info("Hexis API started (pool created)")
     yield
     if _pool:
@@ -70,6 +72,22 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+# Optional Bearer token authentication
+_API_KEY = (os.getenv("HEXIS_API_KEY") or "").strip() or None
+
+
+class _BearerAuthMiddleware(BaseHTTPMiddleware):
+    async def dispatch(self, request: Request, call_next):
+        if _API_KEY and request.url.path != "/health":
+            auth = request.headers.get("authorization", "")
+            if not auth.startswith("Bearer ") or auth[7:] != _API_KEY:
+                return JSONResponse({"error": "Unauthorized"}, status_code=401)
+        return await call_next(request)
+
+
+if _API_KEY:
+    app.add_middleware(_BearerAuthMiddleware)
 
 
 # ---------------------------------------------------------------------------
@@ -108,7 +126,19 @@ def _sse_event(event: str, payload: dict[str, Any]) -> str:
 
 @app.get("/health")
 async def health():
-    return {"status": "ok"}
+    checks = {"db": False}
+    try:
+        if _pool:
+            async with _pool.acquire() as conn:
+                await conn.fetchval("SELECT 1")
+            checks["db"] = True
+    except Exception:
+        pass
+    ok = all(checks.values())
+    return JSONResponse(
+        {"status": "ok" if ok else "degraded", "checks": checks},
+        status_code=200 if ok else 503,
+    )
 
 
 @app.get("/api/status")
@@ -135,10 +165,11 @@ async def chat(req: ChatRequest):
 
 async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
     """
-    Run the AgentLoop in streaming mode and yield SSE events that match
+    Run the unified agent in streaming mode and yield SSE events that match
     the format the Next.js frontend already parses.
 
     Event mapping:
+        AgentEvent.PHASE_CHANGE  → phase_start/phase_end  {phase}
         AgentEvent.LOOP_START    → phase_start  {phase: "conscious_final"}
         AgentEvent.TEXT_DELTA    → token        {phase: "conscious_final", text}
         AgentEvent.TOOL_START    → log          {id, kind: "tool_call", title, detail}
@@ -157,144 +188,110 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
     session_id = str(uuid.uuid4())
 
     try:
-        # Load LLM config from DB
-        async with pool.acquire() as conn:
-            llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm")
-
-        # Build registry, profile, system prompt
         registry = create_default_registry(pool)
-        agent_profile = await get_agent_profile_context(dsn)
-        system_prompt = await _build_system_prompt(agent_profile, registry)
+        agent_profile = await get_agent_profile_context(pool=pool)
 
-        # Hydrate memory context
-        async with CognitiveMemory.connect(dsn) as mem_client:
-            context = await mem_client.hydrate(
-                user_message,
-                memory_limit=10,
-                include_partial=True,
-                include_identity=True,
-                include_worldview=True,
-                include_emotional_state=True,
-                include_goals=True,
-                include_drives=True,
-            )
-            if context.memories:
-                await mem_client.touch_memories([m.id for m in context.memories])
+        full_text = ""
+        conscious_started = False
 
-            memory_context = format_context_for_prompt(context, max_memories=10)
+        async for event in stream_agent(
+            pool,
+            registry,
+            user_message=user_message,
+            mode="chat",
+            history=history,
+            session_id=session_id,
+            agent_profile=agent_profile,
+            dsn=dsn,
+        ):
+            if event.event == AgentEvent.PHASE_CHANGE:
+                phase = event.data.get("phase", "")
+                status = event.data.get("status", "")
+                if phase == "memory_recall":
+                    count = event.data.get("count", 0)
+                    yield _sse_event("log", {
+                        "id": str(uuid.uuid4()),
+                        "kind": "memory_recall",
+                        "title": "Memory Recall",
+                        "detail": f"Retrieved {count} relevant memories",
+                    })
+                elif phase == "subconscious":
+                    if status == "start":
+                        yield _sse_event("phase_start", {"phase": "subconscious"})
+                    elif status == "end":
+                        yield _sse_event("phase_end", {"phase": "subconscious"})
 
-            # Log memory recall
-            if context.memories:
+            elif event.event == AgentEvent.LOOP_START:
+                if not conscious_started:
+                    yield _sse_event("phase_start", {"phase": "conscious_final"})
+                    conscious_started = True
+
+            elif event.event == AgentEvent.TEXT_DELTA:
+                if not conscious_started:
+                    yield _sse_event("phase_start", {"phase": "conscious_final"})
+                    conscious_started = True
+                text = event.data.get("text", "")
+                if text:
+                    full_text += text
+                    yield _sse_event("token", {
+                        "phase": "conscious_final",
+                        "text": text,
+                    })
+
+            elif event.event == AgentEvent.TOOL_START:
                 yield _sse_event("log", {
                     "id": str(uuid.uuid4()),
-                    "kind": "memory_recall",
-                    "title": "Memory Recall",
-                    "detail": f"Retrieved {len(context.memories)} relevant memories",
+                    "kind": "tool_call",
+                    "title": event.data.get("tool_name", "tool"),
+                    "detail": json.dumps(event.data.get("arguments", {}))[:500],
                 })
 
-            if memory_context:
-                enriched_user_message = f"{memory_context}\n\n[USER MESSAGE]\n{user_message}"
-            else:
-                enriched_user_message = user_message
+            elif event.event == AgentEvent.TOOL_RESULT:
+                tool_name = event.data.get("tool_name", "tool")
+                success = event.data.get("success", False)
+                error = event.data.get("error")
+                detail = f"{'OK' if success else 'FAILED'}"
+                if error:
+                    detail += f": {error}"
+                yield _sse_event("log", {
+                    "id": str(uuid.uuid4()),
+                    "kind": "tool_result",
+                    "title": tool_name,
+                    "detail": detail,
+                })
 
-            # Configure agent loop
-            loop_config = AgentLoopConfig(
-                tool_context=ToolContext.CHAT,
-                system_prompt=system_prompt,
-                llm_config=llm_config,
-                registry=registry,
-                pool=pool,
-                energy_budget=None,
-                max_iterations=6,
-                timeout_seconds=120.0,
-                temperature=0.7,
-                max_tokens=1200,
-                session_id=session_id,
-            )
+            elif event.event == AgentEvent.ERROR:
+                yield _sse_event("error", {
+                    "message": event.data.get("error", "Unknown error"),
+                })
 
-            agent = AgentLoop(loop_config)
-            full_text = ""
-
-            # Signal conscious_final phase start
-            yield _sse_event("phase_start", {"phase": "conscious_final"})
-
-            async for event in agent.stream(enriched_user_message, history=history):
-                if event.event == AgentEvent.TEXT_DELTA:
-                    text = event.data.get("text", "")
-                    if text:
-                        full_text += text
-                        yield _sse_event("token", {
-                            "phase": "conscious_final",
-                            "text": text,
-                        })
-
-                elif event.event == AgentEvent.TOOL_START:
-                    yield _sse_event("log", {
-                        "id": str(uuid.uuid4()),
-                        "kind": "tool_call",
-                        "title": event.data.get("tool_name", "tool"),
-                        "detail": json.dumps(event.data.get("arguments", {}))[:500],
-                    })
-
-                elif event.event == AgentEvent.TOOL_RESULT:
-                    tool_name = event.data.get("tool_name", "tool")
-                    success = event.data.get("success", False)
-                    error = event.data.get("error")
-                    detail = f"{'OK' if success else 'FAILED'}"
-                    if error:
-                        detail += f": {error}"
-                    yield _sse_event("log", {
-                        "id": str(uuid.uuid4()),
-                        "kind": "tool_result",
-                        "title": tool_name,
-                        "detail": detail,
-                    })
-
-                elif event.event == AgentEvent.ERROR:
-                    yield _sse_event("error", {
-                        "message": event.data.get("error", "Unknown error"),
-                    })
-
-            # Signal phase end and completion
+        # Signal phase end and completion
+        if conscious_started:
             yield _sse_event("phase_end", {"phase": "conscious_final"})
 
-            # Memory formation
-            if full_text:
-                try:
-                    await _remember_conversation(
-                        mem_client,
-                        user_message=user_message,
-                        assistant_message=full_text,
-                    )
-                    yield _sse_event("log", {
-                        "id": str(uuid.uuid4()),
-                        "kind": "memory_write",
-                        "title": "Memory Formation",
-                        "detail": "Conversation stored as episodic memory",
-                    })
-                except Exception as e:
-                    logger.error("Memory formation failed: %s", e)
+        # Memory formation
+        if full_text:
+            try:
+                mem_client = CognitiveMemory(pool)
+                await _remember_conversation(
+                    mem_client,
+                    user_message=user_message,
+                    assistant_message=full_text,
+                )
+                yield _sse_event("log", {
+                    "id": str(uuid.uuid4()),
+                    "kind": "memory_write",
+                    "title": "Memory Formation",
+                    "detail": "Conversation stored as episodic memory",
+                })
+            except Exception as e:
+                logger.error("Memory formation failed: %s", e)
 
-            yield _sse_event("done", {"assistant": full_text})
+        yield _sse_event("done", {"assistant": full_text})
 
     except Exception as e:
         logger.exception("Chat stream error")
         yield _sse_event("error", {"message": str(e)})
-
-
-def _extract_json_payload(text: str) -> dict[str, Any]:
-    if not text:
-        return {}
-    start = text.find("{")
-    end = text.rfind("}")
-    if start == -1 or end == -1 or end <= start:
-        return {}
-    snippet = text[start : end + 1]
-    try:
-        doc = json.loads(snippet)
-    except Exception:
-        return {}
-    return doc if isinstance(doc, dict) else {}
 
 
 def _resolve_fallback_api_key(provider: str, role: str) -> str | None:
@@ -519,7 +516,8 @@ async def init_consent_request(req: InitConsentRequest):
                     args = tc_args
                 break
         if not args:
-            args = _extract_json_payload(content_text)
+            from core.llm_json import extract_json_object
+            args = extract_json_object(content_text)
         raw_text = json.dumps(args) if args else content_text
 
     decision = str(args.get("decision") or "abstain").strip().lower()

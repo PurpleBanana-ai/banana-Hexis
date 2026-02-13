@@ -1,6 +1,7 @@
 """Tests for core.tools.ingest -- fast, slow, hybrid ingestion tools."""
 
 import json
+from pathlib import Path
 
 import pytest
 
@@ -113,6 +114,55 @@ class TestHybridIngestHandler:
 
 
 # ---------------------------------------------------------------------------
+# GitIngestHandler
+# ---------------------------------------------------------------------------
+
+class TestGitIngestHandler:
+    """Unit tests for GitIngestHandler."""
+
+    def test_spec_properties(self):
+        from core.tools.ingest import GitIngestHandler
+
+        handler = GitIngestHandler()
+        spec = handler.spec
+        assert spec.name == "git_ingest"
+        assert spec.category == ToolCategory.INGEST
+        assert spec.energy_cost == 4
+        assert ToolContext.HEARTBEAT in spec.allowed_contexts
+        assert ToolContext.CHAT in spec.allowed_contexts
+        assert ToolContext.MCP in spec.allowed_contexts
+        assert spec.is_read_only is False
+
+    def test_validate_missing_url(self):
+        from core.tools.ingest import GitIngestHandler
+
+        handler = GitIngestHandler()
+        errors = handler.validate({})
+        assert any("url" in e.lower() for e in errors)
+
+    def test_validate_empty_url(self):
+        from core.tools.ingest import GitIngestHandler
+
+        handler = GitIngestHandler()
+        errors = handler.validate({"url": ""})
+        assert any("url" in e.lower() for e in errors)
+
+    def test_validate_valid_url(self):
+        from core.tools.ingest import GitIngestHandler
+
+        handler = GitIngestHandler()
+        errors = handler.validate({"url": "https://github.com/owner/repo"})
+        assert errors == []
+
+    def test_validate_shorthand(self):
+        from core.tools.ingest import GitIngestHandler
+
+        handler = GitIngestHandler()
+        errors = handler.validate({"url": "owner/repo"})
+        assert errors == []
+
+
+# ---------------------------------------------------------------------------
 # Factory
 # ---------------------------------------------------------------------------
 
@@ -123,9 +173,9 @@ class TestCreateIngestTools:
         from core.tools.ingest import create_ingest_tools
 
         tools = create_ingest_tools()
-        assert len(tools) == 3
+        assert len(tools) == 4
         names = {t.spec.name for t in tools}
-        assert names == {"fast_ingest", "slow_ingest", "hybrid_ingest"}
+        assert names == {"fast_ingest", "slow_ingest", "hybrid_ingest", "git_ingest"}
 
     def test_all_have_ingest_category(self):
         from core.tools.ingest import create_ingest_tools
@@ -133,6 +183,61 @@ class TestCreateIngestTools:
         tools = create_ingest_tools()
         for t in tools:
             assert t.spec.category == ToolCategory.INGEST
+
+
+# ---------------------------------------------------------------------------
+# _build_ingest_config resolution (requires running DB)
+# ---------------------------------------------------------------------------
+
+class TestBuildIngestConfig:
+    """Verify _build_ingest_config resolves LLM config from DB."""
+
+    async def test_resolves_provider_from_db(self, db_pool):
+        from core.tools.ingest import _build_ingest_config
+        from services.ingest import IngestionMode
+
+        config = await _build_ingest_config(db_pool, mode=IngestionMode.FAST)
+        assert config.llm_config is not None
+        assert "provider" in config.llm_config
+        assert "model" in config.llm_config
+        assert config.dsn is not None
+
+    async def test_overrides_applied(self, db_pool):
+        from core.tools.ingest import _build_ingest_config
+        from services.ingest import IngestionMode
+
+        config = await _build_ingest_config(
+            db_pool, mode=IngestionMode.FAST, max_section_chars=5000
+        )
+        assert config.max_section_chars == 5000
+
+
+class TestResolveLlmConfig:
+    """Verify resolve_llm_config works with pools and connections."""
+
+    async def test_with_pool(self, db_pool):
+        from core.llm_config import resolve_llm_config
+
+        cfg = await resolve_llm_config(db_pool, "llm.chat", fallback_key="llm")
+        assert "provider" in cfg
+        assert "model" in cfg
+
+    async def test_with_connection(self, db_pool):
+        from core.llm_config import resolve_llm_config
+
+        async with db_pool.acquire() as conn:
+            cfg = await resolve_llm_config(conn, "llm.chat", fallback_key="llm")
+        assert "provider" in cfg
+        assert "model" in cfg
+
+    async def test_overrides_merged(self, db_pool):
+        from core.llm_config import resolve_llm_config
+
+        cfg = await resolve_llm_config(
+            db_pool, "llm.chat", fallback_key="llm",
+            overrides={"model": "custom-model"},
+        )
+        assert cfg["model"] == "custom-model"
 
 
 # ---------------------------------------------------------------------------
@@ -207,7 +312,7 @@ class TestSlowIngestAssessment:
 # ---------------------------------------------------------------------------
 
 class TestIngestionModeEnum:
-    """Verify new ingestion modes exist."""
+    """Verify ingestion modes exist."""
 
     def test_fast_mode_exists(self):
         from services.ingest import IngestionMode
@@ -223,6 +328,51 @@ class TestIngestionModeEnum:
         from services.ingest import IngestionMode
 
         assert IngestionMode.HYBRID.value == "hybrid"
+
+    def test_normalize_fast(self):
+        from services.ingest import _normalize_mode, IngestionMode
+
+        assert _normalize_mode("fast") == IngestionMode.FAST
+
+    def test_normalize_legacy_auto(self):
+        from services.ingest import _normalize_mode, IngestionMode
+
+        assert _normalize_mode("auto") == IngestionMode.FAST
+
+    def test_normalize_legacy_standard(self):
+        from services.ingest import _normalize_mode, IngestionMode
+
+        assert _normalize_mode("standard") == IngestionMode.FAST
+
+    def test_normalize_legacy_deep(self):
+        from services.ingest import _normalize_mode, IngestionMode
+
+        assert _normalize_mode("deep") == IngestionMode.FAST
+
+    def test_normalize_legacy_shallow(self):
+        from services.ingest import _normalize_mode, IngestionMode
+
+        assert _normalize_mode("shallow") == IngestionMode.FAST
+
+    def test_normalize_legacy_archive(self):
+        from services.ingest import _normalize_mode, IngestionMode
+
+        assert _normalize_mode("archive") == IngestionMode.FAST
+
+    def test_normalize_slow(self):
+        from services.ingest import _normalize_mode, IngestionMode
+
+        assert _normalize_mode("slow") == IngestionMode.SLOW
+
+    def test_normalize_hybrid(self):
+        from services.ingest import _normalize_mode, IngestionMode
+
+        assert _normalize_mode("hybrid") == IngestionMode.HYBRID
+
+    def test_normalize_none_defaults_fast(self):
+        from services.ingest import _normalize_mode, IngestionMode
+
+        assert _normalize_mode(None) == IngestionMode.FAST
 
 
 # ---------------------------------------------------------------------------
@@ -297,3 +447,228 @@ class TestSlowIngestPrompt:
         # Should not raise
         result = compose_personhood_prompt("ingest")
         assert isinstance(result, str)
+
+
+# ---------------------------------------------------------------------------
+# Reader coverage
+# ---------------------------------------------------------------------------
+
+class TestReaderExtensionCoverage:
+    """Verify get_reader() returns the correct reader for new extensions."""
+
+    def test_docx_reader(self):
+        from services.ingest import DocxReader, get_reader
+
+        reader = get_reader(Path("test.docx"))
+        assert isinstance(reader, DocxReader)
+
+    def test_rtf_reader(self):
+        from services.ingest import RtfReader, get_reader
+
+        reader = get_reader(Path("test.rtf"))
+        assert isinstance(reader, RtfReader)
+
+    def test_tex_reader(self):
+        from services.ingest import LatexReader, get_reader
+
+        reader = get_reader(Path("test.tex"))
+        assert isinstance(reader, LatexReader)
+
+    def test_bib_reader(self):
+        from services.ingest import LatexReader, get_reader
+
+        reader = get_reader(Path("test.bib"))
+        assert isinstance(reader, LatexReader)
+
+    def test_eml_reader(self):
+        from services.ingest import EmailReader, get_reader
+
+        reader = get_reader(Path("test.eml"))
+        assert isinstance(reader, EmailReader)
+
+    def test_mbox_reader(self):
+        from services.ingest import EmailReader, get_reader
+
+        reader = get_reader(Path("test.mbox"))
+        assert isinstance(reader, EmailReader)
+
+    def test_epub_reader(self):
+        from services.ingest import EpubReader, get_reader
+
+        reader = get_reader(Path("test.epub"))
+        assert isinstance(reader, EpubReader)
+
+    def test_pptx_reader(self):
+        from services.ingest import PptxReader, get_reader
+
+        reader = get_reader(Path("test.pptx"))
+        assert isinstance(reader, PptxReader)
+
+    def test_xlsx_reader(self):
+        from services.ingest import XlsxReader, get_reader
+
+        reader = get_reader(Path("test.xlsx"))
+        assert isinstance(reader, XlsxReader)
+
+    def test_xls_reader(self):
+        from services.ingest import XlsxReader, get_reader
+
+        reader = get_reader(Path("test.xls"))
+        assert isinstance(reader, XlsxReader)
+
+    def test_ipynb_reader(self):
+        from services.ingest import NotebookReader, get_reader
+
+        reader = get_reader(Path("test.ipynb"))
+        assert isinstance(reader, NotebookReader)
+
+
+class TestSupportedExtensions:
+    """Verify new extensions are in SUPPORTED_EXTENSIONS."""
+
+    def test_new_extensions_included(self):
+        from services.ingest import IngestionPipeline
+
+        expected = {".docx", ".rtf", ".tex", ".bib", ".eml", ".mbox",
+                    ".epub", ".pptx", ".xlsx", ".xls", ".ipynb"}
+        for ext in expected:
+            assert ext in IngestionPipeline.SUPPORTED_EXTENSIONS, f"{ext} not in SUPPORTED_EXTENSIONS"
+
+
+class TestInferSourceType:
+    """Verify _infer_source_type for new extensions."""
+
+    def test_pptx_is_presentation(self):
+        from services.ingest import _infer_source_type
+
+        assert _infer_source_type(Path("test.pptx")) == "presentation"
+
+    def test_xlsx_is_spreadsheet(self):
+        from services.ingest import _infer_source_type
+
+        assert _infer_source_type(Path("test.xlsx")) == "spreadsheet"
+
+    def test_xls_is_spreadsheet(self):
+        from services.ingest import _infer_source_type
+
+        assert _infer_source_type(Path("test.xls")) == "spreadsheet"
+
+    def test_ipynb_is_code(self):
+        from services.ingest import _infer_source_type
+
+        assert _infer_source_type(Path("test.ipynb")) == "code"
+
+    def test_eml_is_email(self):
+        from services.ingest import _infer_source_type
+
+        assert _infer_source_type(Path("test.eml")) == "email"
+
+    def test_mbox_is_email(self):
+        from services.ingest import _infer_source_type
+
+        assert _infer_source_type(Path("test.mbox")) == "email"
+
+    def test_epub_is_document(self):
+        from services.ingest import _infer_source_type
+
+        assert _infer_source_type(Path("test.epub")) == "document"
+
+    def test_tex_is_document(self):
+        from services.ingest import _infer_source_type
+
+        assert _infer_source_type(Path("test.tex")) == "document"
+
+    def test_docx_is_document(self):
+        from services.ingest import _infer_source_type
+
+        assert _infer_source_type(Path("test.docx")) == "document"
+
+
+class TestNotebookReaderParse:
+    """Verify NotebookReader can parse a simple notebook."""
+
+    def test_simple_notebook(self, tmp_path):
+        import json as json_mod
+
+        from services.ingest import NotebookReader
+
+        nb = {
+            "cells": [
+                {"cell_type": "markdown", "source": ["# Title\n", "Some text"]},
+                {"cell_type": "code", "source": ["print('hello')"]},
+            ],
+            "metadata": {"kernelspec": {"language": "python"}},
+        }
+        nb_path = tmp_path / "test.ipynb"
+        nb_path.write_text(json_mod.dumps(nb))
+        result = NotebookReader.read(nb_path)
+        assert "[Format: Jupyter Notebook]" in result
+        assert "[Cells: 2]" in result
+        assert "# Title" in result
+        assert "```python" in result
+        assert "print('hello')" in result
+
+
+class TestLatexReaderParse:
+    """Verify LatexReader can parse simple LaTeX content."""
+
+    def test_simple_tex(self, tmp_path):
+        from services.ingest import LatexReader
+
+        tex = r"""
+\documentclass{article}
+\begin{document}
+\section{Introduction}
+Hello world.
+\textbf{Bold text} and \emph{italic text}.
+\end{document}
+"""
+        tex_path = tmp_path / "test.tex"
+        tex_path.write_text(tex)
+        result = LatexReader.read(tex_path)
+        assert "[Format: LaTeX]" in result
+        assert "Hello world" in result
+        assert "Bold text" in result
+        assert "italic text" in result
+
+    def test_simple_bib(self, tmp_path):
+        from services.ingest import LatexReader
+
+        bib = """
+@article{smith2024,
+  author = {John Smith},
+  title = {A Great Paper},
+  year = {2024},
+  abstract = {This is the abstract.}
+}
+"""
+        bib_path = tmp_path / "test.bib"
+        bib_path.write_text(bib)
+        result = LatexReader.read(bib_path)
+        assert "[Format: BibTeX]" in result
+        assert "John Smith" in result
+        assert "A Great Paper" in result
+        assert "[Entries: 1]" in result
+
+
+class TestEmailReaderParse:
+    """Verify EmailReader can parse a simple .eml file."""
+
+    def test_simple_eml(self, tmp_path):
+        from services.ingest import EmailReader
+
+        eml_content = (
+            "From: alice@example.com\r\n"
+            "To: bob@example.com\r\n"
+            "Subject: Test Email\r\n"
+            "Date: Mon, 01 Jan 2024 00:00:00 +0000\r\n"
+            "\r\n"
+            "Hello Bob,\r\n"
+            "This is a test.\r\n"
+        )
+        eml_path = tmp_path / "test.eml"
+        eml_path.write_bytes(eml_content.encode("utf-8"))
+        result = EmailReader.read(eml_path)
+        assert "[Email]" in result
+        assert "[Subject: Test Email]" in result
+        assert "Hello Bob" in result

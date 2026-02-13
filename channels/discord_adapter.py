@@ -12,24 +12,14 @@ import logging
 import os
 from typing import Any, Callable, Awaitable
 
-from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage
+from .base import ChannelAdapter, ChannelCapabilities, ChannelMessage, parse_allowlist, resolve_channel_token
 from .media import Attachment
 
 logger = logging.getLogger(__name__)
 
 
 def _resolve_token(config: dict[str, Any]) -> str | None:
-    """Resolve Discord bot token from config (env var name) or environment."""
-    # Config stores the env var NAME, not the value
-    token_env = config.get("bot_token") or config.get("bot_token_env") or "DISCORD_BOT_TOKEN"
-    token = os.getenv(str(token_env))
-    if token:
-        return token
-    # Fallback: maybe the value is the token itself (for backwards compat)
-    raw = config.get("bot_token", "")
-    if raw and len(str(raw)) > 20 and "." in str(raw):
-        return str(raw)
-    return None
+    return resolve_channel_token(config, "bot_token", "DISCORD_BOT_TOKEN")
 
 
 class DiscordAdapter(ChannelAdapter):
@@ -57,18 +47,7 @@ class DiscordAdapter(ChannelAdapter):
 
     @staticmethod
     def _parse_allowlist(value: Any) -> set[str] | None:
-        """Parse an allowlist value. Returns None for '*' (allow all)."""
-        if value is None or value == "*":
-            return None
-        if isinstance(value, str):
-            import json
-            try:
-                value = json.loads(value)
-            except Exception:
-                return {value}
-        if isinstance(value, list):
-            return {str(v) for v in value}
-        return None
+        return parse_allowlist(value)
 
     @property
     def channel_type(self) -> str:
@@ -266,7 +245,7 @@ class DiscordAdapter(ChannelAdapter):
                 channel = await self._client.fetch_channel(int(channel_id))
             await channel.typing()
         except Exception:
-            pass
+            logger.debug("Silent exception in DiscordAdapter", exc_info=True)
 
     async def edit_message(
         self, channel_id: str, message_id: str, text: str,

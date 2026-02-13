@@ -12,16 +12,9 @@ import json
 import logging
 from typing import Any, TYPE_CHECKING
 
-from core.agent_loop import AgentEvent, AgentEventData, AgentLoop, AgentLoopConfig
-from core.llm_config import load_llm_config
-from core.tools.base import ToolContext
 from core.tools.config import ContextOverrides
+from services.agent import run_agent
 from services.heartbeat_prompt import build_heartbeat_decision_prompt
-from services.prompt_resources import (
-    compose_personhood_prompt,
-    load_heartbeat_agentic_prompt,
-    load_heartbeat_task_mode_prompt,
-)
 
 if TYPE_CHECKING:
     import asyncpg
@@ -85,45 +78,24 @@ async def build_heartbeat_system_prompt(
     *,
     has_backlog_tasks: bool = False,
 ) -> str:
-    """Build the system prompt for an agentic heartbeat."""
-    base_prompt = load_heartbeat_agentic_prompt().strip()
+    """Build the system prompt for an agentic heartbeat.
 
-    personhood = ""
-    try:
-        personhood = compose_personhood_prompt("heartbeat")
-    except Exception:
-        logger.debug("Failed to compose personhood prompt", exc_info=True)
+    Compatibility wrapper — delegates to services.agent.build_system_prompt().
+    """
+    from services.agent import build_system_prompt as _build
+    from core.tools.registry import ToolRegistry as _TR
 
-    # Add tool descriptions from registry
-    tool_section = ""
-    if registry:
-        try:
-            specs = await registry.get_specs(ToolContext.HEARTBEAT)
-            tool_names = sorted(s["function"]["name"] for s in specs)
-            tool_section = (
-                "\n\n## Available Tools\n"
-                + ", ".join(tool_names)
-                + "\n\nUse these tools via tool_use to take actions. "
-                "Each tool has its own parameters — the LLM API will show you the schemas."
-            )
-        except Exception:
-            logger.debug("Failed to get tool specs for heartbeat prompt", exc_info=True)
-
-    parts = [base_prompt]
-    if tool_section:
-        parts.append(tool_section)
-
-    # Append task guidance when backlog has work
-    if has_backlog_tasks:
-        task_mode_prompt = load_heartbeat_task_mode_prompt().strip()
-        parts.append("\n\n" + task_mode_prompt)
-
-    if personhood:
-        parts.append(
-            "\n\n----- PERSONHOOD MODULES (for grounding) -----\n\n"
-            + personhood
-        )
-    return "\n".join(parts)
+    if registry is None:
+        # Create a minimal mock for the prompt builder
+        class _NoopRegistry:
+            async def get_specs(self, ctx):
+                return []
+        registry = _NoopRegistry()  # type: ignore[assignment]
+    return await _build(
+        "heartbeat",
+        registry,  # type: ignore[arg-type]
+        has_backlog_tasks=has_backlog_tasks,
+    )
 
 
 async def run_agentic_heartbeat(
@@ -135,7 +107,7 @@ async def run_agentic_heartbeat(
     context: dict[str, Any],
 ) -> dict[str, Any]:
     """
-    Run a single heartbeat cycle using the AgentLoop.
+    Run a single heartbeat cycle using the unified agent runner.
 
     Returns a dict with:
     - completed: bool
@@ -150,9 +122,6 @@ async def run_agentic_heartbeat(
     if has_tasks:
         logger.info("Backlog has actionable items — scaling resources + granting permissions")
 
-    # Build system prompt (with task guidance addendum if backlog has work)
-    system_prompt = await build_heartbeat_system_prompt(registry, has_backlog_tasks=has_tasks)
-
     # Build the user message (heartbeat context snapshot)
     user_message = build_heartbeat_decision_prompt(context)
 
@@ -161,9 +130,6 @@ async def run_agentic_heartbeat(
         checkpoint_ctx = _get_checkpoint_context(context)
         if checkpoint_ctx:
             user_message += "\n" + checkpoint_ctx
-
-    # Load LLM config
-    llm_config = await load_llm_config(conn, "llm.heartbeat")
 
     # Extract energy budget from context
     energy = context.get("energy", {})
@@ -174,41 +140,22 @@ async def run_agentic_heartbeat(
         energy_budget = energy_budget * 2
         logger.info("Backlog energy boost: %d → %d", energy_budget // 2, energy_budget)
 
-    timeout = 300.0 if has_tasks else 120.0
-
-    # Build agent loop config
-    # Planning and self-correction are always on — they're just better
-    # loop behavior. Only permissions scale with backlog state.
-    loop_config = AgentLoopConfig(
-        tool_context=ToolContext.HEARTBEAT,
-        system_prompt=system_prompt,
-        llm_config=llm_config,
-        registry=registry,
-        pool=pool,
+    result = await run_agent(
+        pool,
+        registry,
+        user_message=user_message,
+        mode="heartbeat",
         energy_budget=energy_budget,
-        max_iterations=None,  # Timeout-based
-        timeout_seconds=timeout,
-        temperature=0.7,
-        max_tokens=4096 if has_tasks else 2048,
         heartbeat_id=heartbeat_id,
-        # Always plan → execute → verify
-        enable_planning=True,
-        # Always nudge for self-correction
-        continuation_prompt=(
-            "You finished without taking further action. "
-            "Review your output — is there anything you should recall, "
-            "record, or act on before finishing?"
-        ),
-        max_continuations=2 if has_tasks else 1,
-        # Only grant shell/file_write when there are tasks to execute
+        heartbeat_context=context,
+        has_backlog_tasks=has_tasks,
+        timeout_seconds=300.0 if has_tasks else 120.0,
+        max_tokens=4096 if has_tasks else 2048,
         context_overrides=ContextOverrides(
             allow_shell=True,
             allow_file_write=True,
         ) if has_tasks else None,
     )
-
-    agent = AgentLoop(loop_config)
-    result = await agent.run(user_message)
 
     return {
         "completed": result.stopped_reason == "completed",

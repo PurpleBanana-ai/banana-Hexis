@@ -354,6 +354,9 @@ $$;
 -- ============================================================================
 -- INDEXES
 -- ============================================================================
+CREATE INDEX IF NOT EXISTS idx_memories_source_ref
+    ON memories ((source_attribution->>'ref'))
+    WHERE source_attribution->>'ref' IS NOT NULL;
 -- Note: Use text-based indexes because timestamptz casts aren't IMMUTABLE.
 -- ============================================================================
 -- HELPER FUNCTIONS
