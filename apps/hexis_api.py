@@ -31,6 +31,7 @@ from core.agent_api import db_dsn_from_env, get_agent_profile_context, pool_size
 from core.agent_loop import AgentEvent
 from core.cli_api import status_payload_rich
 from core.cognitive_memory_api import CognitiveMemory
+from core.gateway import EventSource, Gateway
 from core.tools import create_default_registry
 from services.agent import stream_agent
 from services.chat import _remember_conversation
@@ -151,6 +152,109 @@ async def status():
         return JSONResponse({"error": str(e)}, status_code=500)
 
 
+@app.post("/api/webhook/{source}")
+async def webhook(source: str, request: Request):
+    """Accept an external webhook payload and submit to the gateway for async processing."""
+    pool = _pool
+    if pool is None:
+        return JSONResponse({"error": "Server not ready"}, status_code=503)
+
+    try:
+        payload = await request.json()
+    except Exception:
+        payload = {}
+
+    try:
+        gateway = Gateway(pool)
+        event_id = await gateway.submit(
+            EventSource.WEBHOOK,
+            f"webhook:{source}",
+            payload,
+        )
+        return JSONResponse({"status": "accepted", "event_id": event_id}, status_code=202)
+    except Exception as e:
+        logger.error("Webhook submit failed: %s", e)
+        return JSONResponse({"error": str(e)}, status_code=500)
+
+
+@app.get("/api/events/stream")
+async def event_stream():
+    """SSE stream of gateway events for real-time dashboard updates.
+
+    Uses pg_notify on the 'gateway_events' channel. Each notification triggers
+    a fetch of the event row and yields it as an SSE event.
+    """
+    pool = _pool
+    if pool is None:
+        return StreamingResponse(
+            _sse_iter_error("Server not ready"),
+            media_type="text/event-stream",
+        )
+    return StreamingResponse(
+        _sse_event_stream(pool),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
+    )
+
+
+async def _sse_iter_error(msg: str) -> AsyncIterator[str]:
+    yield _sse_event("error", {"message": msg})
+
+
+async def _sse_event_stream(pool: asyncpg.Pool) -> AsyncIterator[str]:
+    """Generator that listens for pg_notify and yields SSE events."""
+    import asyncio
+
+    queue: asyncio.Queue[str] = asyncio.Queue()
+
+    def _on_notify(conn, pid, channel, payload):
+        queue.put_nowait(payload)
+
+    conn = await pool.acquire()
+    try:
+        await conn.add_listener("gateway_events", _on_notify)
+        yield _sse_event("connected", {"message": "Listening for gateway events"})
+
+        while True:
+            try:
+                # Wait for notification with a 30s keepalive timeout
+                event_id_str = await asyncio.wait_for(queue.get(), timeout=30.0)
+            except asyncio.TimeoutError:
+                # Send keepalive comment
+                yield ": keepalive\n\n"
+                continue
+
+            # Fetch the event from DB
+            try:
+                row = await pool.fetchrow(
+                    "SELECT id, source, status, session_key, payload, result, error, "
+                    "correlation_id, created_at, started_at, completed_at "
+                    "FROM gateway_events WHERE id = $1",
+                    int(event_id_str),
+                )
+                if row:
+                    event_data = {
+                        "id": row["id"],
+                        "source": row["source"],
+                        "status": row["status"],
+                        "session_key": row["session_key"],
+                        "correlation_id": str(row["correlation_id"]),
+                        "created_at": row["created_at"].isoformat() if row["created_at"] else None,
+                    }
+                    yield _sse_event("gateway_event", event_data)
+            except Exception:
+                logger.debug("Failed to fetch event %s", event_id_str, exc_info=True)
+
+    except asyncio.CancelledError:
+        pass
+    finally:
+        try:
+            await conn.remove_listener("gateway_events", _on_notify)
+        except Exception:
+            pass
+        await pool.release(conn)
+
+
 @app.post("/api/chat")
 async def chat(req: ChatRequest):
     return StreamingResponse(
@@ -186,6 +290,17 @@ async def _stream_chat(req: ChatRequest) -> AsyncIterator[str]:
     user_message = req.message
     history = req.history or []
     session_id = str(uuid.uuid4())
+
+    # Record chat event for audit trail (record-and-dispatch mode)
+    try:
+        gateway = Gateway(pool)
+        await gateway.record(
+            EventSource.CHAT,
+            f"chat:api:{session_id}",
+            {"message": user_message[:500]},
+        )
+    except Exception:
+        logger.debug("Gateway record failed (non-fatal)", exc_info=True)
 
     try:
         registry = create_default_registry(pool)

@@ -1,8 +1,9 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
 import { useRouter } from "next/navigation";
 import Link from "next/link";
+import { useGatewayEvents } from "./hooks/use-gateway-events";
 import { Card } from "./components/ui/card";
 import { Badge, GoalPriorityBadge, MemoryTypeBadge } from "./components/ui/badge";
 import { ProgressBar } from "./components/ui/progress-bar";
@@ -55,6 +56,16 @@ export default function Dashboard() {
   const [status, setStatus] = useState<StatusData | null>(null);
   const [loading, setLoading] = useState(true);
 
+  const refreshStatus = useCallback(async () => {
+    try {
+      const res = await fetch("/api/status", { cache: "no-store" });
+      if (res.ok) {
+        const data = await res.json();
+        setStatus(data);
+      }
+    } catch {}
+  }, []);
+
   useEffect(() => {
     const load = async () => {
       try {
@@ -85,14 +96,10 @@ export default function Dashboard() {
       }
     };
     load();
-    const interval = setInterval(() => {
-      fetch("/api/status", { cache: "no-store" })
-        .then((r) => r.json())
-        .then(setStatus)
-        .catch(() => {});
-    }, 30000);
-    return () => clearInterval(interval);
   }, [router]);
+
+  // Refresh when gateway events arrive (replaces 30s polling)
+  useGatewayEvents(refreshStatus);
 
   if (loading) {
     return (

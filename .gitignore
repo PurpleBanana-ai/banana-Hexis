@@ -64,3 +64,4 @@ logs/
 # Misc
 .cache/
 .tmp/
+.reference

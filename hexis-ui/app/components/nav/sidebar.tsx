@@ -2,7 +2,8 @@
 
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import { useEffect, useState } from "react";
+import { useCallback, useEffect, useState } from "react";
+import { useGatewayEvents } from "../../hooks/use-gateway-events";
 import { ProgressBar } from "../ui/progress-bar";
 import { Badge } from "../ui/badge";
 
@@ -42,20 +43,21 @@ export function Sidebar() {
   const pathname = usePathname();
   const [status, setStatus] = useState<StatusData>({});
 
-  useEffect(() => {
-    const load = async () => {
-      try {
-        const res = await fetch("/api/status", { cache: "no-store" });
-        if (res.ok) {
-          const data = await res.json();
-          setStatus(data);
-        }
-      } catch {}
-    };
-    load();
-    const interval = setInterval(load, 30000);
-    return () => clearInterval(interval);
+  const loadStatus = useCallback(async () => {
+    try {
+      const res = await fetch("/api/status", { cache: "no-store" });
+      if (res.ok) {
+        const data = await res.json();
+        setStatus(data);
+      }
+    } catch {}
   }, []);
+
+  // Load on mount
+  useEffect(() => { loadStatus(); }, [loadStatus]);
+
+  // Refresh when gateway events arrive (replaces 30s polling)
+  useGatewayEvents(loadStatus);
 
   return (
     <aside className="fixed left-0 top-0 z-20 flex h-screen w-56 flex-col border-r border-[var(--outline)] bg-[var(--surface)] px-4 py-6">

@@ -19,7 +19,11 @@ from services.heartbeat_agentic import (
     finalize_heartbeat,
     run_agentic_heartbeat,
 )
-from services.worker_service import HeartbeatWorker
+from services.worker_service import (
+    HeartbeatWorker,
+    _extract_heartbeat_context,
+    _is_agentic_heartbeat_enabled,
+)
 
 pytestmark = [pytest.mark.asyncio(loop_scope="session")]
 
@@ -283,7 +287,7 @@ class TestFinalizeHeartbeat:
 
 
 # ============================================================================
-# Unit: HeartbeatWorker context extraction
+# Unit: context extraction
 # ============================================================================
 
 
@@ -306,7 +310,7 @@ class TestContextExtraction:
                 }
             ],
         }
-        context = HeartbeatWorker._extract_heartbeat_context(payload)
+        context = _extract_heartbeat_context(payload)
         assert "energy" in context
         assert context["energy"]["current"] == 15
 
@@ -324,13 +328,13 @@ class TestContextExtraction:
                 }
             ],
         }
-        context = HeartbeatWorker._extract_heartbeat_context(payload)
+        context = _extract_heartbeat_context(payload)
         assert "energy" in context
 
     def test_extract_context_no_external_calls(self):
         """Returns payload when no external_calls present."""
         payload = {"heartbeat_id": "hb-123", "energy": {"current": 5}}
-        context = HeartbeatWorker._extract_heartbeat_context(payload)
+        context = _extract_heartbeat_context(payload)
         assert context["heartbeat_id"] == "hb-123"
 
     def test_extract_context_no_think_call(self):
@@ -340,59 +344,50 @@ class TestContextExtraction:
                 {"call_type": "embed", "input": {}},
             ],
         }
-        context = HeartbeatWorker._extract_heartbeat_context(payload)
+        context = _extract_heartbeat_context(payload)
         assert context == payload
 
     def test_extract_context_empty_external_calls(self):
         """Returns payload when external_calls is empty."""
         payload = {"external_calls": []}
-        context = HeartbeatWorker._extract_heartbeat_context(payload)
+        context = _extract_heartbeat_context(payload)
         assert context == payload
 
 
 # ============================================================================
-# Unit: HeartbeatWorker agentic flag
+# Unit: agentic flag
 # ============================================================================
 
 
 class TestAgenticFlag:
     async def test_agentic_disabled_by_default(self, db_pool):
         """Agentic heartbeat is disabled when config key is missing."""
-        worker = HeartbeatWorker()
-        worker.pool = db_pool
-
         async with db_pool.acquire() as conn:
             # Ensure the config key is absent
             await conn.execute("DELETE FROM config WHERE key = 'heartbeat.use_agentic_loop'")
-            enabled = await worker._is_agentic_heartbeat_enabled(conn)
+            enabled = await _is_agentic_heartbeat_enabled(conn)
             assert enabled is False
 
     async def test_agentic_enabled_when_true(self, db_pool):
         """Agentic heartbeat is enabled when config key is 'true'."""
-        worker = HeartbeatWorker()
-        worker.pool = db_pool
-
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "SELECT set_config('heartbeat.use_agentic_loop', 'true'::jsonb)"
             )
             try:
-                enabled = await worker._is_agentic_heartbeat_enabled(conn)
+                enabled = await _is_agentic_heartbeat_enabled(conn)
                 assert enabled is True
             finally:
                 await conn.execute("DELETE FROM config WHERE key = 'heartbeat.use_agentic_loop'")
 
     async def test_agentic_disabled_when_false(self, db_pool):
         """Agentic heartbeat is disabled when config key is 'false'."""
-        worker = HeartbeatWorker()
-        worker.pool = db_pool
-
         async with db_pool.acquire() as conn:
             await conn.execute(
                 "SELECT set_config('heartbeat.use_agentic_loop', 'false'::jsonb)"
             )
             try:
-                enabled = await worker._is_agentic_heartbeat_enabled(conn)
+                enabled = await _is_agentic_heartbeat_enabled(conn)
                 assert enabled is False
             finally:
                 await conn.execute("DELETE FROM config WHERE key = 'heartbeat.use_agentic_loop'")

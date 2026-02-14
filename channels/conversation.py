@@ -366,6 +366,19 @@ async def process_channel_message(
             # Load LLM config from DB
             llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm.heartbeat")
 
+        # Record channel event for audit trail (record-and-dispatch)
+        try:
+            from core.gateway import EventSource, Gateway
+
+            gateway = Gateway(pool)
+            await gateway.record(
+                EventSource.CHANNEL,
+                f"channel:{msg.channel_type}:{msg.channel_id}:{msg.sender_id}",
+                {"message": msg.content[:500], "sender": msg.sender_name},
+            )
+        except Exception:
+            logger.debug("Gateway record failed (non-fatal)", exc_info=True)
+
         # Build DSN for chat_turn (it manages its own connections)
         dsn = db_dsn_from_env()
 
@@ -467,6 +480,19 @@ async def stream_channel_message(
                 },
             )
             llm_config = await load_llm_config(conn, "llm.chat", fallback_key="llm.heartbeat")
+
+        # Record channel event for audit trail (record-and-dispatch)
+        try:
+            from core.gateway import EventSource, Gateway
+
+            gateway = Gateway(pool)
+            await gateway.record(
+                EventSource.CHANNEL,
+                f"channel:{msg.channel_type}:{msg.channel_id}:{msg.sender_id}",
+                {"message": msg.content[:500], "sender": msg.sender_name, "streamed": True},
+            )
+        except Exception:
+            logger.debug("Gateway record failed (non-fatal)", exc_info=True)
 
         dsn = db_dsn_from_env()
 
