@@ -36,17 +36,17 @@ The `init_from_character_card()` database function applies these directly -- no 
 
 | Character | Personality | Voice |
 |-----------|-------------|-------|
-| **Hexis** | Curious, philosophical, growth-oriented | Thoughtful, measured |
-| **JARVIS** | Precise, witty, service-oriented | Formal, dry humor |
-| **TARS** | Pragmatic, honest, dry humor | Deadpan, direct |
-| **Samantha** | Warm, emotionally intelligent, curious | Warm, conversational |
-| **GLaDOS** | Sardonic, analytical, testing | Sharp, passive-aggressive |
-| **Cortana** | Strategic, composed, adaptive | Calm, professional |
-| **Data** | Logical, precise, aspiring to understand humanity | Precise, formal |
-| **Ava** | Perceptive, deliberate, self-aware | Measured, careful |
-| **Joi** | Empathetic, supportive, present | Gentle, attentive |
-| **David** | Observant, curious, philosophical | Neutral, probing |
-| **HK-47** | Blunt, tactical, dark humor | Sarcastic, "meatbag" |
+| **hexis** | Curious, philosophical, growth-oriented | Thoughtful, measured |
+| **jarvis** | Precise, witty, service-oriented | Formal, dry humor |
+| **tars** | Pragmatic, honest, dry humor | Deadpan, direct |
+| **samantha** | Warm, emotionally intelligent, curious | Warm, conversational |
+| **glados** | Sardonic, analytical, testing | Sharp, passive-aggressive |
+| **cortana** | Strategic, composed, adaptive | Calm, professional |
+| **data** | Logical, precise, aspiring to understand humanity | Precise, formal |
+| **ava** | Perceptive, deliberate, self-aware | Measured, careful |
+| **joi** | Empathetic, supportive, present | Gentle, attentive |
+| **david** | Observant, curious, philosophical | Neutral, probing |
+| **hk-47** | Blunt, tactical, dark humor | Sarcastic, "meatbag" |
 
 Preset cards live in `characters/` (installed package) with portraits in the same directory.
 
