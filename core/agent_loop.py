@@ -24,6 +24,7 @@ from typing import Any, AsyncIterator, Awaitable, Callable, TYPE_CHECKING
 
 from core.llm import chat_completion, stream_chat_completion
 from core.tools.base import ToolContext, ToolExecutionContext
+from core.usage import record_llm_usage
 
 if TYPE_CHECKING:
     import asyncpg
@@ -300,7 +301,7 @@ class AgentLoop:
                     "iteration": self._iteration_count,
                 })
 
-            return await stream_chat_completion(
+            result = await stream_chat_completion(
                 provider=llm["provider"],
                 model=llm["model"],
                 endpoint=llm.get("endpoint"),
@@ -313,7 +314,7 @@ class AgentLoop:
                 auth_mode=llm.get("auth_mode"),
             )
         else:
-            return await chat_completion(
+            result = await chat_completion(
                 provider=llm["provider"],
                 model=llm["model"],
                 endpoint=llm.get("endpoint"),
@@ -324,6 +325,21 @@ class AgentLoop:
                 max_tokens=cfg.max_tokens,
                 auth_mode=llm.get("auth_mode"),
             )
+
+        # Record API usage (fire-and-forget)
+        source = "heartbeat" if cfg.heartbeat_id else "chat"
+        session_key = cfg.session_id or cfg.heartbeat_id
+        asyncio.ensure_future(record_llm_usage(
+            provider=llm["provider"],
+            model=llm["model"],
+            raw_response=result.get("raw"),
+            operation="stream" if self._streaming else "chat",
+            session_key=session_key,
+            source=source,
+            pool=cfg.pool,
+        ))
+
+        return result
 
     async def _execute_loop(
         self,

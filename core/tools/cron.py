@@ -27,9 +27,41 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-_VALID_ACTIONS = {"create", "list", "update", "cancel"}
-_VALID_SCHEDULE_KINDS = {"once", "interval", "daily", "weekly"}
+_VALID_ACTIONS = {"create", "list", "update", "cancel", "stats"}
+_VALID_SCHEDULE_KINDS = {"once", "interval", "daily", "weekly", "cron"}
 _VALID_ACTION_KINDS = {"queue_user_message", "create_goal"}
+_VALID_DELIVERY_MODES = {"outbox", "channel", "webhook", "silent"}
+
+
+def _is_cron_expression(s: str) -> bool:
+    """Check if a string looks like a standard cron expression (5 or 6 fields)."""
+    import re
+    parts = s.strip().split()
+    if len(parts) not in (5, 6):
+        return False
+    # Each field should match cron syntax: digits, *, /, -, comma
+    cron_field = re.compile(r'^[\d\*\/\-\,\?LW#]+$')
+    return all(cron_field.match(p) for p in parts)
+
+
+def _cron_next_run(cron_expr: str, timezone: str = "UTC") -> str | None:
+    """Compute the next run time for a cron expression. Returns ISO8601 string or None."""
+    try:
+        from croniter import croniter
+        from datetime import datetime, timezone as tz
+        import pytz
+    except ImportError:
+        return None
+    try:
+        local_tz = pytz.timezone(timezone)
+    except Exception:
+        local_tz = pytz.UTC
+    now = datetime.now(tz.utc).astimezone(local_tz)
+    cron = croniter(cron_expr, now)
+    next_dt = cron.get_next(datetime)
+    if next_dt.tzinfo is None:
+        next_dt = local_tz.localize(next_dt)
+    return next_dt.astimezone(tz.utc).isoformat()
 
 
 def _parse_shorthand_schedule(schedule_str: str) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
@@ -42,10 +74,19 @@ def _parse_shorthand_schedule(schedule_str: str) -> tuple[str, dict[str, Any], d
         "weekly:monday:09:00" -> weekly, weekday = 1, time = 09:00
         "every:5m"          -> interval, every_minutes = 5
         "every:2h"          -> interval, every_hours = 2
+        "0 9 * * *"         -> cron expression (standard 5-field format)
 
     Returns None if the string doesn't match any shorthand.
     """
-    if not schedule_str or ":" not in schedule_str:
+    if not schedule_str:
+        return None
+
+    # Check for standard cron expression first
+    if _is_cron_expression(schedule_str):
+        next_run = _cron_next_run(schedule_str)
+        return ("cron", {"cron": schedule_str, "_next_run": next_run or ""}, {})
+
+    if ":" not in schedule_str:
         return None
 
     parts = schedule_str.strip().split(":")
@@ -112,11 +153,16 @@ class ManageScheduleHandler(ToolHandler):
                 "'create' (new task), "
                 "'list' (view scheduled tasks), "
                 "'update' (modify a task), "
-                "'cancel' (disable/delete a task). "
-                "Schedule kinds: 'once' (one-shot), 'interval' (recurring), 'daily', 'weekly'. "
-                "Shorthand: 'once:+2h', 'daily:07:00', 'weekly:monday:09:00', 'every:5m'. "
+                "'cancel' (disable/delete a task), "
+                "'stats' (execution statistics). "
+                "Schedule kinds: 'once' (one-shot), 'interval' (recurring), 'daily', 'weekly', "
+                "'cron' (standard cron expression like '0 9 * * *'). "
+                "Shorthand: 'once:+2h', 'daily:07:00', 'weekly:monday:09:00', 'every:5m', "
+                "or standard cron: '*/15 * * * *', '0 9 * * 1-5'. "
                 "Action kinds: 'queue_user_message' (send a message prompt to yourself), "
-                "'create_goal' (create a goal when the task fires)."
+                "'create_goal' (create a goal when the task fires). "
+                "Delivery modes: 'outbox' (default), 'channel' (specific channel+topic), "
+                "'webhook' (HTTP POST), 'silent' (log only, no notification)."
             ),
             parameters={
                 "type": "object",
@@ -177,6 +223,27 @@ class ManageScheduleHandler(ToolHandler):
                         "type": "integer",
                         "description": "Maximum number of times the task should run. 1 for one-shot.",
                     },
+                    "delivery_mode": {
+                        "type": "string",
+                        "enum": list(_VALID_DELIVERY_MODES),
+                        "description": (
+                            "Where to deliver results: 'outbox' (default, normal outbox routing), "
+                            "'channel' (specific channel+topic), 'webhook' (HTTP POST to URL), "
+                            "'silent' (log only, no notification)."
+                        ),
+                    },
+                    "delivery_channel": {
+                        "type": "string",
+                        "description": "Channel type for 'channel' delivery (e.g. 'telegram', 'discord').",
+                    },
+                    "delivery_topic": {
+                        "type": "string",
+                        "description": "Topic/thread ID for 'channel' delivery.",
+                    },
+                    "delivery_webhook_url": {
+                        "type": "string",
+                        "description": "Webhook URL for 'webhook' delivery mode.",
+                    },
                 },
                 "required": ["action"],
             },
@@ -214,6 +281,8 @@ class ManageScheduleHandler(ToolHandler):
             return await self._update(pool, arguments)
         if action == "cancel":
             return await self._cancel(pool, arguments)
+        if action == "stats":
+            return await self._stats(pool, arguments)
 
         return ToolResult.error_result(f"Unhandled action: {action}")
 
@@ -301,16 +370,44 @@ class ManageScheduleHandler(ToolHandler):
             except Exception as e:
                 return ToolResult.error_result(f"Failed to compute schedule offset: {e}")
 
+        # For cron expressions, ensure _next_run is populated
+        if schedule_kind == "cron":
+            cron_expr = schedule_json.get("cron", "")
+            if not cron_expr:
+                return ToolResult.error_result(
+                    "Cron expression is required for cron schedule_kind",
+                    ToolErrorType.INVALID_PARAMS,
+                )
+            try:
+                from croniter import croniter
+                croniter(cron_expr)  # Validate expression
+            except ImportError:
+                return ToolResult.error_result(
+                    "croniter package is required for cron expressions (pip install croniter)",
+                    ToolErrorType.MISSING_DEPENDENCY,
+                )
+            except (ValueError, KeyError) as e:
+                return ToolResult.error_result(
+                    f"Invalid cron expression '{cron_expr}': {e}",
+                    ToolErrorType.INVALID_PARAMS,
+                )
+            next_run = _cron_next_run(cron_expr, timezone)
+            if next_run:
+                schedule_json["_next_run"] = next_run
+
         # For one-shot tasks, default max_runs to 1
         if schedule_kind == "once" and max_runs is None:
             max_runs = 1
+
+        # Build delivery JSONB
+        delivery = self._build_delivery(args)
 
         try:
             async with pool.acquire() as conn:
                 task_id = await conn.fetchval(
                     """SELECT create_scheduled_task(
                         $1, $2, $3::jsonb, $4, $5::jsonb,
-                        $6, $7, 'active', $8, 'agent'
+                        $6, $7, 'active', $8, 'agent', $9::jsonb
                     )""",
                     name,
                     schedule_kind,
@@ -320,6 +417,7 @@ class ManageScheduleHandler(ToolHandler):
                     timezone,
                     description,
                     max_runs,
+                    json.dumps(delivery),
                 )
             return ToolResult.success_result(
                 {
@@ -327,6 +425,7 @@ class ManageScheduleHandler(ToolHandler):
                     "name": name,
                     "schedule_kind": schedule_kind,
                     "action_kind": action_kind,
+                    "delivery": delivery,
                 },
                 display_output=f"Created scheduled task: {name} ({schedule_kind})",
             )
@@ -351,7 +450,7 @@ class ManageScheduleHandler(ToolHandler):
 
             tasks = []
             for row in rows:
-                tasks.append({
+                task_info = {
                     "id": str(row["id"]),
                     "name": row["name"],
                     "description": row.get("description"),
@@ -361,7 +460,18 @@ class ManageScheduleHandler(ToolHandler):
                     "last_run_at": str(row["last_run_at"]) if row.get("last_run_at") else None,
                     "run_count": row.get("run_count", 0),
                     "action_kind": row.get("action_kind"),
-                })
+                    "last_error": row.get("last_error"),
+                }
+                if row.get("delivery"):
+                    delivery = row["delivery"]
+                    if isinstance(delivery, str):
+                        try:
+                            delivery = json.loads(delivery)
+                        except Exception:
+                            pass
+                    if isinstance(delivery, dict) and delivery.get("mode") != "outbox":
+                        task_info["delivery"] = delivery
+                tasks.append(task_info)
             return ToolResult.success_result(
                 {"tasks": tasks, "count": len(tasks)},
                 display_output=f"Found {len(tasks)} scheduled task(s)",
@@ -408,12 +518,17 @@ class ManageScheduleHandler(ToolHandler):
         elif goal_title:
             action_payload = json.dumps({"title": goal_title})
 
+        # Build delivery if any delivery params provided
+        delivery_json = None
+        if any(args.get(k) for k in ("delivery_mode", "delivery_channel", "delivery_topic", "delivery_webhook_url")):
+            delivery_json = json.dumps(self._build_delivery(args))
+
         try:
             async with pool.acquire() as conn:
                 result = await conn.fetchval(
                     """SELECT update_scheduled_task(
                         $1::uuid, $2, $3, $4, $5::jsonb,
-                        $6, $7, $8::jsonb, $9, $10
+                        $6, $7, $8::jsonb, $9, $10, $11::jsonb
                     )""",
                     task_id,
                     name,
@@ -425,6 +540,7 @@ class ManageScheduleHandler(ToolHandler):
                     action_payload,
                     status,
                     max_runs,
+                    delivery_json,
                 )
             return ToolResult.success_result(
                 {"task_id": task_id, "updated": True},
@@ -475,6 +591,96 @@ class ManageScheduleHandler(ToolHandler):
         except Exception as e:
             logger.error("Failed to cancel scheduled task: %s", e)
             return ToolResult.error_result(f"Failed to cancel scheduled task: {e}")
+
+
+    @staticmethod
+    def _build_delivery(args: dict[str, Any]) -> dict[str, Any]:
+        """Build a delivery JSONB from tool arguments."""
+        mode = args.get("delivery_mode", "outbox")
+        delivery: dict[str, Any] = {"mode": mode}
+        if mode == "channel":
+            if args.get("delivery_channel"):
+                delivery["channel"] = args["delivery_channel"]
+            if args.get("delivery_topic"):
+                delivery["topic"] = args["delivery_topic"]
+        elif mode == "webhook":
+            if args.get("delivery_webhook_url"):
+                delivery["url"] = args["delivery_webhook_url"]
+        return delivery
+
+    async def _stats(self, pool: "asyncpg.Pool", args: dict[str, Any]) -> ToolResult:
+        """Return execution statistics for scheduled tasks (D.3)."""
+        task_id = (args.get("task_id") or "").strip()
+        try:
+            async with pool.acquire() as conn:
+                if task_id:
+                    # Stats for a specific task
+                    row = await conn.fetchrow(
+                        """SELECT name, schedule_kind, status, run_count, max_runs,
+                                  last_run_at, last_error, next_run_at, created_at
+                           FROM scheduled_tasks WHERE id = $1::uuid""",
+                        task_id,
+                    )
+                    if not row:
+                        return ToolResult.error_result(f"Task {task_id} not found")
+                    return ToolResult.success_result({
+                        "task_id": task_id,
+                        "name": row["name"],
+                        "schedule_kind": row["schedule_kind"],
+                        "status": row["status"],
+                        "run_count": row["run_count"],
+                        "max_runs": row["max_runs"],
+                        "last_run_at": str(row["last_run_at"]) if row["last_run_at"] else None,
+                        "next_run_at": str(row["next_run_at"]) if row["next_run_at"] else None,
+                        "last_error": row["last_error"],
+                        "created_at": str(row["created_at"]),
+                    })
+                else:
+                    # Aggregate stats
+                    stats = await conn.fetchrow("""
+                        SELECT
+                            COUNT(*) FILTER (WHERE status = 'active') AS active_count,
+                            COUNT(*) FILTER (WHERE status = 'paused') AS paused_count,
+                            COUNT(*) FILTER (WHERE status = 'disabled') AS disabled_count,
+                            SUM(run_count) AS total_runs,
+                            COUNT(*) FILTER (WHERE last_error IS NOT NULL AND status = 'active') AS tasks_with_errors,
+                            MAX(last_run_at) AS last_execution,
+                            MIN(next_run_at) FILTER (WHERE status = 'active') AS next_execution
+                        FROM scheduled_tasks
+                    """)
+                    # Recent gateway events for cron
+                    recent = await conn.fetch("""
+                        SELECT created_at, payload
+                        FROM gateway_events
+                        WHERE source = 'cron'
+                        ORDER BY created_at DESC
+                        LIMIT 10
+                    """)
+                    recent_runs = []
+                    for r in recent:
+                        payload = r["payload"]
+                        if isinstance(payload, str):
+                            try:
+                                payload = json.loads(payload)
+                            except Exception:
+                                pass
+                        recent_runs.append({
+                            "at": str(r["created_at"]),
+                            "tasks_executed": payload.get("executed") if isinstance(payload, dict) else None,
+                        })
+                    return ToolResult.success_result({
+                        "active_tasks": stats["active_count"],
+                        "paused_tasks": stats["paused_count"],
+                        "disabled_tasks": stats["disabled_count"],
+                        "total_executions": stats["total_runs"],
+                        "tasks_with_errors": stats["tasks_with_errors"],
+                        "last_execution": str(stats["last_execution"]) if stats["last_execution"] else None,
+                        "next_execution": str(stats["next_execution"]) if stats["next_execution"] else None,
+                        "recent_runs": recent_runs,
+                    })
+        except Exception as e:
+            logger.error("Failed to get cron stats: %s", e)
+            return ToolResult.error_result(f"Failed to get cron stats: {e}")
 
 
 def create_cron_tools() -> list[ToolHandler]:

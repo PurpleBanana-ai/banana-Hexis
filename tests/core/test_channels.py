@@ -349,7 +349,7 @@ class TestTelegramAdapter:
 
         adapter = TelegramAdapter()
         caps = adapter.capabilities
-        assert caps.threads is False
+        assert caps.threads is True
         assert caps.reactions is True
         assert caps.media is True
         assert caps.typing_indicator is True

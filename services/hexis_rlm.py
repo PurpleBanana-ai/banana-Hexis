@@ -116,6 +116,14 @@ async def _llm_completion(
         temperature=0.7,
         max_tokens=max_tokens,
     )
+    import asyncio
+    from core.usage import record_llm_usage
+    asyncio.ensure_future(record_llm_usage(
+        provider=llm_config["provider"],
+        model=llm_config["model"],
+        raw_response=result.get("raw"),
+        source="rlm",
+    ))
     return result.get("content", "")
 
 

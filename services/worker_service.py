@@ -17,6 +17,7 @@ from core.rabbitmq_bridge import RabbitMQBridge
 from core.state import (
     is_agent_terminated,
     mark_subconscious_decider_run,
+    recompute_cron_next_runs,
     run_heartbeat,
     run_maintenance_if_due,
     run_scheduled_tasks,
@@ -398,16 +399,24 @@ class MaintenanceWorker:
             outbox_messages = payload.get("outbox_messages")
             if isinstance(outbox_messages, list):
                 await self._publish_outbox(outbox_messages)
-            executed = payload.get("executed_count") or payload.get("executed")
+            executed = payload.get("ran") or payload.get("executed_count") or payload.get("executed")
+            ran_tasks = payload.get("ran_tasks") or []
             if executed:
                 try:
                     await Gateway(self.pool).record(
                         EventSource.CRON,
                         "cron::scheduled",
-                        {"executed": executed},
+                        {"executed": executed, "tasks": ran_tasks},
                     )
                 except Exception:
                     logger.debug("Gateway record failed (non-fatal)", exc_info=True)
+            # Recompute next_run_at for cron-expression tasks (Python-side croniter)
+            cron_task_ids = payload.get("cron_task_ids") or []
+            if cron_task_ids:
+                try:
+                    await recompute_cron_next_runs(conn, cron_task_ids)
+                except Exception:
+                    logger.warning("Cron recompute failed (non-fatal)", exc_info=True)
 
     async def _run_maintenance_if_due(self) -> None:
         if not self.pool:
@@ -558,6 +567,8 @@ async def _amain(mode: str, instance: str | None = None) -> None:
     # Shared resources for the heartbeat consumer
     dsn = db_dsn_from_env(instance)
     consumer_pool = await asyncpg.create_pool(dsn, min_size=2, max_size=10)
+    from core.usage import set_usage_pool
+    set_usage_pool(consumer_pool)
     bridge = RabbitMQBridge(consumer_pool)
     await bridge.ensure_ready()
 

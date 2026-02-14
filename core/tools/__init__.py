@@ -116,11 +116,16 @@ from .calendar import (
     create_calendar_tools,
     GoogleCalendarHandler,
     CreateCalendarEventHandler,
+    UpdateCalendarEventHandler,
+    DeleteCalendarEventHandler,
 )
 from .email import (
     create_email_tools,
     EmailSendHandler,
     SendGridEmailHandler,
+    EmailListHandler,
+    EmailReadHandler,
+    EmailSearchHandler,
 )
 from .messaging import (
     create_messaging_tools,
@@ -143,6 +148,7 @@ from .ingest import (
     FastIngestHandler,
     SlowIngestHandler,
     HybridIngestHandler,
+    URLIngestHandler,
 )
 from .workflow import (
     create_workflow_tools,
@@ -244,10 +250,15 @@ __all__ = [
     "create_calendar_tools",
     "GoogleCalendarHandler",
     "CreateCalendarEventHandler",
+    "UpdateCalendarEventHandler",
+    "DeleteCalendarEventHandler",
     # Email tools
     "create_email_tools",
     "EmailSendHandler",
     "SendGridEmailHandler",
+    "EmailListHandler",
+    "EmailReadHandler",
+    "EmailSearchHandler",
     # Messaging tools
     "create_messaging_tools",
     "DiscordSendHandler",
@@ -266,6 +277,7 @@ __all__ = [
     "FastIngestHandler",
     "SlowIngestHandler",
     "HybridIngestHandler",
+    "URLIngestHandler",
     # Workflow tools
     "create_workflow_tools",
     "WorkflowHandler",

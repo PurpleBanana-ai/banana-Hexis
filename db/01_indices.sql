@@ -8,6 +8,7 @@ CREATE INDEX idx_memories_embedding ON memories USING hnsw (embedding vector_cos
 CREATE INDEX idx_memories_status ON memories (status);
 CREATE INDEX idx_memories_type ON memories (type);
 CREATE INDEX idx_memories_content ON memories USING GIN (content gin_trgm_ops);
+CREATE INDEX idx_memories_content_fts ON memories USING GIN (to_tsvector('english', content));
 CREATE INDEX idx_memories_importance ON memories (importance DESC) WHERE status = 'active';
 CREATE INDEX idx_memories_created ON memories (created_at DESC);
 CREATE INDEX idx_memories_last_accessed ON memories (last_accessed DESC NULLS LAST);

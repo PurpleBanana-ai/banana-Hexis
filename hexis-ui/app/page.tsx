@@ -31,6 +31,14 @@ type StatusData = {
   memory_health?: { type: string; count: number; avg_importance: number }[];
 };
 
+type UsageData = {
+  total_cost_usd: number;
+  total_tokens: number;
+  total_calls: number;
+  by_model: { provider: string; model: string; calls: number; tokens: number; cost_usd: number }[];
+  daily: { day: string; cost: number; tokens: number; calls: number }[];
+};
+
 const moodColors: Record<string, string> = {
   enthusiastic: "accent",
   content: "teal",
@@ -54,6 +62,7 @@ function urgencyColor(urgency: number): "accent" | "teal" | "green" | "amber" | 
 export default function Dashboard() {
   const router = useRouter();
   const [status, setStatus] = useState<StatusData | null>(null);
+  const [usage, setUsage] = useState<UsageData | null>(null);
   const [loading, setLoading] = useState(true);
 
   const refreshStatus = useCallback(async () => {
@@ -62,6 +71,12 @@ export default function Dashboard() {
       if (res.ok) {
         const data = await res.json();
         setStatus(data);
+      }
+    } catch {}
+    try {
+      const res = await fetch("/api/usage?period=30 days", { cache: "no-store" });
+      if (res.ok) {
+        setUsage(await res.json());
       }
     } catch {}
   }, []);
@@ -79,6 +94,12 @@ export default function Dashboard() {
           router.push("/init");
           return;
         }
+
+        // Fetch usage data in background
+        fetch("/api/usage?period=30 days", { cache: "no-store" })
+          .then((r) => r.ok ? r.json() : null)
+          .then((u) => { if (u) setUsage(u); })
+          .catch(() => {});
       } catch {
         // If status API fails, try init status check
         try {
@@ -306,6 +327,59 @@ export default function Dashboard() {
                   </div>
                 ))}
               </div>
+            </Card>
+
+            {/* Usage & Cost */}
+            <Card>
+              <h3 className="font-display text-lg">Usage &amp; Cost</h3>
+              {usage ? (
+                <>
+                  <p className="mt-2 text-2xl font-display text-[var(--accent)]">
+                    ${usage.total_cost_usd.toFixed(2)}
+                    <span className="ml-2 text-sm font-normal text-[var(--ink-soft)]">30d</span>
+                  </p>
+                  <div className="mt-3 space-y-1.5">
+                    <div className="flex justify-between text-xs">
+                      <span className="text-[var(--ink-soft)]">API calls</span>
+                      <span>{usage.total_calls.toLocaleString()}</span>
+                    </div>
+                    <div className="flex justify-between text-xs">
+                      <span className="text-[var(--ink-soft)]">Tokens</span>
+                      <span>{usage.total_tokens.toLocaleString()}</span>
+                    </div>
+                  </div>
+                  {usage.by_model.length > 0 && (
+                    <div className="mt-4 flex flex-wrap gap-2">
+                      {usage.by_model.slice(0, 3).map((m) => (
+                        <Badge key={`${m.provider}/${m.model}`} variant="muted">
+                          {m.model}: ${m.cost_usd.toFixed(2)}
+                        </Badge>
+                      ))}
+                    </div>
+                  )}
+                  {usage.daily.length > 0 && (
+                    <div className="mt-4">
+                      <div className="flex h-16 items-end gap-px">
+                        {usage.daily.slice(-14).map((d, i) => {
+                          const maxCost = Math.max(...usage.daily.slice(-14).map((x) => x.cost), 0.01);
+                          const h = Math.max(4, (d.cost / maxCost) * 100);
+                          return (
+                            <div
+                              key={i}
+                              className="flex-1 rounded-t bg-[var(--teal)] transition-all"
+                              style={{ height: `${h}%` }}
+                              title={`${d.day}: $${d.cost.toFixed(2)}`}
+                            />
+                          );
+                        })}
+                      </div>
+                      <p className="mt-1 text-xs text-[var(--ink-soft)]">Daily cost (14d)</p>
+                    </div>
+                  )}
+                </>
+              ) : (
+                <p className="mt-2 text-sm text-[var(--ink-soft)]">No usage data yet.</p>
+              )}
             </Card>
           </div>
         </div>

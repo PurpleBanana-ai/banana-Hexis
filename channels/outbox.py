@@ -126,27 +126,85 @@ class ChannelOutboxConsumer:
         delivery_mode = str(payload.get("delivery_mode") or "last_active")
         outbox_msg_id = str(body.get("id") or "")
 
+        # I.2: Check for domain-based delivery routing from cron delivery info
+        delivery_info = payload.get("delivery") or body.get("delivery")
+        if isinstance(delivery_info, dict) and delivery_info.get("mode") == "channel":
+            # Override delivery to route to specific channel+topic
+            payload["target_channel"] = delivery_info.get("channel", "")
+            payload["target_id"] = delivery_info.get("target_id", payload.get("target_id", ""))
+            payload["thread_id"] = delivery_info.get("topic", "")
+            delivery_mode = "direct"
+        elif isinstance(delivery_info, dict) and delivery_info.get("mode") == "silent":
+            # Silent: log only, no notification
+            logger.info("Silent delivery (suppressed): %s", content[:100])
+            return
+
         if delivery_mode == "direct":
             await self._deliver_direct(content, payload, outbox_msg_id)
         elif delivery_mode == "broadcast":
             await self._deliver_broadcast(content, payload, outbox_msg_id)
         else:
+            # I.2: Check domain-based routing config
+            domain = str(payload.get("domain") or payload.get("intent") or "")
+            if domain:
+                routed = await self._deliver_by_domain(content, payload, domain, outbox_msg_id)
+                if routed:
+                    return
             # Default: last_active
             await self._deliver_last_active(content, payload, outbox_msg_id)
 
+    async def _deliver_by_domain(
+        self, content: str, payload: dict, domain: str, outbox_msg_id: str
+    ) -> bool:
+        """I.2: Route message based on content domain config.
+
+        Config key: channel.routing.{domain} = JSON {"channel": "...", "target_id": "...", "topic": "..."}
+        Returns True if routing was found and delivery attempted, False otherwise.
+        """
+        try:
+            async with self._pool.acquire() as conn:
+                raw = await conn.fetchval(
+                    "SELECT get_config_text($1)",
+                    f"channel.routing.{domain}",
+                )
+            if not raw:
+                return False
+            route = json.loads(raw) if isinstance(raw, str) else raw
+            if not isinstance(route, dict):
+                return False
+            channel_type = str(route.get("channel") or "")
+            target_id = str(route.get("target_id") or "")
+            if not channel_type or not target_id:
+                return False
+            thread_id = str(route.get("topic") or "") or None
+            msg_id = await self._manager.send(
+                channel_type, target_id, content, thread_id=thread_id
+            )
+            await self._log_delivery(
+                outbox_msg_id, channel_type, target_id, thread_id, content, f"domain:{domain}", True
+            )
+            return True
+        except Exception as e:
+            logger.warning("Domain routing for %s failed: %s", domain, e)
+            return False
+
     async def _deliver_direct(self, content: str, payload: dict, outbox_msg_id: str) -> None:
-        """Send to an explicit channel + target."""
+        """Send to an explicit channel + target, optionally with thread/topic."""
         channel_type = str(payload.get("target_channel") or "")
         target_id = str(payload.get("target_id") or "")
         if not channel_type or not target_id:
             logger.warning("Direct delivery missing target_channel/target_id")
             return
 
+        thread_id = str(payload.get("thread_id") or "") or None
+
         try:
-            msg_id = await self._manager.send(channel_type, target_id, content)
-            await self._log_delivery(outbox_msg_id, channel_type, target_id, None, content, "direct", True)
+            msg_id = await self._manager.send(
+                channel_type, target_id, content, thread_id=thread_id
+            )
+            await self._log_delivery(outbox_msg_id, channel_type, target_id, thread_id, content, "direct", True)
         except Exception as e:
-            await self._log_delivery(outbox_msg_id, channel_type, target_id, None, content, "direct", False, str(e))
+            await self._log_delivery(outbox_msg_id, channel_type, target_id, thread_id, content, "direct", False, str(e))
 
     async def _deliver_last_active(self, content: str, payload: dict, outbox_msg_id: str) -> None:
         """Send to the sender's most recently active channel session."""

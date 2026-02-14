@@ -1,0 +1,540 @@
+"""Tests for Skills Marketplace features (J.1-J.4)."""
+
+import os
+import tempfile
+from pathlib import Path
+from unittest.mock import patch
+
+import pytest
+
+from skills.base import (
+    InstallMethod,
+    SkillCategory,
+    SkillContext,
+    SkillSpec,
+)
+from skills.loader import (
+    discover_skill_dirs,
+    install_skill_deps,
+    load_skills,
+    load_skills_from_dir,
+)
+
+pytestmark = [pytest.mark.asyncio(loop_scope="session")]
+
+
+# ============================================================================
+# J.1: SkillSpec Extended Fields
+# ============================================================================
+
+
+class TestSkillSpecExtended:
+    """Test the extended SkillSpec fields (category, bins, env, install, etc.)."""
+
+    def test_category_field(self):
+        spec = SkillSpec(
+            name="test",
+            description="test",
+            content="test",
+            category=SkillCategory.RESEARCH,
+        )
+        assert spec.category == SkillCategory.RESEARCH
+
+    def test_default_category(self):
+        spec = SkillSpec(name="test", description="test", content="test")
+        assert spec.category == SkillCategory.OTHER
+
+    def test_requires_bins(self):
+        spec = SkillSpec(
+            name="test",
+            description="test",
+            content="test",
+            requires_bins=["git", "curl"],
+        )
+        assert spec.requires_bins == ["git", "curl"]
+
+    def test_requires_env(self):
+        spec = SkillSpec(
+            name="test",
+            description="test",
+            content="test",
+            requires_env=["OPENAI_API_KEY"],
+        )
+        assert spec.requires_env == ["OPENAI_API_KEY"]
+
+    def test_os_support(self):
+        spec = SkillSpec(
+            name="test",
+            description="test",
+            content="test",
+            os_support=["darwin", "linux"],
+        )
+        assert "darwin" in spec.os_support
+
+    def test_bound_tools(self):
+        spec = SkillSpec(
+            name="test",
+            description="test",
+            content="test",
+            bound_tools=["web_search", "recall"],
+        )
+        assert spec.bound_tools == ["web_search", "recall"]
+
+    def test_enabled_flag(self):
+        spec = SkillSpec(name="test", description="test", content="test")
+        assert spec.enabled is True
+
+        spec2 = SkillSpec(name="test", description="test", content="test", enabled=False)
+        assert spec2.enabled is False
+
+    def test_install_methods(self):
+        method = InstallMethod(kind="brew", package="ripgrep", bins=["rg"])
+        assert method.kind == "brew"
+        assert method.package == "ripgrep"
+        assert method.bins == ["rg"]
+
+    def test_install_method_from_dict(self):
+        m = InstallMethod.from_dict({
+            "kind": "pip",
+            "package": "requests",
+            "bins": [],
+        })
+        assert m.kind == "pip"
+        assert m.package == "requests"
+
+    def test_install_method_from_dict_formula(self):
+        """Formula key should map to package."""
+        m = InstallMethod.from_dict({"kind": "brew", "formula": "jq", "bins": ["jq"]})
+        assert m.package == "jq"
+
+    def test_from_frontmatter_with_extended_fields(self):
+        metadata = {
+            "name": "twitter-research",
+            "description": "Twitter research skill",
+            "category": "research",
+            "requires": {
+                "tools": ["search_twitter"],
+                "config": [],
+                "bins": ["curl"],
+                "env": ["TWITTER_BEARER_TOKEN"],
+            },
+            "os_support": ["darwin", "linux"],
+            "bound_tools": ["search_twitter"],
+            "install": [
+                {"kind": "brew", "package": "curl", "bins": ["curl"]},
+            ],
+            "contexts": ["heartbeat", "chat"],
+        }
+        content = "# Twitter Research\nUse search_twitter tool."
+
+        spec = SkillSpec.from_frontmatter(metadata, content)
+        assert spec.name == "twitter-research"
+        assert spec.category == SkillCategory.RESEARCH
+        assert spec.requires_bins == ["curl"]
+        assert spec.requires_env == ["TWITTER_BEARER_TOKEN"]
+        assert spec.bound_tools == ["search_twitter"]
+        assert len(spec.install_methods) == 1
+        assert spec.install_methods[0].kind == "brew"
+        assert "darwin" in spec.os_support
+
+    def test_from_frontmatter_invalid_category(self):
+        metadata = {"name": "test", "description": "test", "category": "nonexistent"}
+        spec = SkillSpec.from_frontmatter(metadata, "content")
+        assert spec.category == SkillCategory.OTHER
+
+    def test_from_frontmatter_string_os_support(self):
+        metadata = {"name": "test", "description": "test", "os_support": "darwin"}
+        spec = SkillSpec.from_frontmatter(metadata, "content")
+        assert spec.os_support == ["darwin"]
+
+    def test_from_frontmatter_string_bound_tools(self):
+        metadata = {"name": "test", "description": "test", "bound_tools": "recall"}
+        spec = SkillSpec.from_frontmatter(metadata, "content")
+        assert spec.bound_tools == ["recall"]
+
+
+# ============================================================================
+# J.1: SkillCategory Enum
+# ============================================================================
+
+
+class TestSkillCategory:
+    def test_all_categories(self):
+        expected = {"research", "productivity", "communication", "knowledge",
+                     "analytics", "creative", "system", "other"}
+        actual = {c.value for c in SkillCategory}
+        assert actual == expected
+
+    def test_category_is_string_enum(self):
+        assert SkillCategory.RESEARCH == "research"
+        assert SkillCategory.ANALYTICS.value == "analytics"
+
+
+# ============================================================================
+# J.1: Requirement Checking
+# ============================================================================
+
+
+class TestRequirementChecking:
+    def test_check_bins_available(self):
+        """Python should always be available in test env."""
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            requires_bins=["python3"],
+        )
+        missing = spec.check_bins_available()
+        # python3 should be available
+        assert "python3" not in missing
+
+    def test_check_bins_missing(self):
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            requires_bins=["nonexistent_binary_xyz_12345"],
+        )
+        missing = spec.check_bins_available()
+        assert "nonexistent_binary_xyz_12345" in missing
+
+    def test_check_env_available(self):
+        with patch.dict(os.environ, {"TEST_HEXIS_VAR": "value"}):
+            spec = SkillSpec(
+                name="test", description="test", content="test",
+                requires_env=["TEST_HEXIS_VAR"],
+            )
+            missing = spec.check_env_available()
+            assert len(missing) == 0
+
+    def test_check_env_missing(self):
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            requires_env=["NONEXISTENT_ENV_VAR_XYZ"],
+        )
+        missing = spec.check_env_available()
+        assert "NONEXISTENT_ENV_VAR_XYZ" in missing
+
+    def test_check_os_support(self):
+        import sys
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            os_support=[sys.platform],
+        )
+        assert spec.check_os_support() is True
+
+    def test_check_os_unsupported(self):
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            os_support=["win32_only_platform"],
+        )
+        assert spec.check_os_support() is False
+
+    def test_full_requirements_met_all_ok(self):
+        import sys
+        with patch.dict(os.environ, {"TEST_VAR": "1"}):
+            spec = SkillSpec(
+                name="test", description="test", content="test",
+                requires_tools=["recall"],
+                requires_env=["TEST_VAR"],
+                requires_bins=["python3"],
+                os_support=[sys.platform],
+            )
+            met, reasons = spec.full_requirements_met(
+                available_tools={"recall"},
+            )
+            assert met is True
+            assert len(reasons) == 0
+
+    def test_full_requirements_met_disabled(self):
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            enabled=False,
+        )
+        met, reasons = spec.full_requirements_met(available_tools=set())
+        assert met is False
+        assert any("disabled" in r for r in reasons)
+
+    def test_full_requirements_met_missing_tool(self):
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            requires_tools=["nonexistent_tool"],
+        )
+        met, reasons = spec.full_requirements_met(available_tools=set())
+        assert met is False
+        assert any("tool" in r for r in reasons)
+
+    def test_full_requirements_met_missing_env(self):
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            requires_env=["NONEXISTENT_VAR_ABC"],
+        )
+        met, reasons = spec.full_requirements_met(available_tools=set())
+        assert met is False
+        assert any("env var" in r for r in reasons)
+
+
+# ============================================================================
+# J.2: Built-in Skill Library
+# ============================================================================
+
+
+class TestBuiltInSkillLibrary:
+    def test_bundled_skills_load(self):
+        skills_dir = Path(__file__).resolve().parents[2] / "skills" / "installed"
+        skills = load_skills_from_dir(skills_dir)
+        names = [s.name for s in skills]
+        # Should have at least research + self-reflection + new skills
+        assert "research" in names
+        assert "self-reflection" in names
+        assert len(skills) >= 4  # At least 4 skills total
+
+    def test_new_skills_have_categories(self):
+        skills_dir = Path(__file__).resolve().parents[2] / "skills" / "installed"
+        skills = load_skills_from_dir(skills_dir)
+        for skill in skills:
+            if skill.name not in ("research", "self-reflection"):
+                # New skills should have a non-OTHER category
+                assert skill.category != SkillCategory.OTHER or skill.name == "research", (
+                    f"Skill {skill.name} should have a specific category"
+                )
+
+    def test_new_skills_have_bound_tools(self):
+        skills_dir = Path(__file__).resolve().parents[2] / "skills" / "installed"
+        skills = load_skills_from_dir(skills_dir)
+        skills_with_tools = [s for s in skills if s.bound_tools]
+        assert len(skills_with_tools) >= 4
+
+    def test_all_skills_parse_correctly(self):
+        skills_dir = Path(__file__).resolve().parents[2] / "skills" / "installed"
+        skills = load_skills_from_dir(skills_dir)
+        for skill in skills:
+            assert skill.name, f"Skill from {skill.source} has no name"
+            assert skill.description, f"Skill {skill.name} has no description"
+            assert skill.content, f"Skill {skill.name} has no content"
+            assert len(skill.contexts) > 0, f"Skill {skill.name} has no contexts"
+
+    def test_skill_content_is_substantive(self):
+        """Skills should have meaningful content (at least 100 chars)."""
+        skills_dir = Path(__file__).resolve().parents[2] / "skills" / "installed"
+        skills = load_skills_from_dir(skills_dir)
+        for skill in skills:
+            assert len(skill.content) >= 100, (
+                f"Skill {skill.name} content too short ({len(skill.content)} chars)"
+            )
+
+
+# ============================================================================
+# J.3: Skill Installer
+# ============================================================================
+
+
+class TestSkillInstaller:
+    def test_install_no_deps(self):
+        spec = SkillSpec(name="test", description="test", content="test")
+        results = install_skill_deps(spec)
+        assert len(results) == 0
+
+    def test_install_unsupported_os(self):
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            os_support=["win32_only"],
+        )
+        results = install_skill_deps(spec)
+        assert len(results) == 1
+        assert results[0]["status"] == "unsupported"
+
+    def test_install_reports_missing_env(self):
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            requires_env=["NONEXISTENT_TEST_VAR_XYZ"],
+        )
+        results = install_skill_deps(spec)
+        assert len(results) == 1
+        assert results[0]["status"] == "missing"
+        assert "env var" in results[0]["detail"]
+
+    def test_install_reports_present_env(self):
+        with patch.dict(os.environ, {"PRESENT_VAR": "value"}):
+            spec = SkillSpec(
+                name="test", description="test", content="test",
+                requires_env=["PRESENT_VAR"],
+            )
+            results = install_skill_deps(spec)
+            assert len(results) == 1
+            assert results[0]["status"] == "ok"
+
+    def test_install_bins_already_present(self):
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            requires_bins=["python3"],
+        )
+        results = install_skill_deps(spec)
+        assert len(results) == 1
+        assert results[0]["status"] == "ok"
+        assert "already installed" in results[0]["detail"]
+
+    def test_install_missing_bins_no_method(self):
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            requires_bins=["nonexistent_bin_xyz"],
+        )
+        results = install_skill_deps(spec)
+        assert any(r["status"] == "missing" for r in results)
+
+    @patch("skills.loader.shutil.which")
+    @patch("skills.loader._run_install_command")
+    def test_install_with_brew(self, mock_run, mock_which):
+        mock_which.side_effect = lambda x: "/usr/local/bin/brew" if x == "brew" else None
+        mock_run.return_value = (True, "installed")
+
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            requires_bins=["rg"],
+            install_methods=[InstallMethod(kind="brew", package="ripgrep", bins=["rg"])],
+        )
+        results = install_skill_deps(spec)
+        installed = [r for r in results if r["status"] == "installed"]
+        assert len(installed) == 1
+        mock_run.assert_called_once()
+
+    @patch("skills.loader.shutil.which")
+    def test_install_installer_not_available(self, mock_which):
+        mock_which.return_value = None  # No brew available
+
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            requires_bins=["nonexistent_tool"],
+            install_methods=[InstallMethod(kind="brew", package="some-pkg", bins=["nonexistent_tool"])],
+        )
+        results = install_skill_deps(spec)
+        skipped = [r for r in results if r["status"] == "skipped"]
+        assert len(skipped) >= 1
+
+    @patch("skills.loader.shutil.which")
+    @patch("skills.loader._run_install_command")
+    def test_install_failure(self, mock_run, mock_which):
+        mock_which.side_effect = lambda x: "/usr/bin/pip" if x == "pip" else None
+        mock_run.return_value = (False, "pip install failed")
+
+        spec = SkillSpec(
+            name="test", description="test", content="test",
+            requires_bins=["some_binary"],
+            install_methods=[InstallMethod(kind="pip", package="some-pkg", bins=["some_binary"])],
+        )
+        results = install_skill_deps(spec)
+        failed = [r for r in results if r["status"] == "failed"]
+        assert len(failed) == 1
+
+
+# ============================================================================
+# J.4: Skill-to-Tool Binding
+# ============================================================================
+
+
+class TestSkillToolBinding:
+    def test_bound_tools_in_spec(self):
+        """Skills can declare bound_tools."""
+        spec = SkillSpec(
+            name="email-digest",
+            description="Email digest skill",
+            content="content",
+            bound_tools=["list_emails", "read_email", "ingest_emails"],
+        )
+        assert len(spec.bound_tools) == 3
+
+    def test_bound_tools_from_frontmatter(self):
+        metadata = {
+            "name": "test",
+            "description": "test",
+            "bound_tools": ["web_search", "recall"],
+        }
+        spec = SkillSpec.from_frontmatter(metadata, "content")
+        assert spec.bound_tools == ["web_search", "recall"]
+
+    def test_bound_tools_in_skill_file(self):
+        """Test that bundled skills with bound_tools parse correctly."""
+        skills_dir = Path(__file__).resolve().parents[2] / "skills" / "installed"
+        skills = load_skills_from_dir(skills_dir)
+        bound = {s.name: s.bound_tools for s in skills if s.bound_tools}
+        # At least some skills should have bound_tools
+        assert len(bound) >= 1
+
+    def test_to_prompt_block_includes_content(self):
+        """Prompt block should include the skill content for context."""
+        spec = SkillSpec(
+            name="test",
+            description="test skill",
+            content="# Test\nDo the thing.",
+            bound_tools=["recall"],
+        )
+        block = spec.to_prompt_block()
+        assert '<skill name="test">' in block
+        assert "# Test" in block
+        assert "</skill>" in block
+
+
+# ============================================================================
+# Discover Skill Dirs
+# ============================================================================
+
+
+class TestDiscoverSkillDirs:
+    def test_discovers_bundled(self):
+        dirs = discover_skill_dirs()
+        bundled = Path(__file__).resolve().parents[2] / "skills" / "installed"
+        assert any(str(d).endswith("installed") for d in dirs)
+
+    def test_user_dir_included_if_exists(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            with patch("skills.loader._USER_SKILLS_DIR", Path(tmpdir)):
+                dirs = discover_skill_dirs()
+                assert Path(tmpdir) in dirs
+
+    def test_user_dir_excluded_if_missing(self):
+        with patch("skills.loader._USER_SKILLS_DIR", Path("/nonexistent/path/xyz")):
+            dirs = discover_skill_dirs()
+            assert Path("/nonexistent/path/xyz") not in dirs
+
+
+# ============================================================================
+# Load Skills with Extended Filtering
+# ============================================================================
+
+
+class TestLoadSkillsExtended:
+    def test_load_with_extra_dirs(self):
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skill_dir = Path(tmpdir) / "custom_skill"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: custom\ndescription: custom skill\n"
+                "category: system\ncontexts: [chat]\n"
+                "bound_tools: [recall]\n---\n# Custom\nDo things.",
+                encoding="utf-8",
+            )
+
+            skills = load_skills(
+                context=SkillContext.CHAT,
+                available_tools=set(),
+                extra_dirs=[Path(tmpdir)],
+            )
+            names = [s.name for s in skills]
+            assert "custom" in names
+
+    def test_deduplication_user_over_bundled(self):
+        """User skills with same name should override bundled."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            skill_dir = Path(tmpdir) / "research"
+            skill_dir.mkdir()
+            (skill_dir / "SKILL.md").write_text(
+                "---\nname: research\ndescription: custom research\n"
+                "contexts: [chat]\n---\n# Custom Research\nMy version.",
+                encoding="utf-8",
+            )
+
+            with patch("skills.loader._USER_SKILLS_DIR", Path(tmpdir)):
+                skills = load_skills(
+                    context=SkillContext.CHAT,
+                    available_tools={"web_search", "web_fetch"},
+                    available_config={"tavily"},
+                )
+                research = [s for s in skills if s.name == "research"]
+                assert len(research) == 1
+                assert "custom" in research[0].description.lower()

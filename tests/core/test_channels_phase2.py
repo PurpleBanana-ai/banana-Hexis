@@ -687,7 +687,7 @@ class TestOutboxConsumer:
         }
         await consumer._process_message(body)
 
-        manager.send.assert_called_once_with("discord", "ch123", "Hello from heartbeat")
+        manager.send.assert_called_once_with("discord", "ch123", "Hello from heartbeat", thread_id=None)
 
     async def test_empty_content_skipped(self):
         from channels.outbox import ChannelOutboxConsumer

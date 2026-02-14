@@ -57,7 +57,7 @@ class TelegramAdapter(ChannelAdapter):
     @property
     def capabilities(self) -> ChannelCapabilities:
         return ChannelCapabilities(
-            threads=False,
+            threads=True,  # Telegram forum topics = threads
             reactions=True,
             media=True,
             typing_indicator=True,
@@ -203,6 +203,11 @@ class TelegramAdapter(ChannelAdapter):
 
         sender_name = user.full_name or user.username or str(user.id)
 
+        # Extract forum topic ID if available (I.1: Telegram topic support)
+        topic_id = None
+        if hasattr(message, "message_thread_id") and message.message_thread_id:
+            topic_id = str(message.message_thread_id)
+
         channel_msg = ChannelMessage(
             channel_type="telegram",
             channel_id=str(chat.id),
@@ -211,11 +216,14 @@ class TelegramAdapter(ChannelAdapter):
             content=content or "",
             message_id=str(message.message_id),
             reply_to_id=str(message.reply_to_message.message_id) if message.reply_to_message else None,
+            thread_id=topic_id,
             attachments=attachments,
             metadata={
                 "chat_type": chat.type,
                 "is_private": is_private,
                 "username": user.username,
+                "topic_id": topic_id,
+                "is_topic_message": getattr(message, "is_topic_message", False),
             },
         )
 
@@ -255,6 +263,9 @@ class TelegramAdapter(ChannelAdapter):
             }
             if reply_to:
                 kwargs["reply_to_message_id"] = int(reply_to)
+            # I.1: Telegram forum topic support — route to specific topic
+            if thread_id:
+                kwargs["message_thread_id"] = int(thread_id)
 
             sent = await self._application.bot.send_message(**kwargs)
             return str(sent.message_id)
@@ -305,6 +316,70 @@ class TelegramAdapter(ChannelAdapter):
             except Exception:
                 logger.exception("Failed to edit Telegram message %s", message_id)
                 return False
+
+    async def send_media(
+        self,
+        channel_id: str,
+        attachment: "Attachment",
+        caption: str | None = None,
+        *,
+        reply_to: str | None = None,
+    ) -> str | None:
+        """G.3: Send media attachments (images, documents) via Telegram."""
+        if not self._application or not self._application.bot:
+            return None
+
+        try:
+            kwargs: dict[str, Any] = {
+                "chat_id": int(channel_id),
+            }
+            if caption:
+                kwargs["caption"] = caption[:1024]
+            if reply_to:
+                kwargs["reply_to_message_id"] = int(reply_to)
+
+            mime = attachment.mime_type or ""
+
+            if mime.startswith("image/"):
+                # Send as photo
+                if attachment.url:
+                    kwargs["photo"] = attachment.url
+                elif attachment.platform_id:
+                    kwargs["photo"] = attachment.platform_id
+                else:
+                    return None
+                sent = await self._application.bot.send_photo(**kwargs)
+            elif mime.startswith("video/"):
+                if attachment.url:
+                    kwargs["video"] = attachment.url
+                elif attachment.platform_id:
+                    kwargs["video"] = attachment.platform_id
+                else:
+                    return None
+                sent = await self._application.bot.send_video(**kwargs)
+            elif mime.startswith("audio/"):
+                if attachment.url:
+                    kwargs["audio"] = attachment.url
+                elif attachment.platform_id:
+                    kwargs["audio"] = attachment.platform_id
+                else:
+                    return None
+                sent = await self._application.bot.send_audio(**kwargs)
+            else:
+                # Send as document
+                if attachment.url:
+                    kwargs["document"] = attachment.url
+                elif attachment.platform_id:
+                    kwargs["document"] = attachment.platform_id
+                else:
+                    return None
+                sent = await self._application.bot.send_document(**kwargs)
+
+            return str(sent.message_id)
+
+        except Exception:
+            logger.exception("Failed to send media to Telegram %s", channel_id)
+            return None
 
     async def send_media(
         self,

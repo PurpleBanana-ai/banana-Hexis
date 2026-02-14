@@ -3,12 +3,22 @@ Hexis Skills System - Loader
 
 Discovery and loading of skill markdown files from directories.
 Skills use YAML frontmatter for metadata and markdown for content.
+
+Supports:
+- Bundled skills (skills/installed/)
+- User skills (~/.hexis/skills/)
+- Workspace skills (./skills/ in CWD)
+- Extra directories via parameter
 """
 
 from __future__ import annotations
 
 import logging
+import os
 import re
+import shutil
+import subprocess
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 # Default skills directory (bundled with repo)
 _SKILLS_DIR = Path(__file__).resolve().parent / "installed"
+
+# User skills directory
+_USER_SKILLS_DIR = Path.home() / ".hexis" / "skills"
 
 # YAML frontmatter regex: --- at start, content, --- delimiter
 _FRONTMATTER_RE = re.compile(
@@ -155,8 +168,18 @@ def load_skills_from_dir(directory: Path) -> list[SkillSpec]:
 
 
 def discover_skill_dirs() -> list[Path]:
-    """Discover all skill directories to scan."""
+    """
+    Discover all skill directories to scan.
+
+    Precedence (highest to lowest):
+    1. User skills (~/.hexis/skills/)
+    2. Bundled skills (skills/installed/)
+    """
     dirs: list[Path] = []
+
+    # User skills (highest precedence)
+    if _USER_SKILLS_DIR.exists():
+        dirs.append(_USER_SKILLS_DIR)
 
     # Bundled skills
     if _SKILLS_DIR.exists():
@@ -213,3 +236,110 @@ def load_skills(
 
     logger.debug("Loaded %d skills for context=%s", len(all_skills), context.value)
     return all_skills
+
+
+# ---------------------------------------------------------------------------
+# J.3: Skill Installer
+# ---------------------------------------------------------------------------
+
+
+def _run_install_command(cmd: list[str]) -> tuple[bool, str]:
+    """Run an install command and return (success, output)."""
+    try:
+        result = subprocess.run(
+            cmd,
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+        output = result.stdout + result.stderr
+        return (result.returncode == 0, output.strip())
+    except subprocess.TimeoutExpired:
+        return (False, "Installation timed out")
+    except FileNotFoundError:
+        return (False, f"Command not found: {cmd[0]}")
+
+
+def install_skill_deps(skill: SkillSpec) -> list[dict[str, Any]]:
+    """
+    Validate and install missing dependencies for a skill.
+
+    Returns a list of result dicts: [{"dep": ..., "status": ..., "detail": ...}]
+    """
+    results: list[dict[str, Any]] = []
+
+    # Check OS support
+    if not skill.check_os_support():
+        results.append({
+            "dep": "os",
+            "status": "unsupported",
+            "detail": f"OS {sys.platform} not in {skill.os_support}",
+        })
+        return results
+
+    # Check env vars (can't install these, just report)
+    for var in skill.requires_env:
+        if os.environ.get(var):
+            results.append({"dep": var, "status": "ok", "detail": "env var set"})
+        else:
+            results.append({"dep": var, "status": "missing", "detail": "set this env var manually"})
+
+    # Check and install binary deps
+    missing_bins = skill.check_bins_available()
+    if not missing_bins:
+        for b in skill.requires_bins:
+            results.append({"dep": b, "status": "ok", "detail": "already installed"})
+        return results
+
+    # Try install methods for missing bins
+    for method in skill.install_methods:
+        # Check if this method's bins match any missing bins
+        method_bins = set(method.bins) if method.bins else {method.package}
+        needed = method_bins & set(missing_bins)
+        if not needed:
+            continue
+
+        # Check if the installer is available
+        if not shutil.which(method.kind):
+            results.append({
+                "dep": method.package,
+                "status": "skipped",
+                "detail": f"{method.kind} not available",
+            })
+            continue
+
+        # Build install command
+        if method.kind == "brew":
+            cmd = ["brew", "install", method.package]
+        elif method.kind == "apt":
+            cmd = ["sudo", "apt-get", "install", "-y", method.package]
+        elif method.kind == "pip":
+            cmd = [sys.executable, "-m", "pip", "install", method.package]
+        elif method.kind == "npm":
+            cmd = ["npm", "install", "-g", method.package]
+        else:
+            results.append({
+                "dep": method.package,
+                "status": "skipped",
+                "detail": f"unknown installer: {method.kind}",
+            })
+            continue
+
+        success, output = _run_install_command(cmd)
+        results.append({
+            "dep": method.package,
+            "status": "installed" if success else "failed",
+            "detail": output[:200] if output else ("installed successfully" if success else "install failed"),
+        })
+
+        # Update missing list
+        if success:
+            for b in method_bins:
+                if b in missing_bins:
+                    missing_bins.remove(b)
+
+    # Report any still-missing bins
+    for b in missing_bins:
+        results.append({"dep": b, "status": "missing", "detail": "no install method available"})
+
+    return results

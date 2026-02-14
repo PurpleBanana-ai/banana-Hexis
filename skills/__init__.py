@@ -29,13 +29,21 @@ Example usage:
         system_prompt += f"\\n\\n{skill.to_prompt_block()}"
 """
 
-from .base import SkillContext, SkillSpec
-from .loader import load_skills, load_skills_from_dir, discover_skill_dirs
+from .base import InstallMethod, SkillCategory, SkillContext, SkillSpec
+from .loader import (
+    discover_skill_dirs,
+    install_skill_deps,
+    load_skills,
+    load_skills_from_dir,
+)
 
 __all__ = [
+    "InstallMethod",
+    "SkillCategory",
     "SkillContext",
     "SkillSpec",
+    "discover_skill_dirs",
+    "install_skill_deps",
     "load_skills",
     "load_skills_from_dir",
-    "discover_skill_dirs",
 ]

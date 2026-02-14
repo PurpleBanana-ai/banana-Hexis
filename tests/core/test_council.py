@@ -1,0 +1,491 @@
+"""Tests for Multi-Agent Council tools (F.1, F.2, F.3)."""
+
+from __future__ import annotations
+
+import json
+from unittest.mock import AsyncMock, MagicMock, patch
+
+import pytest
+
+from core.tools.council import (
+    COUNCIL_PERSONAS,
+    AggregateSignalsHandler,
+    ListCouncilPersonasHandler,
+    RunCouncilHandler,
+    create_council_tools,
+)
+from core.tools.base import ToolCategory, ToolContext, ToolExecutionContext
+
+pytestmark = [pytest.mark.asyncio(loop_scope="session")]
+
+
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
+def _make_context(pool=None):
+    """Build a minimal ToolExecutionContext with a registry stub."""
+    registry = MagicMock()
+    registry.pool = pool
+    return ToolExecutionContext(
+        tool_context=ToolContext.CHAT,
+        call_id="test-call",
+        registry=registry,
+    )
+
+
+# ---------------------------------------------------------------------------
+# F.1 -- COUNCIL_PERSONAS dict
+# ---------------------------------------------------------------------------
+
+
+class TestCouncilPersonas:
+    """Verify the COUNCIL_PERSONAS constant."""
+
+    def test_has_five_personas(self):
+        assert len(COUNCIL_PERSONAS) == 5
+
+    def test_expected_keys(self):
+        expected = {
+            "growth_strategist",
+            "revenue_guardian",
+            "skeptical_operator",
+            "creative_innovator",
+            "customer_advocate",
+        }
+        assert set(COUNCIL_PERSONAS.keys()) == expected
+
+    def test_each_has_name_and_system_prompt(self):
+        for key, persona in COUNCIL_PERSONAS.items():
+            assert "name" in persona, f"{key} missing 'name'"
+            assert "system_prompt" in persona, f"{key} missing 'system_prompt'"
+            assert isinstance(persona["name"], str)
+            assert isinstance(persona["system_prompt"], str)
+            assert len(persona["system_prompt"]) > 10
+
+
+# ---------------------------------------------------------------------------
+# F.1 -- ListCouncilPersonasHandler
+# ---------------------------------------------------------------------------
+
+
+class TestListCouncilPersonasSpec:
+    """Verify list_council_personas tool spec."""
+
+    def test_spec_name(self):
+        handler = ListCouncilPersonasHandler()
+        assert handler.spec.name == "list_council_personas"
+
+    def test_spec_category(self):
+        handler = ListCouncilPersonasHandler()
+        assert handler.spec.category == ToolCategory.MEMORY
+
+    def test_spec_energy_cost_zero(self):
+        handler = ListCouncilPersonasHandler()
+        assert handler.spec.energy_cost == 0
+
+    def test_spec_read_only(self):
+        handler = ListCouncilPersonasHandler()
+        assert handler.spec.is_read_only is True
+
+
+class TestListCouncilPersonasExecution:
+    """Verify list_council_personas execution."""
+
+    async def test_returns_all_five(self):
+        handler = ListCouncilPersonasHandler()
+        ctx = _make_context()
+        result = await handler.execute({}, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        assert data["count"] == 5
+        assert len(data["personas"]) == 5
+
+    async def test_persona_keys_match(self):
+        handler = ListCouncilPersonasHandler()
+        ctx = _make_context()
+        result = await handler.execute({}, ctx)
+
+        data = json.loads(result.output)
+        assert set(data["personas"].keys()) == set(COUNCIL_PERSONAS.keys())
+
+    async def test_each_persona_has_fields(self):
+        handler = ListCouncilPersonasHandler()
+        ctx = _make_context()
+        result = await handler.execute({}, ctx)
+
+        data = json.loads(result.output)
+        for key, persona in data["personas"].items():
+            assert "name" in persona
+            assert "system_prompt" in persona
+
+
+# ---------------------------------------------------------------------------
+# F.2 -- RunCouncilHandler
+# ---------------------------------------------------------------------------
+
+
+class TestRunCouncilSpec:
+    """Verify run_council tool spec."""
+
+    def test_spec_name(self):
+        handler = RunCouncilHandler()
+        assert handler.spec.name == "run_council"
+
+    def test_spec_category(self):
+        handler = RunCouncilHandler()
+        assert handler.spec.category == ToolCategory.MEMORY
+
+    def test_spec_energy_cost(self):
+        handler = RunCouncilHandler()
+        assert handler.spec.energy_cost == 5
+
+    def test_spec_read_only(self):
+        handler = RunCouncilHandler()
+        assert handler.spec.is_read_only is True
+
+    def test_spec_optional(self):
+        handler = RunCouncilHandler()
+        assert handler.spec.optional is True
+
+    def test_spec_requires_topic(self):
+        handler = RunCouncilHandler()
+        assert "topic" in handler.spec.parameters["required"]
+
+
+class TestRunCouncilExecution:
+    """Verify run_council execution."""
+
+    async def test_default_all_five_personas(self):
+        handler = RunCouncilHandler()
+        ctx = _make_context()
+        result = await handler.execute({"topic": "Should we expand into APAC?"}, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        assert data["persona_count"] == 5
+        assert len(data["council"]) == 5
+        assert data["topic"] == "Should we expand into APAC?"
+
+    async def test_custom_persona_list(self):
+        handler = RunCouncilHandler()
+        ctx = _make_context()
+        result = await handler.execute({
+            "topic": "Pricing decision",
+            "personas": ["revenue_guardian", "customer_advocate"],
+        }, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        assert data["persona_count"] == 2
+        included = data["personas_included"]
+        assert "revenue_guardian" in included
+        assert "customer_advocate" in included
+        assert "growth_strategist" not in included
+
+    async def test_single_persona(self):
+        handler = RunCouncilHandler()
+        ctx = _make_context()
+        result = await handler.execute({
+            "topic": "Risk assessment",
+            "personas": ["skeptical_operator"],
+        }, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        assert data["persona_count"] == 1
+        assert data["council"][0]["persona_key"] == "skeptical_operator"
+
+    async def test_invalid_persona_returns_error(self):
+        handler = RunCouncilHandler()
+        ctx = _make_context()
+        result = await handler.execute({
+            "topic": "test",
+            "personas": ["nonexistent_persona"],
+        }, ctx)
+
+        assert not result.success
+        assert "nonexistent_persona" in result.error
+
+    async def test_mixed_valid_invalid_personas_returns_error(self):
+        handler = RunCouncilHandler()
+        ctx = _make_context()
+        result = await handler.execute({
+            "topic": "test",
+            "personas": ["growth_strategist", "bad_persona"],
+        }, ctx)
+
+        assert not result.success
+        assert "bad_persona" in result.error
+
+    async def test_empty_topic_returns_error(self):
+        handler = RunCouncilHandler()
+        ctx = _make_context()
+        result = await handler.execute({"topic": ""}, ctx)
+
+        assert not result.success
+        assert "required" in result.error.lower()
+
+    async def test_missing_topic_returns_error(self):
+        handler = RunCouncilHandler()
+        ctx = _make_context()
+        result = await handler.execute({}, ctx)
+
+        assert not result.success
+
+    async def test_context_included_in_prompt(self):
+        handler = RunCouncilHandler()
+        ctx = _make_context()
+        result = await handler.execute({
+            "topic": "Go/no-go decision",
+            "context": "Revenue is $5M ARR with 30% margins",
+        }, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        for entry in data["council"]:
+            assert "Revenue is $5M ARR" in entry["full_prompt"]
+            assert "Go/no-go decision" in entry["full_prompt"]
+
+    async def test_council_entry_structure(self):
+        handler = RunCouncilHandler()
+        ctx = _make_context()
+        result = await handler.execute({"topic": "Structure test"}, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        for entry in data["council"]:
+            assert "persona_key" in entry
+            assert "persona_name" in entry
+            assert "system_prompt" in entry
+            assert "full_prompt" in entry
+
+    async def test_instructions_present(self):
+        handler = RunCouncilHandler()
+        ctx = _make_context()
+        result = await handler.execute({"topic": "test"}, ctx)
+
+        data = json.loads(result.output)
+        assert "instructions" in data
+        assert len(data["instructions"]) > 0
+
+
+# ---------------------------------------------------------------------------
+# F.3 -- AggregateSignalsHandler
+# ---------------------------------------------------------------------------
+
+
+class TestAggregateSignalsSpec:
+    """Verify aggregate_signals tool spec."""
+
+    def test_spec_name(self):
+        handler = AggregateSignalsHandler()
+        assert handler.spec.name == "aggregate_signals"
+
+    def test_spec_category(self):
+        handler = AggregateSignalsHandler()
+        assert handler.spec.category == ToolCategory.MEMORY
+
+    def test_spec_energy_cost(self):
+        handler = AggregateSignalsHandler()
+        assert handler.spec.energy_cost == 3
+
+    def test_spec_read_only(self):
+        handler = AggregateSignalsHandler()
+        assert handler.spec.is_read_only is True
+
+    def test_spec_no_required_params(self):
+        handler = AggregateSignalsHandler()
+        assert "required" not in handler.spec.parameters
+
+
+class TestAggregateSignalsExecution:
+    """Verify aggregate_signals execution with mock DB."""
+
+    async def test_no_pool_returns_error(self):
+        handler = AggregateSignalsHandler()
+        ctx = _make_context(pool=None)
+        ctx.registry.pool = None
+        result = await handler.execute({}, ctx)
+
+        assert not result.success
+        assert "pool" in result.error.lower()
+
+    async def test_with_db_pool(self, db_pool):
+        """Integration test: runs against real DB (may return empty results)."""
+        handler = AggregateSignalsHandler()
+        ctx = _make_context(pool=db_pool)
+        result = await handler.execute({"days": 1, "limit": 5}, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        assert "events" in data
+        assert "memories" in data
+        assert "goals" in data
+        assert "summary" in data
+        assert data["time_window_days"] == 1
+        assert data["domain_filter"] is None
+
+    async def test_with_domain_filter(self, db_pool):
+        """Integration test with domain filter."""
+        handler = AggregateSignalsHandler()
+        ctx = _make_context(pool=db_pool)
+        result = await handler.execute({
+            "domain": "chat",
+            "days": 7,
+            "limit": 10,
+        }, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        assert data["domain_filter"] == "chat"
+
+    async def test_default_params(self, db_pool):
+        """Default days=7, limit=20."""
+        handler = AggregateSignalsHandler()
+        ctx = _make_context(pool=db_pool)
+        result = await handler.execute({}, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        assert data["time_window_days"] == 7
+
+    async def test_summary_structure(self, db_pool):
+        """Summary section has expected fields."""
+        handler = AggregateSignalsHandler()
+        ctx = _make_context(pool=db_pool)
+        result = await handler.execute({}, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        summary = data["summary"]
+        assert "total_signals" in summary
+        assert "event_sources" in summary
+        assert "highest_importance_goal" in summary
+
+    async def test_limit_capped_at_100(self, db_pool):
+        """Limit should be capped at 100."""
+        handler = AggregateSignalsHandler()
+        ctx = _make_context(pool=db_pool)
+        result = await handler.execute({"limit": 500}, ctx)
+
+        assert result.success
+        # The handler should clamp to 100 internally; no error
+
+    async def test_days_minimum_one(self, db_pool):
+        """Days should be at least 1."""
+        handler = AggregateSignalsHandler()
+        ctx = _make_context(pool=db_pool)
+        result = await handler.execute({"days": 0}, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        assert data["time_window_days"] == 1
+
+    async def test_mock_pool_with_events(self):
+        """Test with a mock pool returning synthetic data."""
+        from contextlib import asynccontextmanager
+        from datetime import datetime, timezone
+
+        mock_conn = AsyncMock()
+
+        # Mock rows as simple dicts wrapped in a list
+        event_row = {
+            "id": 1,
+            "source": "chat",
+            "status": "completed",
+            "session_key": "sess-1",
+            "payload": '{"message": "hello"}',
+            "created_at": datetime(2026, 2, 10, tzinfo=timezone.utc),
+            "completed_at": datetime(2026, 2, 10, tzinfo=timezone.utc),
+        }
+        mem_row = {
+            "id": "00000000-0000-0000-0000-000000000001",
+            "content": "User asked about pricing",
+            "importance": 0.7,
+            "created_at": datetime(2026, 2, 10, tzinfo=timezone.utc),
+            "metadata": None,
+        }
+        goal_row = {
+            "id": "00000000-0000-0000-0000-000000000002",
+            "content": "Increase user retention by 20%",
+            "importance": 0.9,
+            "metadata": None,
+            "created_at": datetime(2026, 2, 9, tzinfo=timezone.utc),
+        }
+
+        # Use simple dicts as mock rows (dict supports __getitem__)
+        async def mock_fetch(query, *args):
+            if "gateway_events" in query:
+                return [event_row]
+            elif "episodic" in query:
+                return [mem_row]
+            elif "goal" in query:
+                return [goal_row]
+            return []
+
+        mock_conn.fetch = mock_fetch
+
+        # Build a mock pool with a proper async context manager for acquire()
+        @asynccontextmanager
+        async def mock_acquire():
+            yield mock_conn
+
+        mock_pool = MagicMock()
+        mock_pool.acquire = mock_acquire
+
+        handler = AggregateSignalsHandler()
+        ctx = _make_context(pool=mock_pool)
+        result = await handler.execute({"days": 7, "limit": 20}, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        assert data["events"]["count"] == 1
+        assert data["memories"]["count"] == 1
+        assert data["goals"]["count"] == 1
+        assert data["summary"]["total_signals"] == 3
+
+
+# ---------------------------------------------------------------------------
+# Factory
+# ---------------------------------------------------------------------------
+
+
+class TestCouncilToolFactory:
+    """Verify the create_council_tools factory."""
+
+    def test_returns_three_handlers(self):
+        tools = create_council_tools()
+        assert len(tools) == 3
+
+    def test_tool_names(self):
+        tools = create_council_tools()
+        names = [t.spec.name for t in tools]
+        assert "list_council_personas" in names
+        assert "run_council" in names
+        assert "aggregate_signals" in names
+
+    def test_all_memory_category(self):
+        tools = create_council_tools()
+        for tool in tools:
+            assert tool.spec.category == ToolCategory.MEMORY
+
+
+# ---------------------------------------------------------------------------
+# Registry integration
+# ---------------------------------------------------------------------------
+
+
+class TestCouncilRegistration:
+    """Verify council tools are registered in the default registry."""
+
+    async def test_registered_in_default_registry(self, db_pool):
+        from core.tools import create_default_registry
+
+        registry = create_default_registry(db_pool)
+        tool_names = [t.spec.name for t in registry._handlers.values()]
+        assert "list_council_personas" in tool_names
+        assert "run_council" in tool_names
+        assert "aggregate_signals" in tool_names

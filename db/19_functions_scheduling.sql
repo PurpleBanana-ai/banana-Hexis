@@ -147,6 +147,17 @@ BEGIN
                 run_at := run_at + INTERVAL '7 days';
             END IF;
             RETURN run_at;
+        WHEN 'cron' THEN
+            -- Cron expressions are computed in Python via croniter.
+            -- The schedule JSONB stores {"cron": "...", "_next_run": "ISO8601"}.
+            -- Python pre-computes _next_run and updates it after each execution.
+            run_at := NULLIF(p_schedule->>'_next_run', '')::timestamptz;
+            IF run_at IS NOT NULL AND run_at > after_ts THEN
+                RETURN run_at;
+            END IF;
+            -- Fallback: return near-future time so task stays active.
+            -- Python worker will fix up the real next_run_at immediately.
+            RETURN after_ts + INTERVAL '1 minute';
         ELSE
             RAISE EXCEPTION 'Unsupported schedule_kind: %', schedule_kind;
     END CASE;
@@ -163,7 +174,8 @@ CREATE OR REPLACE FUNCTION create_scheduled_task(
     p_description TEXT DEFAULT NULL,
     p_status TEXT DEFAULT 'active',
     p_max_runs INT DEFAULT NULL,
-    p_created_by TEXT DEFAULT 'agent'
+    p_created_by TEXT DEFAULT 'agent',
+    p_delivery JSONB DEFAULT '{"mode": "outbox"}'::jsonb
 )
 RETURNS UUID AS $$
 DECLARE
@@ -206,6 +218,7 @@ BEGIN
         timezone,
         action_kind,
         action_payload,
+        delivery,
         status,
         next_run_at,
         max_runs,
@@ -220,6 +233,7 @@ BEGIN
         normalize_timezone(p_timezone),
         action_kind,
         COALESCE(p_action_payload, '{}'::jsonb),
+        COALESCE(p_delivery, '{"mode": "outbox"}'::jsonb),
         status_value,
         next_run,
         p_max_runs,
@@ -271,6 +285,7 @@ RETURNS TABLE (
     timezone TEXT,
     action_kind TEXT,
     action_payload JSONB,
+    delivery JSONB,
     status TEXT,
     next_run_at TIMESTAMPTZ,
     last_run_at TIMESTAMPTZ,
@@ -292,6 +307,7 @@ BEGIN
         t.timezone,
         t.action_kind,
         t.action_payload,
+        t.delivery,
         t.status,
         t.next_run_at,
         t.last_run_at,
@@ -319,7 +335,8 @@ CREATE OR REPLACE FUNCTION update_scheduled_task(
     p_action_kind TEXT DEFAULT NULL,
     p_action_payload JSONB DEFAULT NULL,
     p_status TEXT DEFAULT NULL,
-    p_max_runs INT DEFAULT NULL
+    p_max_runs INT DEFAULT NULL,
+    p_delivery JSONB DEFAULT NULL
 )
 RETURNS JSONB AS $$
 DECLARE
@@ -384,6 +401,7 @@ BEGIN
         timezone = new_timezone,
         action_kind = new_action_kind,
         action_payload = new_action_payload,
+        delivery = COALESCE(p_delivery, current_task.delivery),
         status = new_status,
         next_run_at = new_next_run,
         max_runs = COALESCE(p_max_runs, current_task.max_runs),
@@ -426,8 +444,11 @@ DECLARE
     ran_count INT := 0;
     next_run TIMESTAMPTZ;
     action_payload JSONB;
+    delivery_info JSONB;
     goal_id UUID;
     task_status TEXT;
+    cron_task_ids JSONB := '[]'::jsonb;
+    ran_tasks JSONB := '[]'::jsonb;
 BEGIN
     FOR task IN
         SELECT *
@@ -440,13 +461,15 @@ BEGIN
     LOOP
         BEGIN
             action_payload := COALESCE(task.action_payload, '{}'::jsonb);
+            delivery_info := COALESCE(task.delivery, '{"mode": "outbox"}'::jsonb);
+
             IF task.action_kind = 'queue_user_message' THEN
                 outbox_messages := outbox_messages || jsonb_build_array(
                     build_user_message(
                         NULLIF(action_payload->>'message', ''),
                         NULLIF(action_payload->>'intent', ''),
                         action_payload->'context'
-                    )
+                    ) || jsonb_build_object('delivery', delivery_info, 'task_name', task.name)
                 );
             ELSIF task.action_kind = 'create_goal' THEN
                 goal_id := create_goal(
@@ -463,12 +486,24 @@ BEGIN
                             format('Created goal: %s', COALESCE(action_payload->>'title', goal_id::text)),
                             'goal_created',
                             jsonb_build_object('goal_id', goal_id::text, 'task_id', task.id::text)
-                        )
+                        ) || jsonb_build_object('delivery', delivery_info, 'task_name', task.name)
                     );
                 END IF;
             END IF;
 
             ran_count := ran_count + 1;
+            ran_tasks := ran_tasks || jsonb_build_array(jsonb_build_object(
+                'id', task.id::text,
+                'name', task.name,
+                'schedule_kind', task.schedule_kind,
+                'action_kind', task.action_kind,
+                'delivery', delivery_info
+            ));
+
+            -- Track cron tasks for Python-side next_run recomputation
+            IF task.schedule_kind = 'cron' THEN
+                cron_task_ids := cron_task_ids || jsonb_build_array(task.id::text);
+            END IF;
 
             next_run := compute_next_run_at(task.schedule_kind, task.schedule, task.timezone, now_ts);
             IF task.max_runs IS NOT NULL AND (task.run_count + 1) >= task.max_runs THEN
@@ -498,7 +533,9 @@ BEGIN
 
     RETURN jsonb_build_object(
         'ran', ran_count,
-        'outbox_messages', outbox_messages
+        'outbox_messages', outbox_messages,
+        'cron_task_ids', cron_task_ids,
+        'ran_tasks', ran_tasks
     );
 END;
 $$ LANGUAGE plpgsql;

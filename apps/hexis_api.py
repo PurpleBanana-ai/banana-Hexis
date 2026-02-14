@@ -55,6 +55,8 @@ async def lifespan(app: FastAPI):
     dsn = _dsn()
     _min, _max = pool_sizes_from_env(2, 10)
     _pool = await asyncpg.create_pool(dsn, min_size=_min, max_size=_max)
+    from core.usage import set_usage_pool
+    set_usage_pool(_pool)
     logger.info("Hexis API started (pool created)")
     yield
     if _pool:

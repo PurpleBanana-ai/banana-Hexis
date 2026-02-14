@@ -275,6 +275,25 @@ RETURNS vector[] AS $$
 	            result[missing_indices[global_index]] := embedding_array::vector;
 	        END LOOP;
 
+	        -- Record embedding usage (fire-and-forget; ignore if api_usage table missing)
+	        BEGIN
+	            INSERT INTO api_usage (provider, model, operation, input_tokens, source)
+	            VALUES (
+	                'ollama',
+	                model_id,
+	                'embed',
+	                COALESCE(
+	                    (embedding_json->>'prompt_eval_count')::int,  -- Ollama
+	                    (embedding_json->'usage'->>'total_tokens')::int,  -- OpenAI-compat
+	                    array_length(batch_texts, 1) * 50  -- fallback estimate
+	                ),
+	                'embed'
+	            );
+	        EXCEPTION WHEN OTHERS THEN
+	            -- Silently ignore (table may not exist on first boot)
+	            NULL;
+	        END;
+
 	        batch_start := batch_end + 1;
 	    END LOOP;
 

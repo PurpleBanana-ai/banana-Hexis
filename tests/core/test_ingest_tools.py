@@ -173,9 +173,9 @@ class TestCreateIngestTools:
         from core.tools.ingest import create_ingest_tools
 
         tools = create_ingest_tools()
-        assert len(tools) == 4
+        assert len(tools) == 5
         names = {t.spec.name for t in tools}
-        assert names == {"fast_ingest", "slow_ingest", "hybrid_ingest", "git_ingest"}
+        assert names == {"fast_ingest", "slow_ingest", "hybrid_ingest", "git_ingest", "url_ingest"}
 
     def test_all_have_ingest_category(self):
         from core.tools.ingest import create_ingest_tools

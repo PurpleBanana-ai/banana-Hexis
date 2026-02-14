@@ -367,6 +367,60 @@ class WebReader(DocumentReader):
         return "\n".join(header_parts) + "\n\n" + content
 
 
+class YouTubeTranscriptReader(DocumentReader):
+    """Reader for YouTube video transcripts."""
+
+    # Patterns that identify YouTube URLs
+    _PATTERNS = [
+        re.compile(r"(?:youtube\.com/watch\?.*v=|youtu\.be/)([\w-]{11})"),
+    ]
+
+    @classmethod
+    def extract_video_id(cls, url: str) -> str | None:
+        for pat in cls._PATTERNS:
+            m = pat.search(url)
+            if m:
+                return m.group(1)
+        return None
+
+    @classmethod
+    def can_handle(cls, url: str) -> bool:
+        return cls.extract_video_id(url) is not None
+
+    @staticmethod
+    def read(url: str) -> str:  # type: ignore[override]
+        video_id = YouTubeTranscriptReader.extract_video_id(url)
+        if not video_id:
+            raise RuntimeError(f"Could not extract YouTube video ID from: {url}")
+
+        try:
+            from youtube_transcript_api import YouTubeTranscriptApi
+        except ImportError:
+            raise RuntimeError(
+                "YouTube transcript reader requires youtube-transcript-api: "
+                "pip install youtube-transcript-api"
+            )
+
+        try:
+            transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
+            # Prefer manually created transcripts, fall back to auto-generated
+            try:
+                transcript = transcript_list.find_manually_created_transcript(["en"])
+            except Exception:
+                transcript = transcript_list.find_generated_transcript(["en"])
+
+            entries = transcript.fetch()
+            # Build readable transcript
+            parts = [f"[Source: {url}]", f"[Format: YouTube Transcript]", f"[Video ID: {video_id}]", ""]
+            for entry in entries:
+                text = entry.get("text", entry) if isinstance(entry, dict) else str(entry)
+                parts.append(str(text))
+
+            return "\n".join(parts)
+        except Exception as e:
+            raise RuntimeError(f"Failed to fetch YouTube transcript: {e}")
+
+
 class DataReader(DocumentReader):
     """Reader for structured data files (JSON, YAML, CSV, XML)."""
 
@@ -1157,6 +1211,7 @@ class IngestLLM:
     async def acomplete(self, messages: list[dict[str, str]], temperature: float = 0.3) -> str:
         """Async completion via core.llm."""
         from core.llm import chat_completion
+        from core.usage import record_llm_usage
 
         self.call_count += 1
         result = await chat_completion(
@@ -1169,6 +1224,12 @@ class IngestLLM:
             max_tokens=1200,
             auth_mode=self._cfg.get("auth_mode"),
         )
+        asyncio.ensure_future(record_llm_usage(
+            provider=self._cfg["provider"],
+            model=self._cfg["model"],
+            raw_response=result.get("raw"),
+            source="ingest",
+        ))
         return result.get("content", "")
 
     def complete_json(self, messages: list[dict[str, str]], temperature: float = 0.2) -> dict[str, Any]:

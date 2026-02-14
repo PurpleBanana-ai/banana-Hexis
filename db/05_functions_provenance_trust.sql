@@ -89,6 +89,96 @@ BEGIN
     LIMIT p_limit;
 END;
 $$ LANGUAGE plpgsql STABLE;
+
+-- Structured recall with rich filters: source path/kind, date range, concept, metadata
+CREATE OR REPLACE FUNCTION recall_memories_structured(
+    p_query_text TEXT,
+    p_limit INT DEFAULT 10,
+    p_memory_types memory_type[] DEFAULT NULL,
+    p_min_importance FLOAT DEFAULT 0.0,
+    p_source_path TEXT DEFAULT NULL,
+    p_source_kind TEXT DEFAULT NULL,
+    p_created_after TIMESTAMPTZ DEFAULT NULL,
+    p_created_before TIMESTAMPTZ DEFAULT NULL,
+    p_concept TEXT DEFAULT NULL,
+    p_metadata_filter JSONB DEFAULT NULL
+) RETURNS TABLE (
+    memory_id UUID,
+    content TEXT,
+    memory_type memory_type,
+    score FLOAT,
+    source TEXT,
+    importance FLOAT,
+    trust_level FLOAT,
+    source_attribution JSONB,
+    created_at TIMESTAMPTZ,
+    emotional_valence FLOAT
+) AS $$
+DECLARE
+    use_vector BOOLEAN;
+BEGIN
+    -- If no query text, we can't use fast_recall; fall back to direct filter
+    use_vector := (p_query_text IS NOT NULL AND trim(p_query_text) <> '');
+
+    IF use_vector THEN
+        RETURN QUERY
+        WITH hits AS (
+            SELECT * FROM fast_recall(p_query_text, p_limit * 3)
+        )
+        SELECT
+            h.memory_id,
+            h.content,
+            h.memory_type,
+            h.score,
+            h.source,
+            m.importance,
+            m.trust_level,
+            m.source_attribution,
+            m.created_at,
+            (m.metadata->>'emotional_valence')::float AS emotional_valence
+        FROM hits h
+        JOIN memories m ON m.id = h.memory_id
+        WHERE (p_memory_types IS NULL OR h.memory_type = ANY(p_memory_types))
+          AND m.importance >= COALESCE(p_min_importance, 0.0)
+          AND (p_source_path IS NULL OR m.source_attribution->>'path' ILIKE '%' || p_source_path || '%')
+          AND (p_source_kind IS NULL OR m.source_attribution->>'kind' = p_source_kind)
+          AND (p_created_after IS NULL OR m.created_at >= p_created_after)
+          AND (p_created_before IS NULL OR m.created_at <= p_created_before)
+          AND (p_metadata_filter IS NULL OR m.metadata @> p_metadata_filter)
+        ORDER BY h.score DESC
+        LIMIT p_limit;
+    ELSE
+        -- Filter-only mode (no semantic search)
+        RETURN QUERY
+        SELECT
+            m.id AS memory_id,
+            m.content,
+            m.type AS memory_type,
+            m.importance::float AS score,
+            'filter'::text AS source,
+            m.importance,
+            m.trust_level,
+            m.source_attribution,
+            m.created_at,
+            (m.metadata->>'emotional_valence')::float AS emotional_valence
+        FROM memories m
+        WHERE m.status = 'active'
+          AND (p_memory_types IS NULL OR m.type = ANY(p_memory_types))
+          AND m.importance >= COALESCE(p_min_importance, 0.0)
+          AND (p_source_path IS NULL OR m.source_attribution->>'path' ILIKE '%' || p_source_path || '%')
+          AND (p_source_kind IS NULL OR m.source_attribution->>'kind' = p_source_kind)
+          AND (p_created_after IS NULL OR m.created_at >= p_created_after)
+          AND (p_created_before IS NULL OR m.created_at <= p_created_before)
+          AND (p_metadata_filter IS NULL OR m.metadata @> p_metadata_filter)
+        ORDER BY m.importance DESC, m.created_at DESC
+        LIMIT p_limit;
+    END IF;
+
+    -- Concept filter: if p_concept is provided, additionally filter via graph
+    -- (Handled in Python layer via knowledge graph lookup when concept != NULL)
+END;
+$$ LANGUAGE plpgsql STABLE;
+
 CREATE OR REPLACE FUNCTION recall_memories_stub(
     p_query_text TEXT,
     p_limit INT DEFAULT 10,
@@ -1891,5 +1981,87 @@ BEGIN
     RETURN deleted_count;
 END;
 $$ LANGUAGE plpgsql;
+
+-- Hybrid recall: combines vector similarity (fast_recall) with Postgres full-text search (tsvector)
+-- Returns merged, deduplicated results ranked by a combined score.
+CREATE OR REPLACE FUNCTION recall_hybrid(
+    p_query_text TEXT,
+    p_limit INT DEFAULT 10,
+    p_vector_weight FLOAT DEFAULT 0.6,
+    p_fts_weight FLOAT DEFAULT 0.4
+) RETURNS TABLE (
+    memory_id UUID,
+    content TEXT,
+    memory_type memory_type,
+    score FLOAT,
+    source TEXT,
+    importance FLOAT,
+    trust_level FLOAT,
+    source_attribution JSONB
+) AS $$
+DECLARE
+    fts_query tsquery;
+BEGIN
+    -- Build tsquery from natural language
+    BEGIN
+        fts_query := websearch_to_tsquery('english', p_query_text);
+    EXCEPTION WHEN OTHERS THEN
+        fts_query := plainto_tsquery('english', p_query_text);
+    END;
+
+    RETURN QUERY
+    WITH
+    -- Vector search results via fast_recall
+    vector_hits AS (
+        SELECT fr.memory_id, fr.content, fr.memory_type, fr.score AS vector_score, fr.source
+        FROM fast_recall(p_query_text, p_limit * 2) fr
+    ),
+    -- Full-text search results
+    fts_hits AS (
+        SELECT
+            m.id AS memory_id,
+            m.content,
+            m.type AS memory_type,
+            ts_rank_cd(to_tsvector('english', m.content), fts_query)::float AS fts_score,
+            'fts'::text AS source
+        FROM memories m
+        WHERE m.status = 'active'
+          AND to_tsvector('english', m.content) @@ fts_query
+        ORDER BY fts_score DESC
+        LIMIT p_limit * 2
+    ),
+    -- Merge and deduplicate
+    merged AS (
+        SELECT
+            COALESCE(v.memory_id, f.memory_id) AS mem_id,
+            COALESCE(v.content, f.content) AS mem_content,
+            COALESCE(v.memory_type, f.memory_type) AS mem_type,
+            -- Normalize and combine scores
+            (COALESCE(v.vector_score, 0.0) * p_vector_weight +
+             COALESCE(f.fts_score, 0.0) * p_fts_weight) AS combined_score,
+            CASE
+                WHEN v.memory_id IS NOT NULL AND f.memory_id IS NOT NULL THEN 'hybrid'
+                WHEN v.memory_id IS NOT NULL THEN v.source
+                ELSE 'fts'
+            END AS hit_source
+        FROM vector_hits v
+        FULL OUTER JOIN fts_hits f ON v.memory_id = f.memory_id
+    )
+    SELECT
+        mg.mem_id,
+        mg.mem_content,
+        mg.mem_type,
+        mg.combined_score,
+        mg.hit_source,
+        m.importance,
+        m.trust_level,
+        m.source_attribution
+    FROM merged mg
+    JOIN memories m ON m.id = mg.mem_id
+    WHERE m.status = 'active'
+    ORDER BY mg.combined_score DESC
+    LIMIT p_limit;
+END;
+$$ LANGUAGE plpgsql STABLE;
 
 SET check_function_bodies = on;

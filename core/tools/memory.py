@@ -188,10 +188,15 @@ class RecallHandler(ToolHandler):
                                 sa = json.loads(sa)
                             except Exception:
                                 sa = {}
-                        if isinstance(sa, dict) and sa.get("kind"):
-                            mem["source_kind"] = sa["kind"]
-                        if isinstance(sa, dict) and sa.get("ref"):
-                            mem["source_ref"] = sa["ref"]
+                        if isinstance(sa, dict):
+                            if sa.get("kind"):
+                                mem["source_kind"] = sa["kind"]
+                            if sa.get("label"):
+                                mem["source_label"] = sa["label"]
+                            if sa.get("path"):
+                                mem["source_path"] = sa["path"]
+                            if sa.get("ref"):
+                                mem["source_ref"] = sa["ref"]
                     memories.append(mem)
 
                 # Touch accessed memories

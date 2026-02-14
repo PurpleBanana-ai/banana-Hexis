@@ -118,6 +118,14 @@ class ChannelManager:
             logger.warning("No adapter for channel type: %s", msg.channel_type)
             return
 
+        # I.3: Per-channel user allowlisting
+        if not await self._check_user_allowed(msg):
+            logger.debug(
+                "Ignoring message from non-allowed user %s on %s",
+                msg.sender_id, msg.channel_type,
+            )
+            return
+
         logger.info(
             "Channel message: %s/%s from %s: %s",
             msg.channel_type,
@@ -219,6 +227,57 @@ class ChannelManager:
 
         self._tasks.clear()
         logger.info("All channel adapters stopped")
+
+    async def _check_user_allowed(self, msg: ChannelMessage) -> bool:
+        """I.3: Check per-channel user allowlist from config.
+
+        Config key: channel.{type}.allowed_users
+        Value: JSON array of user IDs, or "*" to allow all.
+        """
+        try:
+            async with self._pool.acquire() as conn:
+                raw = await conn.fetchval(
+                    "SELECT get_config_text($1)",
+                    f"channel.{msg.channel_type}.allowed_users",
+                )
+            if raw is None or raw == "*":
+                return True
+            import json
+            try:
+                allowed = json.loads(raw) if isinstance(raw, str) else raw
+            except (json.JSONDecodeError, TypeError):
+                return True
+            if isinstance(allowed, list):
+                return msg.sender_id in [str(v) for v in allowed]
+            return True
+        except Exception:
+            # Fail open — don't block messages if config lookup fails
+            return True
+
+    async def get_session_ttl(self, channel_type: str) -> int:
+        """I.4: Get configurable session lifetime in seconds.
+
+        Config key: channel.session_ttl or channel.{type}.session_ttl
+        Default: 3600 (1 hour).
+        """
+        try:
+            async with self._pool.acquire() as conn:
+                # Check channel-specific TTL first, then global
+                ttl = await conn.fetchval(
+                    "SELECT get_config_int($1)",
+                    f"channel.{channel_type}.session_ttl",
+                )
+                if ttl is not None:
+                    return int(ttl)
+                ttl = await conn.fetchval(
+                    "SELECT get_config_int($1)",
+                    "channel.session_ttl",
+                )
+                if ttl is not None:
+                    return int(ttl)
+        except Exception:
+            pass
+        return 3600  # Default 1 hour
 
     def status(self) -> list[dict[str, Any]]:
         """Return status of all registered adapters."""

@@ -574,6 +574,21 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     from .backlog import create_backlog_tools
     from .cron import create_cron_tools
     from .sessions import create_session_tools
+    from .contacts import create_contact_tools
+    from .image_gen import create_image_gen_tools
+    from .todoist import create_todoist_tools
+    from .asana import create_asana_tools
+    from .usage_query import create_usage_tools
+    from .hubspot import create_hubspot_tools
+    from .youtube import create_youtube_tools
+    from .twitter import create_twitter_tools
+    from .brave_search import create_brave_search_tools
+    from .firecrawl import create_firecrawl_tools
+    from .fathom import create_fathom_tools
+    from .video_gen import create_video_gen_tools
+    from .council import create_council_tools
+    from .backup import create_backup_tools
+    from .humanizer import create_humanizer_tools
     from .hooks import AuditTrailHook
 
     builder = ToolRegistryBuilder(pool)
@@ -593,6 +608,21 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     builder.add_all(create_backlog_tools())
     builder.add_all(create_cron_tools())
     builder.add_all(create_session_tools())
+    builder.add_all(create_contact_tools())
+    builder.add_all(create_image_gen_tools())
+    builder.add_all(create_todoist_tools())
+    builder.add_all(create_asana_tools())
+    builder.add_all(create_usage_tools())
+    builder.add_all(create_hubspot_tools())
+    builder.add_all(create_youtube_tools())
+    builder.add_all(create_twitter_tools())
+    builder.add_all(create_brave_search_tools())
+    builder.add_all(create_firecrawl_tools())
+    builder.add_all(create_fathom_tools())
+    builder.add_all(create_video_gen_tools())
+    builder.add_all(create_council_tools())
+    builder.add_all(create_backup_tools())
+    builder.add_all(create_humanizer_tools())
 
     registry = builder.build()
 
