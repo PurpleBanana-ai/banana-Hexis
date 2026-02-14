@@ -23,11 +23,12 @@ hexis/
 │   ├── agent_api.py              # Agent status and configuration
 │   ├── agent_loop.py             # Unified agent loop (heartbeat + chat)
 │   ├── memory_tools.py           # Memory tool definitions + handlers
-│   ├── tools/                    # Tool system (ToolHandler ABC, registry, 28 handlers)
+│   ├── tools/                    # Tool system (ToolHandler ABC, registry, ~80 handlers)
 │   ├── consent.py                # Consent DB wrappers
 │   ├── subconscious.py           # Subconscious DB wrappers
 │   ├── state.py                  # Heartbeat/maintenance DB wrappers
 │   ├── llm.py                    # LLM provider abstraction
+│   ├── usage.py                  # Token and cost tracking
 │   └── rabbitmq_bridge.py        # Messaging bridge
 ├── services/               # Orchestration/workflows built on core
 │   ├── conversation.py     # Conversation loop orchestration

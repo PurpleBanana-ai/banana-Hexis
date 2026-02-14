@@ -19,6 +19,7 @@ from .base import (
     ToolResult,
     ToolSpec,
 )
+from .api_keys import resolve_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -86,7 +87,12 @@ class GenerateVideoHandler(ToolHandler):
     async def execute(
         self, arguments: dict[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
-        token = self._api_key_resolver() if self._api_key_resolver else None
+        token = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="runway",
+            env_names=("RUNWAY_API_KEY",),
+        )
         if not token:
             return ToolResult.error_result(
                 "Runway API key not configured. Set RUNWAY_API_KEY.",

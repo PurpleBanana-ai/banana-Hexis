@@ -1,0 +1,195 @@
+<!--
+title: CLI Reference
+summary: Complete reference for all hexis CLI commands
+read_when:
+  - "You need the exact syntax for a CLI command"
+  - "You want to see all available commands"
+section: reference
+-->
+
+# CLI Reference
+
+Complete reference for the `hexis` CLI. Install via `pip install hexis`.
+
+## Global Flags
+
+| Flag | Description |
+|------|-------------|
+| `-h`, `--help` | Show help |
+| `-V`, `--version` | Print version |
+| `-i`, `--instance` | Target a specific instance |
+
+## Command Groups
+
+### Docker Management
+
+| Command | Description |
+|---------|-------------|
+| `hexis up [--build] [--profile PROFILE]` | Start services |
+| `hexis down` | Stop services |
+| `hexis ps` | Show running containers |
+| `hexis logs [-f] [services...]` | View/tail logs |
+| `hexis start` | Start workers |
+| `hexis stop` | Stop workers |
+| `hexis reset [--yes]` | Wipe DB volume and re-initialize |
+
+### Web UI
+
+| Command | Description |
+|---------|-------------|
+| `hexis ui [--no-open] [--port PORT]` | Start web UI (default port: 3477) |
+| `hexis open [--port PORT]` | Open browser to UI |
+
+### Agent Setup and Diagnostics
+
+| Command | Description |
+|---------|-------------|
+| `hexis init` | Interactive setup wizard (see [init flags](#hexis-init)) |
+| `hexis status [--json] [--no-docker] [--raw]` | Agent status overview |
+| `hexis doctor [--json] [--demo]` | Health check (Docker, DB, embeddings) |
+| `hexis config show [--json] [--no-redact]` | Show current configuration |
+| `hexis config validate` | Validate config keys and env references |
+| `hexis demo [--json]` | Run demo scenario |
+
+### Chat and Memory
+
+| Command | Description |
+|---------|-------------|
+| `hexis chat [--dsn DSN]` | Interactive chat |
+| `hexis recall <query> [--limit N] [--type TYPE] [--json]` | Search memories |
+
+### Auth
+
+| Command | Description |
+|---------|-------------|
+| `hexis auth <provider> login` | Login to provider |
+| `hexis auth <provider> status [--json]` | Check credential status |
+| `hexis auth <provider> logout [--yes]` | Remove stored credentials |
+
+Providers: `openai-codex`, `anthropic`, `chutes`, `github-copilot`, `qwen-portal`, `minimax-portal`, `google-gemini-cli`, `google-antigravity`
+
+### Instance Management
+
+| Command | Description |
+|---------|-------------|
+| `hexis instance create <name> [-d DESC]` | Create instance |
+| `hexis instance list [--json]` | List instances |
+| `hexis instance use <name>` | Switch active instance |
+| `hexis instance current` | Show current instance |
+| `hexis instance clone <source> <target> [-d DESC]` | Clone instance |
+| `hexis instance import <name> [--database DB]` | Import existing DB |
+| `hexis instance delete <name> [--force] [--reason TEXT]` | Delete instance |
+
+### Consent
+
+| Command | Description |
+|---------|-------------|
+| `hexis consents list [--json]` | List consent certificates |
+| `hexis consents show <model>` | Show a certificate |
+| `hexis consents request <model>` | Request consent |
+| `hexis consents revoke <model> [--reason TEXT]` | Revoke consent |
+
+### Goals
+
+| Command | Description |
+|---------|-------------|
+| `hexis goals list [--priority P] [--json]` | List goals |
+| `hexis goals create <title> [-d DESC] [--priority P] [--source S]` | Create goal |
+| `hexis goals update <id> --priority P [--reason TEXT]` | Update priority |
+| `hexis goals complete <id> [--reason TEXT]` | Mark complete |
+
+Priorities: `active`, `queued`, `backburner`, `completed`, `abandoned`
+
+Sources: `user_request`, `curiosity`, `identity`, `derived`, `external`
+
+### Scheduling
+
+| Command | Description |
+|---------|-------------|
+| `hexis schedule list [--status S] [--json]` | List tasks |
+| `hexis schedule create <name> --kind K --action A --schedule JSON [--payload JSON] [--timezone TZ]` | Create task |
+| `hexis schedule delete <id> [--force]` | Delete task |
+
+Kinds: `once`, `interval`, `daily`, `weekly`
+
+Actions: `queue_user_message`, `create_goal`
+
+### Tools
+
+| Command | Description |
+|---------|-------------|
+| `hexis tools list [--json] [--context CTX]` | List tools |
+| `hexis tools enable <tool>` | Enable a tool |
+| `hexis tools disable <tool>` | Disable a tool |
+| `hexis tools set-api-key <key> <value>` | Set API key |
+| `hexis tools set-cost <tool> <cost>` | Set energy cost |
+| `hexis tools add-mcp <name> <command> [--args ...] [--env ...]` | Add MCP server |
+| `hexis tools remove-mcp <name>` | Remove MCP server |
+| `hexis tools status [--json]` | Show config |
+
+### Channels
+
+| Command | Description |
+|---------|-------------|
+| `hexis channels setup <channel>` | Configure a channel |
+| `hexis channels start [--channel C]` | Start channel adapters |
+| `hexis channels status [--json]` | Show session counts |
+
+Channels: `discord`, `telegram`, `slack`, `signal`, `whatsapp`, `imessage`, `matrix`
+
+### Skills
+
+| Command | Description |
+|---------|-------------|
+| `hexis skills list` | List installed skills |
+| `hexis skills info <name>` | Show skill details |
+| `hexis skills install <path>` | Install custom skill |
+| `hexis skills uninstall <name>` | Remove a skill |
+
+### Workers and Servers
+
+| Command | Description |
+|---------|-------------|
+| `hexis worker -- --mode {heartbeat,maintenance,both} [--instance I]` | Run worker locally |
+| `hexis mcp [--dsn DSN]` | Start MCP server (stdio) |
+| `hexis api [--host HOST] [--port PORT]` | Start FastAPI server |
+
+### Ingestion
+
+| Command | Description |
+|---------|-------------|
+| `hexis ingest --file FILE` | Ingest a file |
+| `hexis ingest --input DIR` | Ingest a directory |
+| `hexis ingest --url URL` | Ingest a URL |
+| `hexis ingest --stdin --stdin-type TYPE --stdin-title TITLE` | Ingest from stdin |
+| `hexis ingest status [--pending] [--json]` | Show ingestion status |
+| `hexis ingest process [--all-archived] [--limit N] [--content-hash H]` | Process archived items |
+
+Common flags: `--mode {auto,deep,standard,shallow,archive,fast,slow,hybrid}`, `--min-importance F`, `--permanent`, `--base-trust F`, `--no-recursive`, `--quiet`
+
+## hexis init
+
+Full flags for the init wizard:
+
+```
+hexis init [--api-key KEY] [--provider PROVIDER] [--model MODEL]
+           [--character CHARACTER] [--name NAME]
+           [--no-docker] [--no-pull]
+           [--dsn DSN] [--wait-seconds N]
+```
+
+| Flag | Description |
+|------|-------------|
+| `--api-key` | API key (auto-detects provider; triggers non-interactive mode) |
+| `--provider` | LLM provider (auto-detected from key if omitted) |
+| `--model` | LLM model (defaults per provider) |
+| `--character` | Character card name (e.g., `hexis`, `jarvis`) |
+| `--name` | What the agent calls you (default: `User`) |
+| `--no-docker` | Skip Docker auto-start |
+| `--no-pull` | Skip Ollama model pull |
+
+## Related
+
+- [Quickstart](../start/quickstart.md) -- common init patterns
+- [Auth Providers](../integrations/auth/index.md) -- provider-specific auth
+- [Ingestion guide](../guides/ingestion.md) -- ingestion walkthrough

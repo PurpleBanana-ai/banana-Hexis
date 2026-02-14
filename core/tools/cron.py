@@ -64,7 +64,11 @@ def _cron_next_run(cron_expr: str, timezone: str = "UTC") -> str | None:
     return next_dt.astimezone(tz.utc).isoformat()
 
 
-def _parse_shorthand_schedule(schedule_str: str) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
+def _parse_shorthand_schedule(
+    schedule_str: str,
+    *,
+    timezone: str = "UTC",
+) -> tuple[str, dict[str, Any], dict[str, Any]] | None:
     """Parse human-friendly schedule shorthands into (schedule_kind, schedule, action_payload).
 
     Supported formats:
@@ -83,7 +87,7 @@ def _parse_shorthand_schedule(schedule_str: str) -> tuple[str, dict[str, Any], d
 
     # Check for standard cron expression first
     if _is_cron_expression(schedule_str):
-        next_run = _cron_next_run(schedule_str)
+        next_run = _cron_next_run(schedule_str, timezone)
         return ("cron", {"cron": schedule_str, "_next_run": next_run or ""}, {})
 
     if ":" not in schedule_str:
@@ -240,6 +244,10 @@ class ManageScheduleHandler(ToolHandler):
                         "type": "string",
                         "description": "Topic/thread ID for 'channel' delivery.",
                     },
+                    "delivery_target_id": {
+                        "type": "string",
+                        "description": "Target chat/user/channel ID for 'channel' delivery mode.",
+                    },
                     "delivery_webhook_url": {
                         "type": "string",
                         "description": "Webhook URL for 'webhook' delivery mode.",
@@ -302,7 +310,7 @@ class ManageScheduleHandler(ToolHandler):
 
         # Try shorthand first
         if schedule_str:
-            parsed = _parse_shorthand_schedule(schedule_str)
+            parsed = _parse_shorthand_schedule(schedule_str, timezone=timezone)
             if parsed:
                 schedule_kind = parsed[0]
                 schedule_json = parsed[1]
@@ -401,6 +409,16 @@ class ManageScheduleHandler(ToolHandler):
 
         # Build delivery JSONB
         delivery = self._build_delivery(args)
+        if delivery.get("mode") == "channel" and not delivery.get("target_id"):
+            return ToolResult.error_result(
+                "delivery_target_id is required when delivery_mode is 'channel'",
+                ToolErrorType.INVALID_PARAMS,
+            )
+        if delivery.get("mode") == "webhook" and not delivery.get("url"):
+            return ToolResult.error_result(
+                "delivery_webhook_url is required when delivery_mode is 'webhook'",
+                ToolErrorType.INVALID_PARAMS,
+            )
 
         try:
             async with pool.acquire() as conn:
@@ -498,14 +516,79 @@ class ManageScheduleHandler(ToolHandler):
         # Parse schedule if provided
         schedule_json = None
         if schedule_str:
-            parsed = _parse_shorthand_schedule(schedule_str)
+            effective_timezone = timezone
+            if not effective_timezone:
+                try:
+                    async with pool.acquire() as conn:
+                        effective_timezone = await conn.fetchval(
+                            "SELECT timezone FROM scheduled_tasks WHERE id = $1::uuid",
+                            task_id,
+                        ) or "UTC"
+                except Exception:
+                    effective_timezone = "UTC"
+
+            parsed = _parse_shorthand_schedule(schedule_str, timezone=effective_timezone)
             if parsed:
                 schedule_kind = schedule_kind or parsed[0]
-                schedule_json = json.dumps(parsed[1])
+                parsed_schedule = parsed[1]
+                if schedule_kind == "cron":
+                    cron_expr = parsed_schedule.get("cron", "")
+                    if not cron_expr:
+                        return ToolResult.error_result(
+                            "Cron expression is required for cron schedule_kind",
+                            ToolErrorType.INVALID_PARAMS,
+                        )
+                    try:
+                        from croniter import croniter
+                        croniter(cron_expr)
+                    except ImportError:
+                        return ToolResult.error_result(
+                            "croniter package is required for cron expressions (pip install croniter)",
+                            ToolErrorType.MISSING_DEPENDENCY,
+                        )
+                    except (ValueError, KeyError) as e:
+                        return ToolResult.error_result(
+                            f"Invalid cron expression '{cron_expr}': {e}",
+                            ToolErrorType.INVALID_PARAMS,
+                        )
+                    next_run = _cron_next_run(cron_expr, effective_timezone or "UTC")
+                    if next_run:
+                        parsed_schedule["_next_run"] = next_run
+                schedule_json = json.dumps(parsed_schedule)
             else:
                 try:
-                    json.loads(schedule_str)
-                    schedule_json = schedule_str
+                    schedule_obj = json.loads(schedule_str)
+                    if not isinstance(schedule_obj, dict):
+                        return ToolResult.error_result(
+                            "Schedule JSON must be an object.",
+                            ToolErrorType.INVALID_PARAMS,
+                        )
+                    effective_kind = schedule_kind or ""
+                    if effective_kind == "cron":
+                        cron_expr = schedule_obj.get("cron", "")
+                        if not cron_expr:
+                            return ToolResult.error_result(
+                                "Cron expression is required for cron schedule_kind",
+                                ToolErrorType.INVALID_PARAMS,
+                            )
+                        try:
+                            from croniter import croniter
+                            croniter(cron_expr)
+                        except ImportError:
+                            return ToolResult.error_result(
+                                "croniter package is required for cron expressions (pip install croniter)",
+                                ToolErrorType.MISSING_DEPENDENCY,
+                            )
+                        except (ValueError, KeyError) as e:
+                            return ToolResult.error_result(
+                                f"Invalid cron expression '{cron_expr}': {e}",
+                                ToolErrorType.INVALID_PARAMS,
+                            )
+                        tz_for_cron = effective_timezone or "UTC"
+                        next_run = _cron_next_run(cron_expr, tz_for_cron)
+                        if next_run:
+                            schedule_obj["_next_run"] = next_run
+                    schedule_json = json.dumps(schedule_obj)
                 except (json.JSONDecodeError, TypeError):
                     return ToolResult.error_result(f"Could not parse schedule: '{schedule_str}'")
 
@@ -520,8 +603,19 @@ class ManageScheduleHandler(ToolHandler):
 
         # Build delivery if any delivery params provided
         delivery_json = None
-        if any(args.get(k) for k in ("delivery_mode", "delivery_channel", "delivery_topic", "delivery_webhook_url")):
-            delivery_json = json.dumps(self._build_delivery(args))
+        if any(args.get(k) for k in ("delivery_mode", "delivery_channel", "delivery_topic", "delivery_target_id", "delivery_webhook_url")):
+            delivery = self._build_delivery(args)
+            if delivery.get("mode") == "channel" and not delivery.get("target_id"):
+                return ToolResult.error_result(
+                    "delivery_target_id is required when delivery_mode is 'channel'",
+                    ToolErrorType.INVALID_PARAMS,
+                )
+            if delivery.get("mode") == "webhook" and not delivery.get("url"):
+                return ToolResult.error_result(
+                    "delivery_webhook_url is required when delivery_mode is 'webhook'",
+                    ToolErrorType.INVALID_PARAMS,
+                )
+            delivery_json = json.dumps(delivery)
 
         try:
             async with pool.acquire() as conn:
@@ -601,6 +695,8 @@ class ManageScheduleHandler(ToolHandler):
         if mode == "channel":
             if args.get("delivery_channel"):
                 delivery["channel"] = args["delivery_channel"]
+            if args.get("delivery_target_id"):
+                delivery["target_id"] = args["delivery_target_id"]
             if args.get("delivery_topic"):
                 delivery["topic"] = args["delivery_topic"]
         elif mode == "webhook":

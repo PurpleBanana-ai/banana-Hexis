@@ -19,6 +19,7 @@ from .base import (
     ToolResult,
     ToolSpec,
 )
+from .api_keys import resolve_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -60,7 +61,12 @@ class ListHubSpotDealsHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-        token = self._api_key_resolver() if self._api_key_resolver else None
+        token = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="hubspot",
+            env_names=("HUBSPOT_API_KEY", "HUBSPOT_ACCESS_TOKEN"),
+        )
         if not token:
             return ToolResult.error_result(
                 "HubSpot API key not configured. Set HUBSPOT_API_KEY.",
@@ -143,7 +149,12 @@ class GetHubSpotDealHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-        token = self._api_key_resolver() if self._api_key_resolver else None
+        token = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="hubspot",
+            env_names=("HUBSPOT_API_KEY", "HUBSPOT_ACCESS_TOKEN"),
+        )
         if not token:
             return ToolResult.error_result(
                 "HubSpot API key not configured. Set HUBSPOT_API_KEY.",

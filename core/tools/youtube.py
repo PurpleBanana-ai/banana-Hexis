@@ -19,6 +19,7 @@ from .base import (
     ToolResult,
     ToolSpec,
 )
+from .api_keys import resolve_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,12 @@ class GetYouTubeChannelStatsHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-        api_key = self._api_key_resolver() if self._api_key_resolver else None
+        api_key = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="youtube",
+            env_names=("YOUTUBE_API_KEY",),
+        )
         if not api_key:
             return ToolResult.error_result(
                 "YouTube API key not configured. Set YOUTUBE_API_KEY.",
@@ -108,6 +114,97 @@ class GetYouTubeChannelStatsHandler(ToolHandler):
             return ToolResult.error_result(f"YouTube API error: {e}")
 
 
+class GetYouTubeVideoStatsHandler(ToolHandler):
+    """Get statistics for a specific YouTube video."""
+
+    def __init__(self, api_key_resolver: Callable[[], str | None] | None = None):
+        self._api_key_resolver = api_key_resolver
+
+    @property
+    def spec(self) -> ToolSpec:
+        return ToolSpec(
+            name="youtube_video_stats",
+            description="Get statistics and metadata for a YouTube video by video ID.",
+            parameters={
+                "type": "object",
+                "properties": {
+                    "video_id": {
+                        "type": "string",
+                        "description": "YouTube video ID (e.g. 'dQw4w9WgXcQ')",
+                    },
+                },
+                "required": ["video_id"],
+            },
+            category=ToolCategory.EXTERNAL,
+            energy_cost=1,
+            is_read_only=True,
+            optional=True,
+        )
+
+    async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
+        api_key = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="youtube",
+            env_names=("YOUTUBE_API_KEY",),
+        )
+        if not api_key:
+            return ToolResult.error_result(
+                "YouTube API key not configured. Set YOUTUBE_API_KEY.",
+                ToolErrorType.AUTH_FAILED,
+            )
+
+        try:
+            import httpx
+        except ImportError:
+            return ToolResult.error_result(
+                "httpx not installed. Run: pip install httpx",
+                ToolErrorType.MISSING_DEPENDENCY,
+            )
+
+        video_id = arguments["video_id"]
+        params = {
+            "key": api_key,
+            "id": video_id,
+            "part": "statistics,snippet,contentDetails",
+        }
+
+        try:
+            async with httpx.AsyncClient() as client:
+                resp = await client.get(
+                    f"{_BASE_URL}/youtube/v3/videos",
+                    params=params,
+                    timeout=15,
+                )
+                resp.raise_for_status()
+                data = resp.json()
+
+            items = data.get("items", [])
+            if not items:
+                return ToolResult.error_result(f"Video not found: {video_id}")
+
+            video = items[0]
+            snippet = video.get("snippet", {})
+            stats = video.get("statistics", {})
+            content_details = video.get("contentDetails", {})
+
+            return ToolResult.success_result(
+                {
+                    "video_id": video_id,
+                    "title": snippet.get("title"),
+                    "channel_title": snippet.get("channelTitle"),
+                    "published_at": snippet.get("publishedAt"),
+                    "duration": content_details.get("duration"),
+                    "view_count": stats.get("viewCount"),
+                    "like_count": stats.get("likeCount"),
+                    "comment_count": stats.get("commentCount"),
+                },
+                display_output=f"Video: {snippet.get('title', video_id)}",
+            )
+        except Exception as e:
+            return ToolResult.error_result(f"YouTube API error: {e}")
+
+
 class SearchYouTubeVideosHandler(ToolHandler):
     """Search for YouTube videos."""
 
@@ -144,7 +241,12 @@ class SearchYouTubeVideosHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-        api_key = self._api_key_resolver() if self._api_key_resolver else None
+        api_key = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="youtube",
+            env_names=("YOUTUBE_API_KEY",),
+        )
         if not api_key:
             return ToolResult.error_result(
                 "YouTube API key not configured. Set YOUTUBE_API_KEY.",
@@ -208,5 +310,6 @@ def create_youtube_tools(
     """Create YouTube Data API tools."""
     return [
         GetYouTubeChannelStatsHandler(api_key_resolver),
+        GetYouTubeVideoStatsHandler(api_key_resolver),
         SearchYouTubeVideosHandler(api_key_resolver),
     ]

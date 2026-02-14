@@ -19,6 +19,7 @@ from .base import (
     ToolResult,
     ToolSpec,
 )
+from .api_keys import resolve_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -78,7 +79,12 @@ class CreateAsanaTaskHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-        token = self._api_key_resolver() if self._api_key_resolver else None
+        token = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="asana",
+            env_names=("ASANA_ACCESS_TOKEN", "ASANA_API_KEY"),
+        )
         if not token:
             return ToolResult.error_result(
                 "Asana API key not configured. Set ASANA_ACCESS_TOKEN.",
@@ -151,7 +157,12 @@ class ListAsanaProjectsHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-        token = self._api_key_resolver() if self._api_key_resolver else None
+        token = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="asana",
+            env_names=("ASANA_ACCESS_TOKEN", "ASANA_API_KEY"),
+        )
         if not token:
             return ToolResult.error_result(
                 "Asana API key not configured.",

@@ -701,6 +701,83 @@ class TestOutboxConsumer:
 
         manager.send.assert_not_called()
 
+    async def test_delivery_channel_overrides_direct_target(self):
+        from channels.outbox import ChannelOutboxConsumer
+
+        pool = MagicMock()
+        mock_conn = AsyncMock()
+        pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+        pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+
+        manager = MagicMock()
+        manager.send = AsyncMock(return_value="sent-2")
+
+        consumer = ChannelOutboxConsumer(manager, pool)
+        body = {
+            "kind": "channel_message",
+            "payload": {
+                "content": "Scheduled update",
+                "delivery": {
+                    "mode": "channel",
+                    "channel": "telegram",
+                    "target_id": "chat-42",
+                    "topic": "cron-topic",
+                },
+            },
+        }
+
+        await consumer._process_message(body)
+        manager.send.assert_called_once_with("telegram", "chat-42", "Scheduled update", thread_id="cron-topic")
+
+    async def test_webhook_delivery_branch(self):
+        from channels.outbox import ChannelOutboxConsumer
+
+        manager = MagicMock()
+        manager.send = AsyncMock()
+        pool = MagicMock()
+        consumer = ChannelOutboxConsumer(manager, pool)
+        consumer._deliver_webhook = AsyncMock()
+
+        body = {
+            "kind": "channel_message",
+            "id": "outbox-1",
+            "payload": {
+                "content": "Webhook message",
+                "delivery": {"mode": "webhook", "url": "https://example.com/hook"},
+            },
+        }
+
+        await consumer._process_message(body)
+        consumer._deliver_webhook.assert_awaited_once()
+        manager.send.assert_not_called()
+
+    async def test_deliver_webhook_logs_success(self):
+        from channels.outbox import ChannelOutboxConsumer
+
+        manager = MagicMock()
+        pool = MagicMock()
+        consumer = ChannelOutboxConsumer(manager, pool)
+        consumer._log_delivery = AsyncMock()
+
+        class _Resp:
+            status_code = 200
+            text = "ok"
+
+        with patch("channels.outbox.requests.post", return_value=_Resp()) as mock_post:
+            await consumer._deliver_webhook(
+                "Hello webhook",
+                {"content": "Hello webhook"},
+                {"mode": "webhook", "url": "https://example.com/hook"},
+                "outbox-2",
+            )
+
+        mock_post.assert_called_once()
+        consumer._log_delivery.assert_awaited_once()
+        args = consumer._log_delivery.await_args.args
+        assert args[1] == "webhook"
+        assert args[2] == "https://example.com/hook"
+        assert args[6] is True
+
 
 # ============================================================================
 # Energy Check (DB integration)

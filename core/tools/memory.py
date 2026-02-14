@@ -154,22 +154,34 @@ class RecallHandler(ToolHandler):
         try:
             async with context.registry.pool.acquire() as conn:
                 type_filter = [t.value for t in memory_types] if memory_types else None
-                rows = await conn.fetch(
-                    """SELECT * FROM recall_memories_structured(
-                        $1, $2, $3::memory_type[], $4,
-                        $5, $6, $7, $8, $9, $10::jsonb
-                    )""",
-                    query,
-                    limit,
-                    type_filter,
-                    min_importance,
-                    source_path,
-                    source_kind,
-                    created_after,
-                    created_before,
-                    concept,
-                    None,  # metadata_filter
+                use_hybrid = bool(
+                    query
+                    and not any([memory_types_raw, source_path, source_kind, created_after_raw, created_before_raw, concept])
+                    and float(min_importance or 0.0) <= 0.0
                 )
+                if use_hybrid:
+                    rows = await conn.fetch(
+                        "SELECT * FROM recall_hybrid($1, $2)",
+                        query,
+                        limit,
+                    )
+                else:
+                    rows = await conn.fetch(
+                        """SELECT * FROM recall_memories_structured(
+                            $1, $2, $3::memory_type[], $4,
+                            $5, $6, $7, $8, $9, $10::jsonb
+                        )""",
+                        query,
+                        limit,
+                        type_filter,
+                        min_importance,
+                        source_path,
+                        source_kind,
+                        created_after,
+                        created_before,
+                        concept,
+                        None,  # metadata_filter
+                    )
 
                 memories = []
                 for row in rows:
@@ -180,6 +192,8 @@ class RecallHandler(ToolHandler):
                         "score": float(row["score"]) if row["score"] is not None else 0.0,
                         "importance": float(row["importance"]) if row["importance"] is not None else 0.0,
                     }
+                    if use_hybrid and row.get("source"):
+                        mem["retrieval_source"] = row["source"]
                     if row.get("source_attribution"):
                         sa = row["source_attribution"]
                         if isinstance(sa, str):

@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from unittest.mock import MagicMock
+from unittest.mock import AsyncMock, MagicMock, patch
 
 import pytest
 
@@ -49,16 +49,95 @@ class TestSearchTwitterSpec:
 
 
 class TestTwitterNoAuthRequired:
-    """Twitter uses FxTwitter which is free -- no auth failure expected."""
+    """Twitter fallback behavior is exercised without real network calls."""
+
+    @staticmethod
+    def _dummy_client():
+        class _DummyClient:
+            async def __aenter__(self):
+                return object()
+
+            async def __aexit__(self, exc_type, exc, tb):
+                return False
+
+        return _DummyClient()
 
     @pytest.mark.asyncio
-    async def test_search_no_key_still_attempts(self):
-        """FxTwitter doesn't require auth, so no AUTH_FAILED on missing key."""
-        handler = SearchTwitterHandler(api_key_resolver=None)
+    async def test_tier1_fxtwitter_success(self):
+        handler = SearchTwitterHandler()
         ctx = _make_context()
-        # Will fail with a network error (not AUTH_FAILED) since we can't reach FxTwitter
-        result = await handler.execute({"query": "test"}, ctx)
-        # Should NOT be AUTH_FAILED -- FxTwitter is free
+
+        handler._search_fxtwitter = AsyncMock(return_value=[{
+            "id": "1",
+            "text": "hello",
+            "author": "alice",
+            "created_at": "2026-01-01T00:00:00Z",
+            "metrics": {"likes": 1, "retweets": 0, "replies": 0},
+        }])
+
+        with patch("httpx.AsyncClient", return_value=self._dummy_client()):
+            result = await handler.execute({"query": "test"}, ctx)
+
+        assert result.success
+        assert result.output["provider"] == "fxtwitter"
+        assert result.output["tier"] == 1
+        assert result.error_type != ToolErrorType.AUTH_FAILED
+
+    @pytest.mark.asyncio
+    async def test_falls_back_to_twitterapi_io(self):
+        handler = SearchTwitterHandler()
+        ctx = _make_context()
+
+        handler._search_fxtwitter = AsyncMock(side_effect=RuntimeError("fx down"))
+        handler._search_twitterapi_io = AsyncMock(return_value=[{
+            "id": "2",
+            "text": "fallback",
+            "author": "bob",
+            "created_at": "2026-01-01T00:00:00Z",
+            "metrics": {"likes": 2, "retweets": 1, "replies": 0},
+        }])
+        handler._search_x_api = AsyncMock(return_value=[])
+        handler._search_xai = AsyncMock(return_value=[])
+
+        async def _resolve_key(_context, *, explicit_resolver=None, config_key=None, env_names=()):
+            if config_key == "twitterapi_io":
+                return "twapi-key"
+            return None
+
+        with (
+            patch("httpx.AsyncClient", return_value=self._dummy_client()),
+            patch("core.tools.twitter.resolve_api_key", side_effect=_resolve_key),
+        ):
+            result = await handler.execute({"query": "test"}, ctx)
+
+        assert result.success
+        assert result.output["provider"] == "twitterapi_io"
+        assert result.output["tier"] == 2
+        handler._search_twitterapi_io.assert_awaited_once()
+        handler._search_x_api.assert_not_called()
+        handler._search_xai.assert_not_called()
+
+    @pytest.mark.asyncio
+    async def test_all_tiers_fail_returns_error(self):
+        handler = SearchTwitterHandler()
+        ctx = _make_context()
+
+        handler._search_fxtwitter = AsyncMock(side_effect=RuntimeError("fx down"))
+        handler._search_twitterapi_io = AsyncMock(return_value=[])
+        handler._search_x_api = AsyncMock(return_value=[])
+        handler._search_xai = AsyncMock(return_value=[])
+
+        async def _resolve_none(_context, *, explicit_resolver=None, config_key=None, env_names=()):
+            return None
+
+        with (
+            patch("httpx.AsyncClient", return_value=self._dummy_client()),
+            patch("core.tools.twitter.resolve_api_key", side_effect=_resolve_none),
+        ):
+            result = await handler.execute({"query": "test"}, ctx)
+
+        assert not result.success
+        assert "all tiers" in (result.error or "").lower()
         assert result.error_type != ToolErrorType.AUTH_FAILED
 
 

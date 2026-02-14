@@ -154,6 +154,10 @@ class TestRunCouncilSpec:
         handler = RunCouncilHandler()
         assert "topic" in handler.spec.parameters["required"]
 
+    def test_spec_has_signal_limit(self):
+        handler = RunCouncilHandler()
+        assert "signal_limit" in handler.spec.parameters["properties"]
+
 
 class TestRunCouncilExecution:
     """Verify run_council execution."""
@@ -270,6 +274,51 @@ class TestRunCouncilExecution:
         data = json.loads(result.output)
         assert "instructions" in data
         assert len(data["instructions"]) > 0
+
+    async def test_outputs_analysis_and_moderator_report(self):
+        handler = RunCouncilHandler()
+        ctx = _make_context()
+        result = await handler.execute({"topic": "Expansion plan"}, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        assert isinstance(data.get("moderator_report"), str)
+        assert data["moderator_report"]
+        for entry in data["council"]:
+            assert "analysis" in entry
+            assert isinstance(entry["analysis"], str)
+
+    async def test_collects_signals_when_db_available(self):
+        handler = RunCouncilHandler()
+        mock_conn = AsyncMock()
+
+        async def _fetch_side_effect(query: str, *_args):
+            if "FROM gateway_events" in query:
+                return [{"source": "chat", "payload": {"message": "hello", "intent": "plan"}}]
+            if "WHERE type = 'episodic'" in query:
+                return [{"content": "User asked for a launch plan"}]
+            if "WHERE type = 'goal'" in query:
+                return [{"content": "Increase retention this quarter"}]
+            return []
+
+        mock_conn.fetch = AsyncMock(side_effect=_fetch_side_effect)
+        mock_pool = MagicMock()
+        mock_pool.acquire.return_value.__aenter__ = AsyncMock(return_value=mock_conn)
+        mock_pool.acquire.return_value.__aexit__ = AsyncMock(return_value=False)
+        ctx = _make_context(pool=mock_pool)
+        handler._load_llm_config = AsyncMock(return_value=None)
+
+        result = await handler.execute({
+            "topic": "Priorities",
+            "personas": ["growth_strategist"],
+            "signal_limit": 5,
+        }, ctx)
+
+        assert result.success
+        data = json.loads(result.output)
+        assert data["signals"]
+        assert data["signals"][0].startswith("Event[")
+        assert data["persona_count"] == 1
 
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,179 @@
+<!--
+title: Troubleshooting
+summary: Symptom-based diagnosis and fixes for common Hexis issues
+read_when:
+  - "Something isn't working"
+  - "You're getting an error"
+section: operations
+-->
+
+# Troubleshooting
+
+Diagnose and fix common Hexis issues.
+
+## Diagnostic Ladder
+
+Run these commands in order to identify the problem:
+
+```bash
+hexis doctor                     # 1. Overall health check
+hexis status                     # 2. Agent status
+docker compose ps                # 3. Container status
+docker compose logs db           # 4. Database logs
+docker compose logs heartbeat_worker   # 5. Worker logs
+```
+
+## Decision Tree
+
+```
+Problem?
+├── Can't start Hexis
+│   ├── Docker not running → Start Docker Desktop
+│   ├── Port conflict → Change POSTGRES_PORT in .env
+│   └── Ollama not running → Start Ollama
+│
+├── Database connection errors
+│   ├── Container not running → docker compose up -d
+│   ├── Wrong port → Check POSTGRES_PORT in .env
+│   └── Extensions missing → hexis reset
+│
+├── Heartbeat not running
+│   ├── Not configured → hexis init
+│   ├── Paused → Check heartbeat_state.is_paused
+│   ├── Workers not started → hexis up --profile active
+│   └── No energy → Wait for regeneration
+│
+├── Memory search returns nothing
+│   ├── Ollama not running → Start Ollama, pull model
+│   ├── Wrong dimension → hexis reset after fixing EMBEDDING_DIMENSION
+│   └── No memories stored → Ingest content first
+│
+├── Schema changes not taking effect
+│   └── SQL baked into image → docker compose down -v && docker compose build db && docker compose up -d
+│
+└── Auth issues
+    ├── Provider not configured → hexis auth <provider> login
+    ├── Credentials expired → Re-run login
+    └── Callback won't bind → Use --manual flag
+```
+
+## Common Issues
+
+### Database Connection Errors
+
+**Symptoms**: `connection refused`, `could not connect to server`
+
+```bash
+# Check container status
+docker compose ps
+
+# Check logs
+docker compose logs db
+
+# Verify port
+docker exec hexis_brain psql -U hexis_user -d hexis_memory -c "SELECT 1"
+```
+
+**Fixes**:
+- Start the container: `docker compose up -d`
+- Check port conflicts: change `POSTGRES_PORT` in `.env`
+- Verify extensions: `hexis doctor`
+
+### Heartbeat Not Running
+
+**Symptoms**: `hexis status` shows no recent heartbeats
+
+```bash
+# Check if configured
+hexis status    # look for "is_configured: true"
+
+# Check if paused
+docker exec hexis_brain psql -U hexis_user -d hexis_memory \
+  -c "SELECT is_paused FROM heartbeat_state WHERE id = 1"
+
+# Check worker status
+docker compose ps | grep heartbeat
+```
+
+**Fixes**:
+- Run `hexis init` if not configured
+- Unpause: `UPDATE heartbeat_state SET is_paused = FALSE WHERE id = 1`
+- Start workers: `docker compose --profile active up -d`
+
+### Memory Search Returns Nothing
+
+**Symptoms**: `hexis recall` returns no results
+
+```bash
+# Check embedding service
+hexis doctor
+
+# Check if Ollama has the model
+ollama list
+
+# Check memory count
+docker exec hexis_brain psql -U hexis_user -d hexis_memory \
+  -c "SELECT type, count(*) FROM memories WHERE status='active' GROUP BY type"
+```
+
+**Fixes**:
+- Start Ollama: `ollama serve`
+- Pull model: `ollama pull embeddinggemma:300m-qat-q4_0`
+- Ingest content: `hexis ingest --file ./notes.md`
+
+### Schema Changes Not Taking Effect
+
+**Symptoms**: New SQL functions or columns are missing after editing `db/*.sql`
+
+SQL files are baked into the Docker image at build time. Editing on disk does nothing to the running container.
+
+**Fix**:
+
+```bash
+docker compose down -v && docker compose build db && docker compose up -d
+```
+
+This destroys all data. Export first if needed.
+
+### Memory Search Performance
+
+**Symptoms**: Slow recall queries
+
+```bash
+# Check memory health
+docker exec hexis_brain psql -U hexis_user -d hexis_memory \
+  -c "SELECT * FROM memory_health"
+```
+
+**Fixes**:
+- Ensure maintenance worker is running (recomputes neighborhoods)
+- Check HNSW index status
+- Consider memory pruning for very large datasets
+
+### Auth Provider Issues
+
+**"Provider X is not configured"** -- Run `hexis auth <provider> login`
+
+**"Credentials expired"** -- Re-run `hexis auth <provider> login`
+
+**"Callback server won't bind"** -- Use `--manual` to paste the redirect URL
+
+**`hexis doctor` shows auth warnings** -- Run `hexis auth <provider> status` to check health
+
+### Test Failures
+
+```bash
+# Ensure services are up
+hexis up
+hexis doctor
+
+# Run with explicit host (avoids SSL flakes)
+POSTGRES_HOST=127.0.0.1 pytest tests -q
+```
+
+## Related
+
+- [Docker Compose](docker-compose.md) -- profiles and services
+- [Workers](workers.md) -- worker lifecycle
+- [Database](database.md) -- schema management
+- [Embeddings](embeddings.md) -- embedding service configuration

@@ -145,6 +145,7 @@ class TestManageScheduleSpec:
         assert "delivery_mode" in props
         assert "delivery_channel" in props
         assert "delivery_topic" in props
+        assert "delivery_target_id" in props
         assert "delivery_webhook_url" in props
 
     def test_spec_delivery_modes(self):
@@ -169,10 +170,12 @@ class TestBuildDelivery:
         delivery = ManageScheduleHandler._build_delivery({
             "delivery_mode": "channel",
             "delivery_channel": "telegram",
+            "delivery_target_id": "chat-123",
             "delivery_topic": "cron-updates",
         })
         assert delivery["mode"] == "channel"
         assert delivery["channel"] == "telegram"
+        assert delivery["target_id"] == "chat-123"
         assert delivery["topic"] == "cron-updates"
 
     def test_webhook_delivery(self):
@@ -215,6 +218,7 @@ class TestCreateWithCron:
             "message": "Time for standup!",
             "delivery_mode": "channel",
             "delivery_channel": "telegram",
+            "delivery_target_id": "12345",
             "delivery_topic": "reminders",
         }, ctx)
 
@@ -222,6 +226,7 @@ class TestCreateWithCron:
         assert result.output["schedule_kind"] == "cron"
         assert result.output["delivery"]["mode"] == "channel"
         assert result.output["delivery"]["channel"] == "telegram"
+        assert result.output["delivery"]["target_id"] == "12345"
 
     @pytest.mark.asyncio
     async def test_invalid_cron_expression(self):
@@ -327,6 +332,58 @@ class TestStatsAction:
         }, ctx)
 
         assert not result.success
+
+
+class TestDeliveryValidation:
+    @pytest.mark.asyncio
+    async def test_create_channel_requires_target_id(self):
+        handler = ManageScheduleHandler()
+        ctx = _make_context()
+
+        result = await handler.execute({
+            "action": "create",
+            "name": "Missing target",
+            "schedule": "daily:09:00",
+            "action_kind": "queue_user_message",
+            "message": "Ping",
+            "delivery_mode": "channel",
+            "delivery_channel": "telegram",
+        }, ctx)
+
+        assert not result.success
+        assert "delivery_target_id" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_create_webhook_requires_url(self):
+        handler = ManageScheduleHandler()
+        ctx = _make_context()
+
+        result = await handler.execute({
+            "action": "create",
+            "name": "Missing webhook",
+            "schedule": "daily:09:00",
+            "action_kind": "queue_user_message",
+            "message": "Ping",
+            "delivery_mode": "webhook",
+        }, ctx)
+
+        assert not result.success
+        assert "delivery_webhook_url" in (result.error or "")
+
+    @pytest.mark.asyncio
+    async def test_update_channel_requires_target_id(self):
+        handler = ManageScheduleHandler()
+        ctx = _make_context()
+
+        result = await handler.execute({
+            "action": "update",
+            "task_id": "00000000-0000-0000-0000-000000000001",
+            "delivery_mode": "channel",
+            "delivery_channel": "telegram",
+        }, ctx)
+
+        assert not result.success
+        assert "delivery_target_id" in (result.error or "")
 
 
 # ---------------------------------------------------------------------------

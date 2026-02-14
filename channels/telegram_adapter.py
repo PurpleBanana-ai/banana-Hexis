@@ -342,7 +342,9 @@ class TelegramAdapter(ChannelAdapter):
 
             if mime.startswith("image/"):
                 # Send as photo
-                if attachment.url:
+                if attachment.local_path:
+                    kwargs["photo"] = attachment.local_path
+                elif attachment.url:
                     kwargs["photo"] = attachment.url
                 elif attachment.platform_id:
                     kwargs["photo"] = attachment.platform_id
@@ -350,7 +352,9 @@ class TelegramAdapter(ChannelAdapter):
                     return None
                 sent = await self._application.bot.send_photo(**kwargs)
             elif mime.startswith("video/"):
-                if attachment.url:
+                if attachment.local_path:
+                    kwargs["video"] = attachment.local_path
+                elif attachment.url:
                     kwargs["video"] = attachment.url
                 elif attachment.platform_id:
                     kwargs["video"] = attachment.platform_id
@@ -358,7 +362,9 @@ class TelegramAdapter(ChannelAdapter):
                     return None
                 sent = await self._application.bot.send_video(**kwargs)
             elif mime.startswith("audio/"):
-                if attachment.url:
+                if attachment.local_path:
+                    kwargs["audio"] = attachment.local_path
+                elif attachment.url:
                     kwargs["audio"] = attachment.url
                 elif attachment.platform_id:
                     kwargs["audio"] = attachment.platform_id
@@ -367,7 +373,9 @@ class TelegramAdapter(ChannelAdapter):
                 sent = await self._application.bot.send_audio(**kwargs)
             else:
                 # Send as document
-                if attachment.url:
+                if attachment.local_path:
+                    kwargs["document"] = attachment.local_path
+                elif attachment.url:
                     kwargs["document"] = attachment.url
                 elif attachment.platform_id:
                     kwargs["document"] = attachment.platform_id
@@ -379,35 +387,4 @@ class TelegramAdapter(ChannelAdapter):
 
         except Exception:
             logger.exception("Failed to send media to Telegram %s", channel_id)
-            return None
-
-    async def send_media(
-        self,
-        channel_id: str,
-        attachment: Attachment,
-        caption: str | None = None,
-        *,
-        reply_to: str | None = None,
-    ) -> str | None:
-        if not self._application or not self._application.bot:
-            return None
-        try:
-            kwargs: dict[str, Any] = {"chat_id": int(channel_id)}
-            if caption:
-                kwargs["caption"] = caption
-            if reply_to:
-                kwargs["reply_to_message_id"] = int(reply_to)
-
-            source = attachment.local_path or attachment.url
-            if not source:
-                return None
-
-            is_image = attachment.mime_type and attachment.mime_type.startswith("image/")
-            if is_image:
-                sent = await self._application.bot.send_photo(photo=source, **kwargs)
-            else:
-                sent = await self._application.bot.send_document(document=source, **kwargs)
-            return str(sent.message_id)
-        except Exception:
-            logger.exception("Failed to send Telegram media to %s", channel_id)
             return None

@@ -20,6 +20,7 @@ from .base import (
     ToolResult,
     ToolSpec,
 )
+from .api_keys import resolve_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -82,7 +83,12 @@ class CreateTodoistTaskHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-        token = self._api_key_resolver() if self._api_key_resolver else None
+        token = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="todoist",
+            env_names=("TODOIST_API_KEY",),
+        )
         if not token:
             return ToolResult.error_result(
                 "Todoist API key not configured. Set TODOIST_API_KEY.",
@@ -162,7 +168,12 @@ class ListTodoistTasksHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-        token = self._api_key_resolver() if self._api_key_resolver else None
+        token = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="todoist",
+            env_names=("TODOIST_API_KEY",),
+        )
         if not token:
             return ToolResult.error_result(
                 "Todoist API key not configured.",
@@ -241,7 +252,12 @@ class CompleteTodoistTaskHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-        token = self._api_key_resolver() if self._api_key_resolver else None
+        token = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="todoist",
+            env_names=("TODOIST_API_KEY",),
+        )
         if not token:
             return ToolResult.error_result(
                 "Todoist API key not configured.",

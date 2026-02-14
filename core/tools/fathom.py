@@ -20,6 +20,7 @@ from .base import (
     ToolResult,
     ToolSpec,
 )
+from .api_keys import resolve_api_key
 
 if TYPE_CHECKING:
     import asyncpg
@@ -72,7 +73,12 @@ class FetchFathomTranscriptsHandler(ToolHandler):
     async def execute(
         self, arguments: dict[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
-        token = self._api_key_resolver() if self._api_key_resolver else None
+        token = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="fathom",
+            env_names=("FATHOM_API_KEY",),
+        )
         if not token:
             return ToolResult.error_result(
                 "Fathom API key not configured. Set FATHOM_API_KEY.",
@@ -164,7 +170,12 @@ class IngestFathomTranscriptHandler(ToolHandler):
     async def execute(
         self, arguments: dict[str, Any], context: ToolExecutionContext
     ) -> ToolResult:
-        token = self._api_key_resolver() if self._api_key_resolver else None
+        token = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="fathom",
+            env_names=("FATHOM_API_KEY",),
+        )
         if not token:
             return ToolResult.error_result(
                 "Fathom API key not configured. Set FATHOM_API_KEY.",

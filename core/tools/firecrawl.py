@@ -19,6 +19,7 @@ from .base import (
     ToolResult,
     ToolSpec,
 )
+from .api_keys import resolve_api_key
 
 logger = logging.getLogger(__name__)
 
@@ -62,7 +63,12 @@ class FirecrawlScrapeHandler(ToolHandler):
         )
 
     async def execute(self, arguments: dict[str, Any], context: ToolExecutionContext) -> ToolResult:
-        token = self._api_key_resolver() if self._api_key_resolver else None
+        token = await resolve_api_key(
+            context,
+            explicit_resolver=self._api_key_resolver,
+            config_key="firecrawl",
+            env_names=("FIRECRAWL_API_KEY",),
+        )
         if not token:
             return ToolResult.error_result(
                 "Firecrawl API key not configured. Set FIRECRAWL_API_KEY.",

@@ -12,8 +12,10 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import os
 import time
 import uuid
+import json
 from dataclasses import dataclass, field
 from typing import Any, TYPE_CHECKING
 
@@ -591,6 +593,27 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     from .humanizer import create_humanizer_tools
     from .hooks import AuditTrailHook
 
+    def _env_resolver(*names: str):
+        def _resolve() -> str | None:
+            for name in names:
+                value = os.getenv(name)
+                if value:
+                    return value
+            return None
+        return _resolve
+
+    def _json_env_resolver(*names: str):
+        def _resolve() -> dict[str, Any] | None:
+            raw = _env_resolver(*names)()
+            if not raw:
+                return None
+            try:
+                parsed = json.loads(raw)
+                return parsed if isinstance(parsed, dict) else None
+            except Exception:
+                return None
+        return _resolve
+
     builder = ToolRegistryBuilder(pool)
     builder.add_all(create_memory_tools())
     builder.add_all(create_web_tools())
@@ -598,8 +621,15 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     builder.add_all(create_shell_tools())
     builder.add_all(create_code_execution_tools())
     builder.add_all(create_browser_tools())
-    builder.add_all(create_calendar_tools())
-    builder.add_all(create_email_tools())
+    builder.add_all(create_calendar_tools(
+        credentials_resolver=_json_env_resolver("GOOGLE_CALENDAR_CREDENTIALS", "GOOGLE_GMAIL_CREDENTIALS"),
+    ))
+    builder.add_all(create_email_tools(
+        smtp_config_resolver=_json_env_resolver("EMAIL_CONFIG"),
+        sendgrid_api_key_resolver=_env_resolver("SENDGRID_API_KEY"),
+        sendgrid_from_email=os.getenv("SENDGRID_FROM_EMAIL"),
+        gmail_credentials_resolver=_json_env_resolver("GOOGLE_GMAIL_CREDENTIALS", "GOOGLE_CALENDAR_CREDENTIALS"),
+    ))
     builder.add_all(create_messaging_tools())
     builder.add_all(create_ingest_tools())
     builder.add_all(create_workflow_tools())
@@ -610,16 +640,34 @@ def create_default_registry(pool: "asyncpg.Pool") -> ToolRegistry:
     builder.add_all(create_session_tools())
     builder.add_all(create_contact_tools())
     builder.add_all(create_image_gen_tools())
-    builder.add_all(create_todoist_tools())
-    builder.add_all(create_asana_tools())
+    builder.add_all(create_todoist_tools(
+        api_key_resolver=_env_resolver("TODOIST_API_KEY"),
+    ))
+    builder.add_all(create_asana_tools(
+        api_key_resolver=_env_resolver("ASANA_ACCESS_TOKEN", "ASANA_API_KEY"),
+    ))
     builder.add_all(create_usage_tools())
-    builder.add_all(create_hubspot_tools())
-    builder.add_all(create_youtube_tools())
-    builder.add_all(create_twitter_tools())
-    builder.add_all(create_brave_search_tools())
-    builder.add_all(create_firecrawl_tools())
-    builder.add_all(create_fathom_tools())
-    builder.add_all(create_video_gen_tools())
+    builder.add_all(create_hubspot_tools(
+        api_key_resolver=_env_resolver("HUBSPOT_API_KEY", "HUBSPOT_ACCESS_TOKEN"),
+    ))
+    builder.add_all(create_youtube_tools(
+        api_key_resolver=_env_resolver("YOUTUBE_API_KEY"),
+    ))
+    builder.add_all(create_twitter_tools(
+        api_key_resolver=_env_resolver("XAI_API_KEY"),
+    ))
+    builder.add_all(create_brave_search_tools(
+        api_key_resolver=_env_resolver("BRAVE_SEARCH_API_KEY"),
+    ))
+    builder.add_all(create_firecrawl_tools(
+        api_key_resolver=_env_resolver("FIRECRAWL_API_KEY"),
+    ))
+    builder.add_all(create_fathom_tools(
+        api_key_resolver=_env_resolver("FATHOM_API_KEY"),
+    ))
+    builder.add_all(create_video_gen_tools(
+        api_key_resolver=_env_resolver("RUNWAY_API_KEY"),
+    ))
     builder.add_all(create_council_tools())
     builder.add_all(create_backup_tools())
     builder.add_all(create_humanizer_tools())

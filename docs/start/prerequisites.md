@@ -1,0 +1,64 @@
+<!--
+title: Prerequisites
+summary: Software requirements for running Hexis
+read_when:
+  - "You want to know what to install before Hexis"
+  - "You're troubleshooting a missing dependency"
+section: start
+-->
+
+# Prerequisites
+
+What you need before installing Hexis.
+
+## Required
+
+| Dependency | Version | Purpose |
+|------------|---------|---------|
+| [Docker Desktop](https://docs.docker.com/get-docker/) | 20.10+ | Runs PostgreSQL (the agent's brain) |
+| [Ollama](https://ollama.com/download) | Latest | Generates embeddings for memory storage |
+| Python | 3.10+ | Runs the Hexis CLI and workers |
+
+## Verify Installation
+
+```bash
+docker --version          # Docker version 20.10+
+docker compose version    # Docker Compose v2+
+ollama --version          # ollama version 0.x.x
+python3 --version         # Python 3.10+
+```
+
+## LLM Provider
+
+You need access to at least one LLM provider. Hexis supports:
+
+| Provider | Auth Type | Cost |
+|----------|-----------|------|
+| ChatGPT (Codex OAuth) | Browser OAuth | ChatGPT Plus/Pro subscription |
+| GitHub Copilot | Device code | Copilot subscription |
+| Chutes | Browser OAuth | Free |
+| Google Gemini CLI | Browser OAuth | Free tier available |
+| Qwen Portal | Device code | Free tier available |
+| MiniMax Portal | User code | Free tier available |
+| OpenAI Platform | API key | Pay-per-use |
+| Anthropic | API key or setup token | Pay-per-use or Claude subscription |
+| Ollama | None (local) | Free (runs on your hardware) |
+| Any OpenAI-compatible endpoint | API key | Varies |
+
+See [Auth Providers](../integrations/auth/index.md) for setup details on each provider.
+
+## Optional
+
+| Dependency | Purpose |
+|------------|---------|
+| [Node.js / Bun](https://bun.sh/) | Running the web UI from source |
+| [RabbitMQ](https://www.rabbitmq.com/) | Included in Docker stack; only needed if running externally |
+| Git | Cloning the repo for source development |
+
+## Platform Support
+
+Hexis runs on macOS, Linux, and Windows (via WSL2). Docker Desktop handles the PostgreSQL container across all platforms.
+
+## Next Steps
+
+- [Installation](installation.md) -- install Hexis via pip or from source

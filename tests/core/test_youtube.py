@@ -9,6 +9,7 @@ import pytest
 from core.tools.base import ToolCategory, ToolContext, ToolErrorType, ToolExecutionContext
 from core.tools.youtube import (
     GetYouTubeChannelStatsHandler,
+    GetYouTubeVideoStatsHandler,
     SearchYouTubeVideosHandler,
     create_youtube_tools,
 )
@@ -63,6 +64,20 @@ class TestSearchYouTubeVideosSpec:
         assert "order" in props
 
 
+class TestGetYouTubeVideoStatsSpec:
+    def test_spec_name(self):
+        assert GetYouTubeVideoStatsHandler().spec.name == "youtube_video_stats"
+
+    def test_spec_category(self):
+        assert GetYouTubeVideoStatsHandler().spec.category == ToolCategory.EXTERNAL
+
+    def test_spec_read_only(self):
+        assert GetYouTubeVideoStatsHandler().spec.is_read_only is True
+
+    def test_spec_required_params(self):
+        assert "video_id" in GetYouTubeVideoStatsHandler().spec.parameters["required"]
+
+
 class TestYouTubeAuthFailure:
     @pytest.mark.asyncio
     async def test_channel_stats_no_key(self):
@@ -88,15 +103,23 @@ class TestYouTubeAuthFailure:
         assert not result.success
         assert result.error_type == ToolErrorType.AUTH_FAILED
 
+    @pytest.mark.asyncio
+    async def test_video_stats_no_key(self):
+        handler = GetYouTubeVideoStatsHandler(api_key_resolver=None)
+        ctx = _make_context()
+        result = await handler.execute({"video_id": "dQw4w9WgXcQ"}, ctx)
+        assert not result.success
+        assert result.error_type == ToolErrorType.AUTH_FAILED
+
 
 class TestYouTubeFactory:
     def test_factory_count(self):
         tools = create_youtube_tools()
-        assert len(tools) == 2
+        assert len(tools) == 3
 
     def test_factory_names(self):
         names = {t.spec.name for t in create_youtube_tools()}
-        assert names == {"youtube_channel_stats", "youtube_search"}
+        assert names == {"youtube_channel_stats", "youtube_video_stats", "youtube_search"}
 
     def test_factory_passes_resolver(self):
         resolver = lambda: "test-key"

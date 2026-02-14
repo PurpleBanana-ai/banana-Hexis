@@ -1,8 +1,10 @@
-"""
-Hexis Tools System - Twitter/X Research (E.6)
+"""Hexis Tools System - Twitter/X Research (E.6).
 
-Tool for searching tweets using the free FxTwitter API.
-Falls back to a helpful error message if the API is unavailable.
+Implements a multi-tier fallback strategy:
+1) FxTwitter (free, unauthenticated)
+2) TwitterAPI.io (if key configured)
+3) Official X API v2 (if bearer token configured)
+4) xAI Search endpoint (best-effort fallback, if key configured)
 """
 
 from __future__ import annotations
@@ -19,14 +21,41 @@ from .base import (
     ToolResult,
     ToolSpec,
 )
+from .api_keys import resolve_api_key
 
 logger = logging.getLogger(__name__)
 
 _FXTWITTER_BASE = "https://api.fxtwitter.com"
+_TWITTERAPI_IO_BASE = "https://api.twitterapi.io"
+_X_API_BASE = "https://api.twitter.com/2"
+_XAI_SEARCH_BASE = "https://api.x.ai/v1"
+
+
+def _tweet_dict(
+    *,
+    tweet_id: str | None,
+    text: str,
+    author: str,
+    created_at: str | None,
+    likes: int = 0,
+    retweets: int = 0,
+    replies: int = 0,
+) -> dict[str, Any]:
+    return {
+        "id": tweet_id,
+        "text": text,
+        "author": author,
+        "created_at": created_at,
+        "metrics": {
+            "likes": likes,
+            "retweets": retweets,
+            "replies": replies,
+        },
+    }
 
 
 class SearchTwitterHandler(ToolHandler):
-    """Search tweets using the free FxTwitter API."""
+    """Search tweets with multi-tier provider fallback."""
 
     def __init__(self, api_key_resolver: Callable[[], str | None] | None = None):
         # Kept for interface consistency; FxTwitter is free/unauthenticated
@@ -38,7 +67,8 @@ class SearchTwitterHandler(ToolHandler):
             name="twitter_search",
             description=(
                 "Search Twitter/X for recent tweets matching a query. "
-                "Uses the free FxTwitter API (no API key required)."
+                "Uses automatic fallback across FxTwitter, TwitterAPI.io, and "
+                "official X API when keys are available."
             ),
             parameters={
                 "type": "object",
@@ -70,44 +100,225 @@ class SearchTwitterHandler(ToolHandler):
             )
 
         query = arguments["query"]
-        max_results = arguments.get("max_results", 10)
+        max_results = max(1, min(arguments.get("max_results", 10), 100))
+        attempts: list[str] = []
 
-        try:
-            async with httpx.AsyncClient() as client:
-                resp = await client.get(
-                    f"{_FXTWITTER_BASE}/search",
-                    params={"query": query},
-                    timeout=15,
-                )
-                resp.raise_for_status()
-                data = resp.json()
+        async with httpx.AsyncClient() as client:
+            # Tier 1: FxTwitter (free)
+            try:
+                tweets = await self._search_fxtwitter(client, query, max_results)
+                if tweets:
+                    return ToolResult.success_result(
+                        {"tweets": tweets, "count": len(tweets), "provider": "fxtwitter", "tier": 1},
+                        display_output=f"Found {len(tweets)} tweet(s) for '{query}' (FxTwitter)",
+                    )
+                attempts.append("FxTwitter: no results")
+            except Exception as e:
+                logger.warning("FxTwitter search failed: %s", e)
+                attempts.append(f"FxTwitter: {e}")
 
-            tweets_raw = data.get("tweets", data.get("results", []))
-            tweets = []
-            for t in tweets_raw[:max_results]:
-                author = t.get("author", {})
-                tweets.append({
-                    "id": t.get("id"),
-                    "text": t.get("text", ""),
-                    "author": author.get("screen_name") or author.get("name", "unknown"),
-                    "created_at": t.get("created_at"),
-                    "metrics": {
-                        "likes": t.get("likes", 0),
-                        "retweets": t.get("retweets", 0),
-                        "replies": t.get("replies", 0),
-                    },
-                })
-
-            return ToolResult.success_result(
-                {"tweets": tweets, "count": len(tweets)},
-                display_output=f"Found {len(tweets)} tweet(s) for '{query}'",
+            # Tier 2: TwitterAPI.io
+            twitterapi_key = await resolve_api_key(
+                context,
+                config_key="twitterapi_io",
+                env_names=("TWITTERAPI_IO_API_KEY",),
             )
-        except Exception as e:
-            logger.warning("FxTwitter search failed: %s", e)
-            return ToolResult.error_result(
-                f"Twitter search unavailable. Try searching manually at "
-                f"https://x.com/search?q={query} -- Error: {e}"
+            if twitterapi_key:
+                try:
+                    tweets = await self._search_twitterapi_io(
+                        client, query, max_results, twitterapi_key,
+                    )
+                    if tweets:
+                        return ToolResult.success_result(
+                            {
+                                "tweets": tweets,
+                                "count": len(tweets),
+                                "provider": "twitterapi_io",
+                                "tier": 2,
+                            },
+                            display_output=f"Found {len(tweets)} tweet(s) for '{query}' (TwitterAPI.io)",
+                        )
+                    attempts.append("TwitterAPI.io: no results")
+                except Exception as e:
+                    attempts.append(f"TwitterAPI.io: {e}")
+            else:
+                attempts.append("TwitterAPI.io: skipped (no API key)")
+
+            # Tier 3: Official X API v2
+            x_bearer = await resolve_api_key(
+                context,
+                config_key="x_api_bearer",
+                env_names=("X_API_BEARER_TOKEN", "TWITTER_BEARER_TOKEN"),
             )
+            if x_bearer:
+                try:
+                    tweets = await self._search_x_api(client, query, max_results, x_bearer)
+                    if tweets:
+                        return ToolResult.success_result(
+                            {"tweets": tweets, "count": len(tweets), "provider": "x_api_v2", "tier": 3},
+                            display_output=f"Found {len(tweets)} tweet(s) for '{query}' (X API v2)",
+                        )
+                    attempts.append("X API v2: no results")
+                except Exception as e:
+                    attempts.append(f"X API v2: {e}")
+            else:
+                attempts.append("X API v2: skipped (no bearer token)")
+
+            # Tier 4: xAI Search fallback (best-effort)
+            xai_key = await resolve_api_key(
+                context,
+                explicit_resolver=self._api_key_resolver,
+                config_key="xai",
+                env_names=("XAI_API_KEY",),
+            )
+            if xai_key:
+                try:
+                    tweets = await self._search_xai(client, query, max_results, xai_key)
+                    if tweets:
+                        return ToolResult.success_result(
+                            {"tweets": tweets, "count": len(tweets), "provider": "xai_search", "tier": 4},
+                            display_output=f"Found {len(tweets)} tweet(s) for '{query}' (xAI search)",
+                        )
+                    attempts.append("xAI search: no results")
+                except Exception as e:
+                    attempts.append(f"xAI search: {e}")
+            else:
+                attempts.append("xAI search: skipped (no API key)")
+
+        return ToolResult.error_result(
+            "Twitter search unavailable across all tiers. "
+            f"Try manual search at https://x.com/search?q={query}. "
+            f"Attempts: {' | '.join(attempts)}",
+        )
+
+    async def _search_fxtwitter(self, client: Any, query: str, max_results: int) -> list[dict[str, Any]]:
+        resp = await client.get(
+            f"{_FXTWITTER_BASE}/search",
+            params={"query": query},
+            timeout=15,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        tweets_raw = data.get("tweets", data.get("results", []))
+        tweets: list[dict[str, Any]] = []
+        for t in tweets_raw[:max_results]:
+            author = t.get("author", {}) if isinstance(t.get("author"), dict) else {}
+            tweets.append(_tweet_dict(
+                tweet_id=t.get("id"),
+                text=t.get("text", ""),
+                author=author.get("screen_name") or author.get("name", "unknown"),
+                created_at=t.get("created_at"),
+                likes=int(t.get("likes", 0) or 0),
+                retweets=int(t.get("retweets", 0) or 0),
+                replies=int(t.get("replies", 0) or 0),
+            ))
+        return tweets
+
+    async def _search_twitterapi_io(
+        self,
+        client: Any,
+        query: str,
+        max_results: int,
+        api_key: str,
+    ) -> list[dict[str, Any]]:
+        # Endpoint format is kept flexible to tolerate provider-side schema changes.
+        resp = await client.get(
+            f"{_TWITTERAPI_IO_BASE}/twitter/tweet/advanced_search",
+            headers={"X-API-Key": api_key, "Accept": "application/json"},
+            params={"query": query, "limit": max_results},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        candidates = data.get("tweets") or data.get("results") or data.get("data") or []
+        tweets: list[dict[str, Any]] = []
+        for t in candidates[:max_results]:
+            user = t.get("user") or t.get("author") or {}
+            metrics = t.get("metrics") or t.get("public_metrics") or {}
+            tweets.append(_tweet_dict(
+                tweet_id=t.get("id") or t.get("tweet_id"),
+                text=t.get("text", ""),
+                author=user.get("username") or user.get("screen_name") or user.get("name", "unknown"),
+                created_at=t.get("created_at"),
+                likes=int(metrics.get("like_count") or t.get("likes") or 0),
+                retweets=int(metrics.get("retweet_count") or t.get("retweets") or 0),
+                replies=int(metrics.get("reply_count") or t.get("replies") or 0),
+            ))
+        return tweets
+
+    async def _search_x_api(
+        self,
+        client: Any,
+        query: str,
+        max_results: int,
+        bearer_token: str,
+    ) -> list[dict[str, Any]]:
+        capped = max(10, min(max_results, 100))
+        resp = await client.get(
+            f"{_X_API_BASE}/tweets/search/recent",
+            headers={"Authorization": f"Bearer {bearer_token}"},
+            params={
+                "query": query,
+                "max_results": capped,
+                "tweet.fields": "created_at,public_metrics,author_id",
+                "expansions": "author_id",
+                "user.fields": "username,name",
+            },
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+
+        user_map: dict[str, dict[str, Any]] = {}
+        includes = data.get("includes", {})
+        for u in includes.get("users", []):
+            if u.get("id"):
+                user_map[str(u["id"])] = u
+
+        tweets: list[dict[str, Any]] = []
+        for t in (data.get("data") or [])[:max_results]:
+            metrics = t.get("public_metrics") or {}
+            user = user_map.get(str(t.get("author_id")), {})
+            tweets.append(_tweet_dict(
+                tweet_id=t.get("id"),
+                text=t.get("text", ""),
+                author=user.get("username") or user.get("name", "unknown"),
+                created_at=t.get("created_at"),
+                likes=int(metrics.get("like_count") or 0),
+                retweets=int(metrics.get("retweet_count") or 0),
+                replies=int(metrics.get("reply_count") or 0),
+            ))
+        return tweets
+
+    async def _search_xai(
+        self,
+        client: Any,
+        query: str,
+        max_results: int,
+        api_key: str,
+    ) -> list[dict[str, Any]]:
+        resp = await client.get(
+            f"{_XAI_SEARCH_BASE}/search",
+            headers={"Authorization": f"Bearer {api_key}", "Accept": "application/json"},
+            params={"q": query, "limit": max_results},
+            timeout=20,
+        )
+        resp.raise_for_status()
+        data = resp.json()
+        results = data.get("results") or data.get("tweets") or []
+        tweets: list[dict[str, Any]] = []
+        for r in results[:max_results]:
+            tweets.append(_tweet_dict(
+                tweet_id=r.get("id"),
+                text=r.get("text", ""),
+                author=r.get("author") or "unknown",
+                created_at=r.get("created_at"),
+                likes=int(r.get("likes") or 0),
+                retweets=int(r.get("retweets") or 0),
+                replies=int(r.get("replies") or 0),
+            ))
+        return tweets
 
 
 def create_twitter_tools(

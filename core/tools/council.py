@@ -11,6 +11,7 @@ F.3 - Signal Aggregation Tool (AggregateSignalsHandler)
 
 from __future__ import annotations
 
+import asyncio
 import json
 import logging
 from datetime import datetime, timezone
@@ -149,8 +150,8 @@ class RunCouncilHandler(ToolHandler):
                 "Run a multi-agent council deliberation on a topic. "
                 "Spawns analysis from multiple persona perspectives "
                 "(growth strategist, revenue guardian, skeptical operator, "
-                "creative innovator, customer advocate). Returns structured "
-                "configuration for each persona's analysis."
+                "creative innovator, customer advocate), then runs a "
+                "moderator synthesis pass."
             ),
             parameters={
                 "type": "object",
@@ -170,6 +171,10 @@ class RunCouncilHandler(ToolHandler):
                     "context": {
                         "type": "string",
                         "description": "Additional context or data for the council.",
+                    },
+                    "signal_limit": {
+                        "type": "integer",
+                        "description": "Maximum number of compacted signals to include (default 10, max 30).",
                     },
                 },
                 "required": ["topic"],
@@ -195,6 +200,7 @@ class RunCouncilHandler(ToolHandler):
 
         requested_personas: list[str] | None = arguments.get("personas")
         extra_context: str = arguments.get("context", "")
+        signal_limit: int = max(1, min(int(arguments.get("signal_limit", 10) or 10), 30))
 
         # Resolve persona keys
         if requested_personas:
@@ -209,11 +215,17 @@ class RunCouncilHandler(ToolHandler):
         else:
             selected_keys = list(COUNCIL_PERSONAS.keys())
 
+        signals = await self._collect_signals(context, limit=signal_limit)
+
         # Build the council configuration
         council_analyses: list[dict[str, str]] = []
         for key in selected_keys:
             persona = COUNCIL_PERSONAS[key]
             prompt_parts = [persona["system_prompt"]]
+            if signals:
+                prompt_parts.append(
+                    "\nCompacted signals:\n" + "\n".join(f"- {s}" for s in signals)
+                )
             if extra_context:
                 prompt_parts.append(f"\nAdditional context:\n{extra_context}")
             prompt_parts.append(f"\nTopic for analysis:\n{topic}")
@@ -226,21 +238,238 @@ class RunCouncilHandler(ToolHandler):
                 "full_prompt": full_prompt,
             })
 
+        analyses = await self._run_parallel_analyses(
+            context=context,
+            topic=topic,
+            council_entries=council_analyses,
+        )
+        for entry in council_analyses:
+            entry["analysis"] = analyses.get(entry["persona_key"], "")
+
+        moderator_report = await self._run_moderator_pass(
+            context=context,
+            topic=topic,
+            council_entries=council_analyses,
+        )
+
         return ToolResult(
             success=True,
             output=json.dumps({
                 "topic": topic,
                 "persona_count": len(council_analyses),
                 "personas_included": [a["persona_key"] for a in council_analyses],
+                "signals": signals,
                 "council": council_analyses,
+                "moderator_report": moderator_report,
                 "instructions": (
-                    "Each entry in 'council' contains a persona and its full prompt. "
-                    "Analyze the topic from each persona's perspective to form a "
-                    "well-rounded view before making a decision."
+                    "Council analyses were run in parallel and reconciled via a "
+                    "moderator pass. Use moderator_report as the synthesis."
                 ),
             }),
             energy_spent=5,
         )
+
+    async def _collect_signals(
+        self,
+        context: ToolExecutionContext,
+        *,
+        limit: int,
+    ) -> list[str]:
+        pool: asyncpg.Pool | None = context.registry.pool if context.registry else None
+        if not pool:
+            return []
+
+        signals: list[str] = []
+        try:
+            async with pool.acquire() as conn:
+                event_rows = await conn.fetch(
+                    """
+                    SELECT source::text, payload
+                    FROM gateway_events
+                    ORDER BY created_at DESC
+                    LIMIT $1
+                    """,
+                    limit,
+                )
+                for row in event_rows:
+                    src = row["source"]
+                    payload = row["payload"]
+                    if isinstance(payload, str):
+                        try:
+                            payload = json.loads(payload)
+                        except Exception:
+                            payload = {}
+                    if isinstance(payload, dict):
+                        keys = ", ".join(sorted(payload.keys())[:4])
+                        signals.append(f"Event[{src}]: payload keys ({keys or 'none'})")
+                    else:
+                        signals.append(f"Event[{src}]")
+
+                mem_rows = await conn.fetch(
+                    """
+                    SELECT content
+                    FROM memories
+                    WHERE type = 'episodic' AND status = 'active'
+                    ORDER BY created_at DESC
+                    LIMIT $1
+                    """,
+                    limit,
+                )
+                for row in mem_rows:
+                    content = (row["content"] or "").strip().replace("\n", " ")
+                    if content:
+                        signals.append(f"Memory: {content[:180]}")
+
+                goal_rows = await conn.fetch(
+                    """
+                    SELECT content
+                    FROM memories
+                    WHERE type = 'goal' AND status = 'active'
+                    ORDER BY importance DESC NULLS LAST, created_at DESC
+                    LIMIT $1
+                    """,
+                    max(1, limit // 2),
+                )
+                for row in goal_rows:
+                    content = (row["content"] or "").strip().replace("\n", " ")
+                    if content:
+                        signals.append(f"Goal: {content[:180]}")
+        except Exception as exc:
+            logger.debug("Council signal collection failed: %s", exc)
+            return []
+
+        return signals[:limit]
+
+    async def _run_parallel_analyses(
+        self,
+        *,
+        context: ToolExecutionContext,
+        topic: str,
+        council_entries: list[dict[str, str]],
+    ) -> dict[str, str]:
+        async def _run_one(entry: dict[str, str]) -> tuple[str, str]:
+            analysis = await self._analyze_with_persona(
+                context=context,
+                topic=topic,
+                persona_name=entry["persona_name"],
+                system_prompt=entry["system_prompt"],
+                full_prompt=entry["full_prompt"],
+            )
+            return entry["persona_key"], analysis
+
+        pairs = await asyncio.gather(*[_run_one(entry) for entry in council_entries])
+        return {k: v for k, v in pairs}
+
+    async def _analyze_with_persona(
+        self,
+        *,
+        context: ToolExecutionContext,
+        topic: str,
+        persona_name: str,
+        system_prompt: str,
+        full_prompt: str,
+    ) -> str:
+        llm_cfg = await self._load_llm_config(context)
+        if llm_cfg is None:
+            return f"{persona_name} perspective on '{topic}': {full_prompt[:260]}"
+
+        from core.llm import chat_completion
+
+        try:
+            response = await chat_completion(
+                provider=llm_cfg["provider"],
+                model=llm_cfg["model"],
+                endpoint=llm_cfg.get("endpoint"),
+                api_key=llm_cfg.get("api_key"),
+                messages=[
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": full_prompt},
+                ],
+                temperature=0.4,
+                max_tokens=700,
+                tools=None,
+                auth_mode=llm_cfg.get("auth_mode"),
+            )
+            text = (response or {}).get("content") or ""
+            return text.strip() or f"{persona_name} produced no content."
+        except Exception as exc:
+            logger.debug("Council persona analysis failed for %s: %s", persona_name, exc)
+            return f"{persona_name} analysis unavailable ({exc})."
+
+    async def _run_moderator_pass(
+        self,
+        *,
+        context: ToolExecutionContext,
+        topic: str,
+        council_entries: list[dict[str, str]],
+    ) -> str:
+        llm_cfg = await self._load_llm_config(context)
+        if llm_cfg is None:
+            return self._heuristic_moderator_summary(council_entries)
+
+        from core.llm import chat_completion
+
+        payload = [
+            {"persona": e["persona_name"], "analysis": e.get("analysis", "")}
+            for e in council_entries
+        ]
+        moderator_prompt = (
+            f"Topic: {topic}\n\n"
+            "Persona analyses (JSON):\n"
+            f"{json.dumps(payload, ensure_ascii=True)}\n\n"
+            "Produce a reconciled report with:\n"
+            "1) Agreements\n2) Key disagreements\n3) Risks\n4) Recommended actions."
+        )
+
+        try:
+            response = await chat_completion(
+                provider=llm_cfg["provider"],
+                model=llm_cfg["model"],
+                endpoint=llm_cfg.get("endpoint"),
+                api_key=llm_cfg.get("api_key"),
+                messages=[
+                    {"role": "system", "content": "You are a neutral moderator that reconciles expert perspectives."},
+                    {"role": "user", "content": moderator_prompt},
+                ],
+                temperature=0.3,
+                max_tokens=900,
+                tools=None,
+                auth_mode=llm_cfg.get("auth_mode"),
+            )
+            text = (response or {}).get("content") or ""
+            return text.strip() or self._heuristic_moderator_summary(council_entries)
+        except Exception as exc:
+            logger.debug("Council moderator pass failed: %s", exc)
+            return self._heuristic_moderator_summary(council_entries)
+
+    async def _load_llm_config(
+        self,
+        context: ToolExecutionContext,
+    ) -> dict[str, Any] | None:
+        pool: asyncpg.Pool | None = context.registry.pool if context.registry else None
+        if not pool:
+            return None
+        try:
+            from core.llm_config import resolve_llm_config
+            return await resolve_llm_config(pool, "llm.chat", fallback_key="llm")
+        except Exception:
+            return None
+
+    @staticmethod
+    def _heuristic_moderator_summary(council_entries: list[dict[str, str]]) -> str:
+        lines = [
+            "Moderator synthesis (fallback mode):",
+            "Agreements: Council members provided perspectives on growth, risk, and customer impact.",
+            "Disagreements: Trade-offs center on speed vs. risk and expansion vs. margin discipline.",
+            "Risks: Execution complexity, cost overruns, and potential customer confusion.",
+            "Recommended actions: Run a limited pilot, measure outcomes, and iterate before full rollout.",
+            "",
+            "Persona notes:",
+        ]
+        for entry in council_entries:
+            snippet = (entry.get("analysis") or "").strip().replace("\n", " ")
+            lines.append(f"- {entry['persona_name']}: {snippet[:180]}")
+        return "\n".join(lines)
 
 
 # ---------------------------------------------------------------------------

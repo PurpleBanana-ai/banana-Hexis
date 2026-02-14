@@ -134,6 +134,9 @@ class ChannelOutboxConsumer:
             payload["target_id"] = delivery_info.get("target_id", payload.get("target_id", ""))
             payload["thread_id"] = delivery_info.get("topic", "")
             delivery_mode = "direct"
+        elif isinstance(delivery_info, dict) and delivery_info.get("mode") == "webhook":
+            await self._deliver_webhook(content, payload, delivery_info, outbox_msg_id)
+            return
         elif isinstance(delivery_info, dict) and delivery_info.get("mode") == "silent":
             # Silent: log only, no notification
             logger.info("Silent delivery (suppressed): %s", content[:100])
@@ -268,6 +271,40 @@ class ChannelOutboxConsumer:
                 await self._log_delivery(outbox_msg_id, channel_type, channel_id, sender_id, content, "broadcast", True)
             except Exception as e:
                 await self._log_delivery(outbox_msg_id, channel_type, channel_id, sender_id, content, "broadcast", False, str(e))
+
+    async def _deliver_webhook(
+        self,
+        content: str,
+        payload: dict[str, Any],
+        delivery_info: dict[str, Any],
+        outbox_msg_id: str,
+    ) -> None:
+        """Send outbox payload to a configured webhook URL."""
+        url = str(delivery_info.get("url") or "").strip()
+        if not url:
+            logger.warning("Webhook delivery missing URL")
+            return
+
+        body = {
+            "content": content,
+            "payload": payload,
+            "delivery": delivery_info,
+            "outbox_message_id": outbox_msg_id or None,
+        }
+        headers = {"Content-Type": "application/json"}
+
+        try:
+            def _do() -> requests.Response:
+                return requests.post(url, json=body, headers=headers, timeout=8)
+
+            resp = await asyncio.to_thread(_do)
+            if 200 <= resp.status_code < 300:
+                await self._log_delivery(outbox_msg_id, "webhook", url, None, content, "webhook", True)
+            else:
+                err = f"HTTP {resp.status_code}: {resp.text[:300]}"
+                await self._log_delivery(outbox_msg_id, "webhook", url, None, content, "webhook", False, err)
+        except Exception as e:
+            await self._log_delivery(outbox_msg_id, "webhook", url, None, content, "webhook", False, str(e))
 
     async def _log_delivery(
         self,

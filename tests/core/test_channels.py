@@ -381,6 +381,30 @@ class TestTelegramAdapter:
         result = _resolve_token({})
         assert result is None
 
+    async def test_send_media_prefers_local_path(self):
+        from channels.media import Attachment
+        from channels.telegram_adapter import TelegramAdapter
+
+        adapter = TelegramAdapter()
+        bot = MagicMock()
+
+        class _Sent:
+            message_id = 42
+
+        bot.send_photo = AsyncMock(return_value=_Sent())
+        adapter._application = MagicMock(bot=bot)
+
+        result = await adapter.send_media(
+            "123",
+            Attachment(url="", local_path="/tmp/image.png", mime_type="image/png"),
+            "caption",
+        )
+
+        assert result == "42"
+        bot.send_photo.assert_awaited_once()
+        kwargs = bot.send_photo.await_args.kwargs
+        assert kwargs["photo"] == "/tmp/image.png"
+
 
 # ============================================================================
 # Conversation Handler (DB integration)
